@@ -162,3 +162,23 @@ cmake -S . -B build-metal -DMAYA_ENABLE_METAL=ON
 cmake --build build-metal -j
 ctest --test-dir build-metal          # the parity tests above (the 45-layer fixture needs Python with numpy)
 ```
+
+
+## Later additions (2026-11-02, metal-speed-2)
+
+- **Restore points (GLM, opt-in):** the engine keeps named restore points
+  (GEN keys `marks=`/`shared=`, advertised as `restore` on the READY line);
+  the serve layer computes points for GLM/MiniMax templates when
+  `MAYA_METAL_RESTORE_POINTS` is set (>0; off by default). A later request
+  whose prompt starts with a recorded point's tokens resumes prefill at that
+  depth (recurrent state is copied per point; entries are dropped when a
+  request's own reuse depth is shallower, which keeps the KV pool coherent).
+  Fixture: `tools/test_metal_serve_restore.py`.
+- **Decode plan cache (GLM):** decode graphs and their scheduler allocations
+  are kept alive per shape signature, removing per-token graph build/alloc
+  cost on hits. `MAYA_GLM_PLAN_CACHE=0` restores the previous path exactly.
+- **Tensor flash-attention (ggml):** upstream llama.cpp's tensor FA kernels
+  (PRs #29570 + #30491) are carried as `third_party/ggml/metal-tensor-fa.patch`
+  and applied by the same cmake stamp mechanism as the sparse-MLA patch.
+  GLM's attention routes through sparse MLA today, so the kernels engage
+  where a graph calls `ggml_flash_attn_ext` at tensor-eligible shapes.
