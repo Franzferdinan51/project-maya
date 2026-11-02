@@ -804,6 +804,37 @@ class Gguf(unittest.TestCase):
             self.assertIsNone(maya.ds4_upgrade_from(m, d))     # (v2 whole: nothing to upgrade)
             self.assertIsNone(maya.ds4_earlier(m, d))
 
+    def test_table_dupes_share_one_copy(self):
+        """#777: Maya-XS v1's table shards left in its folder beside the shared Engram-Q6_K copy the v2 pack reads: a
+        hard link replaces the old copy when both were checked; an unchecked or different one is left alone."""
+        import json, os, tempfile
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            d, e, pack = root / "Maya-XS", root / "Engram-Q6_K", root / "Maya-XS" / "maya-ds4"
+            for x in (d, e, pack):
+                x.mkdir(parents=True, exist_ok=True)
+            names = ["T-00004-of-00005.gguf", "T-00005-of-00005.gguf"]
+            for n in names:
+                (d / n).write_bytes(b"x" * 64)
+                (e / n).write_bytes(b"x" * 64)
+            (pack / "tensors.txt").write_text("file 0 V2-00001-of-00003.gguf\n" + "".join(
+                f"file {i + 1} ../Engram-Q6_K/{n}\n" for i, n in enumerate(names)), encoding="utf-8")
+
+            def book(where, which):
+                (where / maya.VERIFIED).write_text(json.dumps({n: {"size": (where / n).stat().st_size,
+                    "mtime_ns": (where / n).stat().st_mtime_ns} for n in which}), encoding="utf-8")
+
+            book(e, names)
+            book(d, names[:1])                                  # (the second old copy never checked: kept)
+            with patch.object(maya, "ok", lambda *a: None), patch.object(maya, "warn", lambda *a: None):
+                got = maya.ds4_table_dupes(pack, d)
+            self.assertEqual(got, names[:1])
+            self.assertTrue(os.path.samefile(d / names[0], e / names[0]))
+            self.assertFalse(os.path.samefile(d / names[1], e / names[1]))
+            self.assertTrue((e / names[0]).is_file() and (d / names[0]).is_file())
+            with patch.object(maya, "ok", lambda *a: None):
+                self.assertEqual(maya.ds4_table_dupes(pack, d), [])   # (already one copy: nothing to do)
+
     def test_maya_xs_interrupted_upgrade_keeps_the_old_shards(self):
         """A v2 download cut short (one shard partial) leaves the old Maya-XS whole and in use; the upgrade resumes."""
         p, d = self._small_manifest()

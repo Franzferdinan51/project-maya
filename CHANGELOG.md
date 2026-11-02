@@ -4,6 +4,13 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.49 - 2026-11-02
+
+A fix release: Maya-XS updates start cleanly and give back their disk space, and Qwen CYBER-FROST runs on 8 GB cards again.
+
+- **DeepSeek Maya-XS v1 -> v2 update:** a start could stop with "changed after the pack was built" even after `--setup --repack`, because the old copy of the n-gram tables was checked instead of the shared one the model reads (#777, thanks @waxinz). Running the setup once also turns that old copy into a link to the shared one, giving back about 161 GB.
+- **Qwen CYBER-FROST on 8 GB cards:** v1.1.48 could run out of GPU memory on the first request or during the speed calibration. Maya now keeps room for the first request's buffers on small cards; bigger cards are unchanged. On an RTX 3050 8 GB it writes about as fast as before or faster, and the speed calibration completes.
+
 ## v1.1.48 - 2026-11-01
 
 Faster prompt reading for DeepSeek on several GPUs, no more re-reading after the thinking budget, and fixes.

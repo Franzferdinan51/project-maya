@@ -2784,6 +2784,24 @@ def stamp_pack(pack: Path, shards: list) -> None:
         pass
 
 
+def pack_index_files(pack: Path) -> list | None:
+    """The model files a DS4 pack's tensors.txt reads (its 'file N <path>' lines, relative to the model folder), or
+    None when it names none (an older pack: the caller globs the model folder as before).  A quant that takes its
+    Engram tables (or drafter, vision) from a set beside the model folder names them THERE - the pack is built from
+    those files, and a same-named file an earlier layout left in the model folder is not one of them."""
+    try:
+        lines = (pack / "tensors.txt").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    out = []
+    for ln in lines:
+        m = re.match(r"file \d+ (.+)", ln)
+        if m:
+            p = Path(m.group(1).strip())
+            out.append(p if p.is_absolute() else pack.parent / p)
+    return out or None
+
+
 def check_sha256(shards: list, quant: str | None) -> None:
     """The files a pack is built from (or Metal reads): a Maya download's against its published sha256 (once a file - a
     download is checked as it lands), so a file still being written or damaged stops here, not as garbage answers (#155)."""
@@ -4055,10 +4073,12 @@ def server_command(cfg_path: Path, a) -> tuple:
         if p is None or not p.exists():
             fail(f"{cfg_path.name}: {what} is missing ({p})", f"run {ME} --setup to repair it")
     # a model file changed after its pack was built (pack_stale, #155): the pack's places in it are wrong
-    if ds4 and (pack / PACK_SOURCES).exists():
+    if ds4 and pack is not None and (pack / PACK_SOURCES).exists():
         rec = {r.get("name") for r in read_json(pack / PACK_SOURCES).get("files") or []}
-        why = pack_stale(pack, [s for s in ds4_shards(pack.parent) if s.name in rec or not rec])   # (its own files:
-        # the folder may also hold an earlier layout's)
+        files = pack_index_files(pack)                     # the files the pack's index itself reads: a shared Engram
+        if files is None:                                  # set (or drafter, vision) lives beside the model folder, so
+            files = ds4_shards(pack.parent)                # match those, not a same-named file an earlier layout
+        why = pack_stale(pack, [s for s in files if s.exists() and (s.name in rec or not rec)])   # left there
         if why is not None:
             fail(f"{cfg_path.name}: {why}, so its index of where the tensors sit is wrong",
                  f"run {ME} --setup --repack to build it again (a minute)")
@@ -4849,6 +4869,46 @@ def ds4_upgrade_note(m: dict, d: Path) -> None:
     gb = sum(v for n, v in m["files"].items() if file_incomplete(m, d / n)) / 1e9
     say(f"  Updating {m['folder']} to its newer version: {gb:.0f} GB to download "
         f"({len(m['files'])} model files; the n-gram table files you have are kept).")
+
+
+def ds4_table_dupes(pack: Path, d: Path) -> list:
+    """A second copy of a file the pack reads from beside the model folder (a shared Engram set: Engram-Q6_K) left in
+    the model folder d under the same name - Maya-XS v1's table shards after the update to v2 (#777): a hard link to
+    the shared copy takes its place, so the disk holds one copy and any path to either name still works.  Only when
+    both were checked against the same published sha256 (VERIFIED, size and time unchanged) - else left as they are.
+    The names relinked."""
+    done = []
+    for f in pack_index_files(pack) or []:
+        if f.parent.resolve() == d.resolve() or not f.is_file():
+            continue
+        old = d / f.name
+        try:
+            if not old.is_file() or os.path.samefile(old, f) or old.stat().st_size != f.stat().st_size:
+                continue
+        except OSError:
+            continue
+
+        def verified(p: Path) -> bool:
+            seen, st = read_json(p.parent / VERIFIED).get(p.name) or {}, p.stat()
+            return seen.get("size") == st.st_size and seen.get("mtime_ns") == st.st_mtime_ns
+
+        if not (verified(old) and verified(f)):
+            continue
+        tmp = old.with_name(old.name + ".link")
+        try:
+            os.link(f, tmp)
+            os.replace(tmp, old)
+            done.append(old.name)
+            book, st = read_json(d / VERIFIED), old.stat()   # (the same checked file now: not read again)
+            book[old.name] = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+            (d / VERIFIED).write_text(json.dumps(book, indent=1), encoding="utf-8")
+        except OSError as x:
+            tmp.unlink(missing_ok=True)
+            warn(f"{old}: a second copy of {f} ({x}) - you can delete it")
+    if done:
+        ok(f"{len(done)} second cop{'ies' if len(done) != 1 else 'y'} of the n-gram tables in {d.name} now share "
+           f"{f.parent.name}'s ({sum((d / n).stat().st_size for n in done) / 1e9:.0f} GB back)")
+    return done
 
 
 def ds4_upgrade_drop(old: dict, m: dict, d: Path) -> list:
@@ -5734,6 +5794,8 @@ def set_up_ds4(a, prev: dict) -> Path | None:
                "320 MB of the first GPU's while one is read); the server resizes the pictures")
     if upgrade:                                        # (the new files are whole and packed: the old model files go)
         ds4_upgrade_drop(upgrade, m, d)
+    if gguf:                                           # (an earlier layout's copy of the shared tables: one copy, #777)
+        ds4_table_dupes(pack, d)
     cfg_path = write_config_ds4(a, pc, meta, pack, ctx, models, d, quant, vision)   # 8
     if (drafter or not gguf) and CDS.has_drafter(read_json(cfg_path)):
         how = drafting_choice(a, "The DSpark drafter", "10-30")

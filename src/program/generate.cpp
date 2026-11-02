@@ -5669,6 +5669,47 @@ int main(int argc, char** argv) {
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
         int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
+        // A serve on a small card (8 GB): with borrowing the cache is meant to lend the prompt path its buffers, but
+        // a cache of few slots cannot (lend_slots + 128 slots), and the prompt path then allocates them on top - after
+        // the cache took everything above the reserve.  Together with the verify window, that left ~100 MiB free, and
+        // what a first request creates later (cuBLAS state, window graphs: ~100 MiB measured) ran the card out of
+        // memory - "verify arena does not fit", cuBLAS status 14, "round capture".  So when the buffers will be the
+        // prompt path's own, they come out of the cache's share, down to the floor the load line asks (STRATA_
+        // SERVE_FREE_FLOOR_MIB, default 256 MiB free once everything is loaded).  A card that can lend (or has the
+        // room) is untouched: the floor only binds when the cache would eat into it.
+        if (borrow && o.serve && !multi_gpu && o.prefill_chunk > 0 && slots > 0) {
+            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+            auto k_for = [&](int64_t c) { return ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, c) + blob - 1) / blob; };
+            auto can_lend = [&](int64_t sl) {
+                if (o.prefill_auto) {
+                    for (const int64_t c : {8192, 6144, 4096, 3072, 2048, 1024, 512, 256})
+                        if (k_for(c) + 128 <= sl && k_for(c) * 100 <= 85 * sl) return true;
+                    return false;
+                }
+                for (int64_t c = o.prefill_chunk; c >= 256; c /= 2)
+                    if (k_for(c) + 128 <= sl) return true;
+                return false;
+            };
+            if (!can_lend(slots)) {
+                const int64_t own_mib = (int64_t) (strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_auto ? 1024 : o.prefill_chunk) >> 20);
+                // (measured on an 8 GB card at --prefill 512 --spec 4: the prompt path took its bytes_needed + ~180 MiB of
+                // cuBLAS and staging state, the verify window ~90 MiB, the host-registered expert tiers' tables ~110 MiB)
+                const int64_t verify_mib = 16 * ((int64_t) o.spec + 2);
+                const int64_t other_mib = 192 + 112;
+                const char* fv = std::getenv("STRATA_SERVE_FREE_FLOOR_MIB");
+                const int64_t floor_mib = fv ? std::atoll(fv) : 256;
+                const int64_t post_mib = own_mib + verify_mib + other_mib;
+                const int64_t by_floor = ((int64_t) (free_b >> 20) - post_mib - floor_mib) * (1ll << 20) / blob;
+                if (by_floor < slots) {
+                    const int64_t keep = std::max<int64_t>(std::min<int64_t>(by_floor, slots), 8);
+                    std::fprintf(stderr, "maya generate: the prompt path's own buffers (%lld MiB) and what is loaded after the cache "
+                                         "(~%lld MiB) come out of the expert cache's share: %lld -> %lld slots, to keep ~%lld "
+                                         "MiB free once everything is loaded\n", (long long) own_mib, (long long) (post_mib - own_mib),
+                                 (long long) slots, (long long) keep, (long long) floor_mib);
+                    slots = keep;
+                }
+            }
+        }
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
         std::fprintf(stderr, "maya generate: expert cache auto: %.2f GiB free, %d MiB reserved -> %d slots\n",
                      (double) free_b / 1073741824.0, o.vram_reserve_mib, o.expert_cache);
