@@ -417,6 +417,9 @@ struct Server {
             }
             return produced < max_new;
         };
+        long long d_acc = 0, d_off = 0;   // this request's drafts kept / offered (the DONE line's draft fields)
+        const long long mtp_acc0 = mtp_len ? mtp_len->drafts_accepted() : 0;   // (MTP tallies on its DraftLength)
+        const long long mtp_off0 = mtp_len ? mtp_len->drafts_offered() : 0;
         if (std::strcmp(finish, "cancel") != 0) {
             // one token: the plain pick of these logits (a forced token wins), the counter one draw on
             bool bad = false;
@@ -451,7 +454,8 @@ struct Server {
                         const Drafter df = [&](int32_t tok, int64_t, int n, std::vector<int32_t>& d, std::string& er) {
                             return model.dflash_draft(tok, n, spec.p_min, spec.n_min, spec.p_cum, d, er);
                         };
-                        const bool ok = decode_spec(model, y, n_max, df, nullptr, hk, e);
+                        const bool ok = decode_spec(model, y, n_max, df,
+                                                    [&](int n, int acc, double) { d_off += n; d_acc += acc; }, hk, e);
                         if (!ok || bad) {
                             model.reset();
                             cached.clear();
@@ -495,9 +499,11 @@ struct Server {
             cached.insert(cached.end(), emitted.begin(), emitted.end() - 1);
             cached_img = img_prefix_hash((int64_t) cached.size());
         }
-        std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0\n", (long long) produced, n,
+        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", (long long) produced, n,
                     std::chrono::duration<double, std::milli>(t1 - t0).count(),
-                    std::chrono::duration<double, std::milli>(t2 - t1).count(), finish, reuse);
+                    std::chrono::duration<double, std::milli>(t2 - t1).count(), finish,
+                    d_acc + (mtp_len ? mtp_len->drafts_accepted() - mtp_acc0 : 0),
+                    d_off + (mtp_len ? mtp_len->drafts_offered() - mtp_off0 : 0), reuse);
         std::fflush(stdout);
         if (const size_t grown = model.grow_pool()) {   // memory freed since the start: more experts stay resident
             std::fprintf(stderr, "maya-metal: the expert pool grew by %.1f GB to %.1f GB\n", grown / 1e9,
@@ -552,9 +558,11 @@ int serve(GlmMetal& model, const std::vector<std::string>& args) {
                     "block's memory for the expert pool\n");
     if (s.mtp) s.mtp_len = std::make_unique<DraftLength>(mtp_draft_cap());
     const auto& st = model.stats();
-    std::printf("INFO engine=%s context=%lld logit_bias=1 kv_ctx=%lld kv_gb=%.3f vram_gb=%.1f vram_slots=%zu\n",
+    std::printf("INFO engine=%s context=%lld logit_bias=1 kv_ctx=%lld kv_gb=%.3f vram_gb=%.1f vram_slots=%zu "
+                "mtp=%d dflash=%d\n",
                 MAYA_VERSION, (long long) model.max_context(), (long long) model.max_context(), st.state_bytes / 1e9,
-                (st.dense_bytes + st.pool_bytes + st.state_bytes) / 1e9, st.pool_slots);
+                (st.dense_bytes + st.pool_bytes + st.state_bytes) / 1e9, st.pool_slots, s.mtp ? 1 : 0,
+                model.has_dflash() ? 1 : 0);
     std::printf("NOTE %s\n", model.describe().c_str());
     std::printf("READY %lld stop pause\n", (long long) model.max_context());
     std::fflush(stdout);

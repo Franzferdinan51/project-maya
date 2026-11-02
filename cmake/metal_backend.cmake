@@ -169,6 +169,12 @@ if(MAYA_METAL_TESTS)
       add_test(NAME metal_mm3_dspark_test
                COMMAND metal_mm3_dspark_test ${CMAKE_CURRENT_BINARY_DIR}/dspark-fixture)
       set_tests_properties(metal_mm3_dspark_test PROPERTIES FIXTURES_REQUIRED metal_mm3_dspark)
+    add_executable(metal_mm3_divergence_test src/metal/metal_mm3_divergence_test.cpp)
+    target_link_libraries(metal_mm3_divergence_test PRIVATE maya_metal)
+    add_test(NAME metal_mm3_divergence_test
+             COMMAND metal_mm3_divergence_test ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf
+                     ${CMAKE_CURRENT_BINARY_DIR}/dspark-fixture/dspark)
+    set_tests_properties(metal_mm3_divergence_test PROPERTIES FIXTURES_REQUIRED "metal_mm3_gguf;metal_mm3_dspark")
     endif()
   endif()
   # the same gates on ggml-cpu (the oracle backend), and with the expert pool at its floor and small slices

@@ -2474,10 +2474,10 @@ class Service:
         """Where the configs are: beside this server's own (maya.py's folder)."""
         return Path(self.config_path).parent if self.config_path else ROOT
 
-    def models_info(self) -> dict:
+    def models_info(self, port: int | None = None) -> dict:
         """The configs the setup wrote, the running one marked, each with its engine settings; whether a switch or a
         change to the running one can start Maya again at once (maya.py started this server)."""
-        out = models.listing(self.models_root(), self.config_path)
+        out = models.listing(self.models_root(), self.config_path, port)
         out.update(restarts=bool(os.environ.get("MAYA_RESTART_ON_UPDATE")),
                    running=Path(self.config_path).name if self.config_path else None,
                    restarting=getattr(self, "model_restart", None),
@@ -2655,7 +2655,8 @@ class Service:
         import platform
         out = [f"Project Maya {MAYA_VERSION or '?'} - report of {time.strftime('%Y-%m-%d %H:%M')}",
                f"System: {platform.platform()}, Python {platform.python_version()}",
-               f"GPU: {st.get('gpu_name') or 'not readable'} ({gib(hw.get('gpu_mem_total'))} VRAM)",
+               f"GPU: {st.get('gpu_name') or st.get('gpu_note') or 'not readable'}" +
+               (f" ({gib(hw.get('gpu_mem_total'))} VRAM)" if st.get('gpu_name') else ""),
                f"CPU: {st.get('cpu_name') or '?'}, {st.get('threads') or '?'} threads; RAM {gib(hw.get('ram_total'))}",
                f"Model: {self.model}" + (f" ({self.model_label})" if self.model_label else "") +
                f", context {self.engine.max_context}"]
@@ -4985,7 +4986,7 @@ def make_handler(svc: Service):
             elif path == "/api/models":
                 # the Models page: the configs the setup wrote, the running one, each one's engine settings
                 if self._authorized():
-                    self._json(200, svc.models_info())
+                    self._json(200, svc.models_info(self.server.server_address[1]))
             elif path == "/api/savings":
                 # the sidebar's Saved: what the model's own API would have charged for the same tokens, per model
                 if self._authorized():
