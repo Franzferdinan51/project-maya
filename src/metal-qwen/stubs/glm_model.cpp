@@ -144,6 +144,7 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) { glm_st
 bool Glm5Model::mtp_decode_wanted(int dev, int n_parts) { (void)dev; (void)n_parts; return false; }
 bool Glm5Model::mtp_ready() const { return false; }
 bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit, int64_t& produced, std::string& err) { glm_stub("bool Glm5Model::decode_mtp"); }
+bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit, int64_t& produced, std::string& err) { glm_stub("bool Glm5Model::decode_spec_pipe"); }
 bool Glm5Model::mtp_fill_prev(int32_t token, int64_t p, std::string& err) { glm_stub("bool Glm5Model::mtp_fill_prev"); }
 int Glm5Model::mtp_choose(int n_cap) { glm_stub("int Glm5Model::mtp_choose"); }
 bool Glm5Model::mtp_cache_setup(std::string& err) { glm_stub("bool Glm5Model::mtp_cache_setup"); }
