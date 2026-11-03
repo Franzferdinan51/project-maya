@@ -57,7 +57,8 @@ from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, model_api, model_
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
-                            EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, deepseek_effort_kwargs, deepseek_images,
+                            EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, config_effort, deepseek_effort_kwargs,
+                            deepseek_images,
                             effort_kwargs,
                             effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
                             unmark_literals)
@@ -511,6 +512,17 @@ def lp_attach(tok: LpToken, fields: list[str]) -> LpToken:
     return tok
 
 
+def engine_token(field: str) -> int:
+    """A T line's id.  Below 0 it is no token: an engine whose sample failed (maya-ds4 before #619, or one an
+    update could not rebuild) wrote -1 as one - an error for the request, never an id for the tokenizer and the
+    loop guard (#805: an IndexError there ended a 351K-token prompt's request with a traceback)."""
+    t = int(field)
+    if t < 0:
+        raise ValueError(f"the engine could not pick a token (it wrote the id {t}: its sampling failed - the engine's "
+                         "log says why)")
+    return t
+
+
 def token_piece(tok, t: int) -> bytes:
     """One token's bytes (a logprobs entry's `bytes`): the tokenizer's own, else its decode; b"" for an id it lacks."""
     try:
@@ -884,6 +896,9 @@ class StrataEngine:
                 break
         loading.set()
         if self.max_context <= 0:
+            # its output closed: it is gone, even before the OS says so (as _pump) - alive() is False at once, not
+            # only after the process is reaped (a busy CI runner saw it alive right after a failed restart)
+            self.ended = True
             raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))
         # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
         # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
@@ -1313,9 +1328,9 @@ class StrataEngine:
                     if cancel.is_set():
                         return
                     if want_lp:
-                        lp_wait = LpToken(int(line[2:]))
+                        lp_wait = LpToken(engine_token(line[2:]))
                     else:
-                        yield int(line[2:])
+                        yield engine_token(line[2:])
                 elif line.startswith("LP "):
                     if lp_wait is not None:
                         t, lp_wait = lp_attach(lp_wait, line.split()[1:]), None
@@ -1520,9 +1535,9 @@ class StrataEngine:
                     if cancel.is_set():
                         return
                     if want_lp:
-                        lp_wait = LpToken(int(f[2]))
+                        lp_wait = LpToken(engine_token(f[2]))
                     else:
-                        yield int(f[2])
+                        yield engine_token(f[2])
                 elif line.startswith("LP "):
                     if lp_wait is not None:
                         t, lp_wait = lp_attach(lp_wait, f[2:]), None
@@ -6156,6 +6171,21 @@ def chat_template_path(tpath) -> Path:
     return tpl
 
 
+def checked_config_effort(cfg: dict, template, maya: bool) -> dict:
+    """The run config with its reasoning_effort checked by the model's family (its chat template), before the model
+    loads (#807): a config without one gets the model's own level (the real engine); DeepSeek's "42" becomes its level
+    42 of 100 (#768).  A bad value stops the start at once (SystemExit), a number meant as tokens pointed to
+    thinking_budget."""
+    if "reasoning_effort" not in cfg and maya:          # (a config without one: the model's own level)
+        cfg = dict(cfg, reasoning_effort=maya_quants.model_defaults(cfg)[1])
+    if cfg.get("reasoning_effort") or (template.deepseek and cfg.get("reasoning_effort") is not None):
+        try:
+            cfg = dict(cfg, reasoning_effort=config_effort(cfg["reasoning_effort"], template.deepseek))
+        except ValueError as e:
+            raise SystemExit(f"[maya] config reasoning_effort: {e}")
+    return cfg
+
+
 def sampling_defaults_from_config(cfg: dict) -> dict:
     """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
     a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
@@ -6425,6 +6455,14 @@ def main() -> int:
         import strata_tokenizer as ST
         tok = ST.Tokenizer.from_dir(tpath)              # with the pack's own pre-tokenizer (GLM: glm4, #27)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
+    # the model's own chat template (exported with its tokenizer), else the original model's.  A GLM-5.3-Flash pack's
+    # copy is the one its GGUF carried (August's): the template zai-org publishes now renders the same prompts and
+    # matches tool results to their calls without nested loops (zai-org/GLM-5.3-Flash PR #63: 100 parallel calls
+    # 137 -> 6 ms a render), so the server uses the copy shipped here (serve/glm5_chat_template.jinja) for a GLM-5
+    # pack.  MAYA_PACK_TEMPLATE=1 keeps the pack's own.  Read before the load: it tells the model's family, by which
+    # the config's reasoning_effort is checked here, not after the minutes of loading (#807)
+    template = ChatTemplate(chat_template_path(tpath))
+    cfg = checked_config_effort(cfg, template, a.engine == "maya")
     if a.engine == "maya":
         if not cfg:
             ap.error("--engine maya needs --config")
@@ -6505,27 +6543,15 @@ def main() -> int:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."],
             tok_s=float(os.environ.get("MAYA_MOCK_TOK_S") or 0) or None), None, {}
-    # the model's own chat template (exported with its tokenizer), else the original model's.  A GLM-5.3-Flash pack's
-    # copy is the one its GGUF carried (August's): the template zai-org publishes now renders the same prompts and
-    # matches tool results to their calls without nested loops (zai-org/GLM-5.3-Flash PR #63: 100 parallel calls
-    # 137 -> 6 ms a render), so the server uses the copy shipped here (serve/glm5_chat_template.jinja) for a GLM-5
-    # pack.  MAYA_PACK_TEMPLATE=1 keeps the pack's own.
-    tpl = chat_template_path(tpath)
-    svc = Service(engine, tok, ChatTemplate(tpl),
+    svc = Service(engine, tok, template,
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     if getattr(engine, "multi", 0) > 1:                 # n conversations at once: n places in the FIFO
         svc.fifo.set_capacity(engine.multi)
         print(f"[maya] {engine.multi} conversations at once (--parallel)", flush=True)
-    if "reasoning_effort" not in cfg and a.engine == "maya":   # (a config without one: the model's own level)
-        cfg = dict(cfg, reasoning_effort=maya_quants.model_defaults(cfg)[1])
     if cfg.get("reasoning_effort") or (svc.template.deepseek and cfg.get("reasoning_effort") is not None):
-        try:
-            (deepseek_effort_kwargs if svc.template.deepseek else effort_kwargs)(cfg["reasoning_effort"])
-        except ValueError as e:
-            raise SystemExit(f"[maya] config reasoning_effort: {e}")
-        svc.default_effort = cfg["reasoning_effort"]
+        svc.default_effort = cfg["reasoning_effort"]    # (checked before the load: checked_config_effort)
         # (#363: DeepSeek's 1..100 budget is a level of its own - it was shown as "none")
         level = (effort_name if svc.template.minimax else effort_level)(svc.default_effort) or \
             (f"{svc.default_effort} of 100" if type(svc.default_effort) is int
@@ -6560,7 +6586,7 @@ def main() -> int:
     if a.config:
         svc.config_path = str(Path(a.config).resolve())  # a context change from the dashboard is saved there
         p = Path(svc.config_path)                        # the tokens it serves, and what its API would have charged
-        svc.savings = savings.Ledger(p.parent / savings.FILE, p.name, svc.model, models.quant_label(cfg, p))
+        svc.savings = savings.Ledger(savings.ledger_path(p), p.name, svc.model, models.quant_label(cfg, p))
         threading.Thread(target=svc.finish_delete, daemon=True).start()   # (the model before, if the page deleted it)
     args = [str(x) for x in cfg.get("args") or []]
     flag = next((f for f in ("--glm-pack", "--gguf") if f in args[:-1]), None)   # (Metal: the first GGUF file, no pack)
