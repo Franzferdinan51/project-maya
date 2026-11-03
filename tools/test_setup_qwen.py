@@ -1,7 +1,8 @@
 """tools/test_setup_qwen.py - CYBER-FROST-3.8-PS in the setup and the dashboard: its name everywhere
 ("Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M"; its ids stay), the setup ids, its configs recognised (not taken for DeepSeek's --pack), the pinned download manifest, the
 context recommended by the VRAM, the drafting choice written into the config, the Models page's settings, and its
-template's thinking (always on; thinking off closes the block as its Qwen base writes it).  No GPU, no network.
+template's thinking (always on; thinking off closes the block as its Qwen base writes it); and its Metal backend's
+setup wiring (the gate, the build selection, the compile invocation, the -metal config).  No GPU, no network.
 
     python -m unittest tools.test_setup_qwen -v
 """
@@ -258,6 +259,83 @@ class Vision(unittest.TestCase):
                                            self.d, self.d, vision)
                 c = json.loads(p.read_text())
                 self.assertEqual((c.get("vision"), "--vision" in c["args"]), (vision, vision is not None))
+
+
+class MetalSetup(unittest.TestCase):
+    """The Qwen engine's Metal backend in the setup: --backend metal accepts the family (its own build folder and
+    the `maya` target, -DSTRATA_ENABLE_METAL=ON), its config is maya-cyber-frost-metal.json with backend "metal",
+    and the GLM Metal / CUDA / HIP selections are as before.  The PC probes are faked: no Mac needed."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.patches = [patch.object(maya, n, lambda *a, **k: None) for n in ("say", "ok", "warn", "step")]
+        self.patches += [patch.object(maya, "apple_silicon", lambda: True),
+                         patch.object(maya, "metal_gpus",
+                                      lambda: [{"index": 0, "name": "Apple M-test", "vram_gb": 108.8}]),
+                         patch.object(maya, "mem_gb", lambda: (128.0, 100.0)),
+                         patch.object(maya.S, "out", lambda cmd, *a, **k: "/fake/tool"),
+                         patch.object(maya, "pick_cmake", lambda: "/usr/bin/cmake"),
+                         patch.object(maya, "tool_version", lambda exe: (3, 28))]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def a(self, **kw):
+        return type("A", (), dict(dict(backend="metal", gpus=None, gpu=None, model=None, model_dir=None,
+                                       gguf_dir=None, draft=None, yes=True), **kw))()
+
+    def test_gate(self):
+        pc = maya.check_pc(self.a(), "qwen")
+        self.assertEqual((pc["backend"], pc["metal_family"]), ("metal", "qwen"))
+        self.assertEqual((maya.BUILD.name, maya.EXE.name), ("build-metal-qwen", "maya"))
+        pc = maya.check_pc(self.a(), "glm")            # (GLM on Metal: as before, no marker)
+        self.assertNotIn("metal_family", pc)
+        self.assertEqual((maya.BUILD.name, maya.EXE.name), ("build-metal", "maya-metal"))
+        with self.assertRaises(SystemExit):            # (a family with no Metal engine: still refused)
+            maya.check_pc(self.a(), "deepseek")
+
+    def test_build_selection(self):
+        for backend, family, folder, exe in (("cuda", "", "build", "maya"), ("hip", "", "build-hip", "maya"),
+                                             ("metal", "", "build-metal", "maya-metal"),
+                                             ("metal", "qwen", "build-metal-qwen", "maya")):
+            maya.select_build_backend(backend, family)
+            self.assertEqual((maya.BUILD.name, maya.EXE.name), (folder, exe), (backend, family))
+
+    def test_compile_invocation(self):
+        calls = []
+        maya.BUILD, maya.STAMP = self.d / "b", self.d / "b" / "MAYA-BUILD.json"
+        maya.EXE = self.d / "b" / "maya"
+        maya.BUILD.mkdir()
+        with patch.object(maya, "cmake_steps", lambda *a, **k: calls.append(a) or 0), \
+                patch.object(maya, "cached_generator", lambda: None), patch.object(maya, "venv_tool", lambda n: None):
+            meta = maya.compile_engine_metal_qwen("src")
+        conf, build = calls[0][0], calls[0][1]
+        self.assertIn("-DSTRATA_ENABLE_METAL=ON", conf)
+        self.assertFalse(any("MAYA_ENABLE_METAL" in c for c in conf))
+        self.assertEqual(build[build.index("--target") + 1], "maya")
+        self.assertEqual((meta["backend"], meta["metal_family"], meta["targets"]), ("metal", "qwen", ["maya"]))
+
+    def test_config(self):
+        pack = self.d / "pack"
+        (pack / "tokenizer").mkdir(parents=True)
+        a = type("A", (), dict(port=None, env=[], host=None, api_key=None))()
+        exe = Path("/repo/build-metal-qwen/maya")
+        with patch.object(maya, "ROOT", self.d), patch.object(maya, "EXE", exe), \
+                patch.object(maya, "write_run_script", lambda *x: self.d / "run"):
+            p = maya.write_config_qwen(a, {"backend": "metal", "metal_family": "qwen", "gpus": [{"index": 0}]}, {},
+                                       pack, self.d / "x.gguf", 65536, self.d, self.d)
+            c = json.loads(p.read_text())
+            self.assertEqual(p.name, "maya-cyber-frost-metal.json")
+            self.assertEqual((c["backend"], c["exe"]), ("metal", str(exe)))
+            self.assertTrue(all(f in c["args"] for f in ("--pack", "--native", "--ple-gguf")))
+            p = maya.write_config_qwen(a, {"backend": "cuda", "gpus": [{"index": 0}]}, {},
+                                       pack, self.d / "x.gguf", 65536, self.d, self.d)
+            c = json.loads(p.read_text())              # (CUDA: as before - no backend key, no -metal name)
+            self.assertEqual((p.name, "backend" in c), ("maya-cyber-frost.json", False))
 
 
 if __name__ == "__main__":

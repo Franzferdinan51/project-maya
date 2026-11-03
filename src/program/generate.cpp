@@ -8246,8 +8246,9 @@ int main(int argc, char** argv) {
                     return s;
                 }();
                 auto hash_dev = [&](const void* p, size_t bytes, uint64_t h) {
+                    if (p == nullptr || bytes == 0) return h;   // GRFOLD debug fix: an unallocated piece (e.g. no PLE) hashed as absent, not a crash
                     std::vector<uint8_t> b(bytes);
-                    if (bytes) cudaMemcpy(b.data(), p, bytes, cudaMemcpyDefault);   // VRAM or a streamed host copy
+                    cudaMemcpy(b.data(), p, bytes, cudaMemcpyDefault);   // VRAM or a streamed host copy
                     return fnv1a(b.data(), b.size(), h);
                 };
                 // the cells [c0, c1) of one int8 K or V pool ([page][kv_head][page_size][head_dim]), bytes per value `w`
@@ -8295,10 +8296,36 @@ int main(int argc, char** argv) {
                 };
                 const int64_t end_cell = std::min<int64_t>(((L + qs.page_size - 1) / qs.page_size) * qs.page_size,
                                                            ss.qsa_states[0].max_cells);
+                static const bool state_dump = std::getenv("STRATA_STATE_DUMP") != nullptr;
+                auto dump_f32 = [&](const char* tag, int64_t idx, const float* p, size_t n) {
+                    if (!state_dump || p == nullptr || n == 0) return;
+                    std::vector<float> v(n);
+                    cudaMemcpy(v.data(), p, n * 4, cudaMemcpyDefault);
+                    std::fprintf(stderr, "STATEDUMP %s %lld", tag, (long long) idx);
+                    for (size_t i = 0; i < n; ++i) std::fprintf(stderr, " %.9g", (double) v[i]);
+                    std::fprintf(stderr, "\n");
+                };
+                dump_f32("ple", -1, (const float*) ss.ple_hist, z.ple / 4);
+                if (state_dump) {   // GDN per layer: sum, max-abs and a strided sample (full state is far too large to print)
+                    const size_t per = z.gdn / (size_t) g.n_gdn_layers();
+                    std::vector<float> v(per / 4);
+                    for (int64_t i = 0; i < g.n_gdn_layers(); ++i) {
+                        cudaMemcpy(v.data(), (const uint8_t*) ss.gdn_state + i * per, per, cudaMemcpyDefault);
+                        double sum = 0.0; float mx = 0.0f;
+                        for (float x : v) { sum += x; if (std::fabs(x) > mx) mx = std::fabs(x); }
+                        std::fprintf(stderr, "STATEDUMP gdn %lld sum=%.9g maxabs=%.9g", (long long) i, sum, (double) mx);
+                        for (int k = 0; k < 16; ++k)
+                            std::fprintf(stderr, " %.9g", (double) v[(size_t) k * (v.size() / 16)]);
+                        std::fprintf(stderr, "\n");
+                    }
+                }
                 for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
                     const strata::core::QsaState& st = ss.qsa_states[i];
                     h_tail = hash_dev(st.idx_tail, z.tail, h_tail);
                     h_pool = hash_dev(st.idx_pooled, (size_t) (L / qs.idx_block) * qs.idx_dim * 4, h_pool);
+                    dump_f32("tail", i, (const float*) st.idx_tail, z.tail / 4);
+                    dump_f32("pooled", i, (const float*) st.idx_pooled,
+                             (size_t) (L / qs.idx_block + 1) * (size_t) qs.idx_dim);
                     // KV streaming: the host copy is the identity layout and holds every cell
                     for (const auto& [pool, w] : kv_arrays(st)) {
                         h_kv = hash_cells(pool, w, 0, L, h_kv);
