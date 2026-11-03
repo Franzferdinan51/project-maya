@@ -192,8 +192,8 @@ struct Rows {
 /// with candidates p = cand[t][i / blk] * blk + i % blk for i < lim.k[t] * blk; positions >= lim.n[t] (or past the
 /// query's candidates) -> -inf.  q rows heads * hd apart, w rows 64, cand rows cand_stride, out rows out_stride; the keys
 /// k rows of format kfmt (the cache's kKvFp4p, or kKvBf16).
-/// With kKvFp4p keys and DS4_INDEX_TC=1 (and tc) the tensor cores' kernel: the same products, FP32 sums in another
-/// order.
+/// With kKvFp4p keys and DS4_INDEX_TC=1 (and tc) the tensor cores' kernel (on RDNA 3 its WMMAs): the same products, FP32
+/// sums in another order.
 void index_score(const float* q, const float* w, const void* k, int heads, int hd, int T, int n, const int* cand,
                  int cand_stride, int blk, const Rows& lim, float* out, long long out_stride, cudaStream_t s,
                  int kfmt = kKvFp4p, bool tc = true);
@@ -504,7 +504,7 @@ constexpr int kAr2Piece = 8192;   // (float4s a piece: 128 KB of F32 rows, 64 KB
 void tab_set(const unsigned long long* pairs, int n, cudaStream_t s);
 /// A group of two with pflags (DS4_AR2): ar2_kernel, the put and the sums in one pipelined launch
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s);
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
 constexpr int kPeerArBlocks = 64, kPeerArFlagStride = 32;
 // Optional diagnostic written only by the first block to set the timeout bit.
 struct PeerArFailure {
@@ -530,6 +530,8 @@ struct PeerAr {
     uint64_t timeout_ticks = 0; // HIP wall_clock64 ticks, calibrated with hipDeviceAttributeWallClockRate.
 };
 bool allreduce_peer(float* x, int n, const PeerAr& a, int mi, unsigned seq, cudaStream_t s);
+/// load the transports' kernels on the current device before any of them spins (CUDA lazy loading; HIP: no-op)
+void peer_ar_preload();
 enum class PeerTransport { host, ar2, peer };
 struct PeerCalibration {
     PeerTransport selected = PeerTransport::host;
