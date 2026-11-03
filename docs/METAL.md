@@ -6,7 +6,8 @@ Experimental: GLM-5.3-Flash on a Mac with Apple Silicon, on its GPU through Meta
 OpenAI- and Anthropic-compatible API as on Linux and Windows (streamed answers, tool calls, thinking levels). It reads
 pictures (`maya-vision`, the image encoder, runs on the GPU too), and it drafts
 with the model's MTP block or the DFlash2 drafter (`--draft dflash2`) when that is faster on the Mac. One conversation at a time;
-DeepSeek-V4.1-Flash, MiniMax-M3.1-Flash and Qwen-3.8-Flash-Next are NVIDIA / AMD only for now.
+DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash are NVIDIA / AMD only for now. Qwen-3.8-Flash-Next has its own Metal
+backend, in an earlier stage of construction - see its section below.
 
 **Status: experimental.** Mac support is a community contribution. Every change is built and unit-tested on GitHub's
 Apple Silicon runners (the `macos` workflow: the engine, its sampler and the small synthetic-model tests), but the
@@ -23,6 +24,44 @@ Maya team has no Mac and has not run it with the real model. If you try it on a 
 You need macOS on Apple Silicon (M1 or newer), the Xcode Command Line Tools (`xcode-select --install`), CMake 3.24+
 (`brew install cmake`) and Python 3.10+. On a Mac `./maya.sh` picks the Metal backend by itself when nothing is set
 up yet.
+
+## Qwen-3.8-Flash-Next on Metal (its own engine)
+
+The Qwen family does not run on the GLM engine above. Maya's own Qwen engine - the same engine core that runs it on
+CUDA and HIP (the pack layout, the expert cache, the MTP drafter, the server protocol) - is getting a Metal backend
+for Apple Silicon, in `src/metal-qwen`, selected with CMake's `-DSTRATA_ENABLE_METAL=ON`. It is a separate build from
+GLM's: `build-metal-qwen/`, target `maya` (the target name the Qwen engine has on every backend), and the two builds
+refuse to be enabled together.
+
+```sh
+./maya.sh --backend metal --model cyber-frost --setup   # build the engine, download the model, write the config
+./maya.sh --config maya-cyber-frost-metal.json          # start it: dashboard at http://127.0.0.1:8080
+```
+
+The setup is the Qwen setup you already know from CUDA: the same pinned download (`tools/qwen/download.json`,
+sha256-checked), the same pack built from the GGUF, the same shipped expert profile
+(`data/expert-profile-qwen.bin`), the same context choices. What differs is only the engine's build and the config's
+name (`maya-cyber-frost-metal.json`, its `backend` is `metal`, its `exe` the `maya` in `build-metal-qwen/`). The
+requirements are the Mac requirements above; drafting is the model's MTP drafter as built (nothing is measured on
+Metal yet, so no speed calibration runs there).
+
+**Status: skeleton stage, under construction.** The build wiring and the setup above are in place, and the engine
+core compiles for Metal against a compatibility layer; the device kernels land family by family, and the ones not
+yet ported are named stubs that stop loudly rather than answer wrongly. It has not yet run the real model end to
+end, there are no speed numbers for it, and pictures are not part of this stage. GLM-5.3-Flash above is the Metal
+model to use today; this section is where the Qwen backend's progress will be written as the stages land.
+
+Building it by hand:
+
+```sh
+cmake -S . -B build-metal-qwen -DSTRATA_ENABLE_METAL=ON
+cmake --build build-metal-qwen --target maya -j
+```
+
+In CI it plugs into the existing `macos` workflow (`.github/workflows/macos.yml`) as a second job of the same
+shape - configure `build-metal-qwen` with `-DSTRATA_ENABLE_METAL=ON`, build the `maya` target, run
+`./build-metal-qwen/maya --help` - beside the GLM job, not inside it. That job is a follow-up step: it is added
+once the build is verified on a real Mac, so the workflow never goes red on an unverified build.
 
 ## How it runs
 

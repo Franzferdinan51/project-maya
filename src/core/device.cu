@@ -19,10 +19,21 @@ void check(cudaError_t e, const char* what) {
 // A NaN pattern, not zero.  Zeros read from uninitialised memory are indistinguishable from real zeros in a
 // dequantized weight or a masked attention score, which is exactly the kind of wrong-but-plausible value the
 // Phase 1 harnesses kept catching.
+#if defined(STRATA_USE_METAL)
+// The Metal backend's memory is host memory (shared MTLBuffers): the poison fill is a host
+// loop writing the same NaN pattern, no kernel to launch.
+void poison_kernel(float* p, uint64_t n_floats) {
+    const uint32_t nan_bits = 0x7fc00000u;
+    float nan_value;
+    std::memcpy(&nan_value, &nan_bits, sizeof(nan_value));
+    for (uint64_t i = 0; i < n_floats; ++i) p[i] = nan_value;
+}
+#else
 __global__ void poison_kernel(float* p, uint64_t n_floats) {
     const uint64_t i = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n_floats) p[i] = __int_as_float(0x7fc00000);
 }
+#endif
 
 #if defined(STRATA_USE_HIP)
 #if !defined(STRATA_HIP_ARCHS)
@@ -147,7 +158,12 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
         const uint64_t max_blocks = 0x7FFFFFFFull;
         for (uint64_t b = 0; b < blocks; b += max_blocks) {
             const uint64_t chunk = (blocks - b < max_blocks) ? (blocks - b) : max_blocks;
+#if defined(STRATA_USE_METAL)
+            (void) chunk;
+            poison_kernel((float*) base_ + b * threads, n - b * threads);
+#else
             poison_kernel<<<(unsigned) chunk, threads>>>((float*) base_ + b * threads, n - b * threads);
+#endif
             check(cudaGetLastError(), "poison_kernel");
         }
         check(cudaDeviceSynchronize(), "poison sync");

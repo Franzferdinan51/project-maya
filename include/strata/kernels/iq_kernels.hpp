@@ -82,4 +82,21 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            float swiglu_limit = std::numeric_limits<float>::infinity());
 
+/// The same computation as `native_expert_grouped`, for the case where every group's blob lies inside ONE
+/// allocation: the allocation starting at `blob_base` (host contents address `blob_base`, `blob_span` bytes).
+/// A group's blob offset is grp_ptr[g] - (address of blob_base), computed where the plan is read. This is the
+/// form captured-body callers must use on backends whose kernels cannot dereference pointer values stored in
+/// device memory (Metal): the plan (grp_ptr / grp_start / n_groups) is read on the device under a fixed
+/// cap_groups grid, exactly as the CUDA launcher's kernels read it, and no host synchronisation or readback
+/// happens at any point, so the entry is safe to invoke from inside a graph/body while the stream's earlier
+/// work is still in flight. Groups whose pointer falls outside [blob_base, blob_base + blob_span) contribute
+/// nothing (their output rows are not written). On CUDA the base is redundant (device pointers dereference
+/// directly) and this entry is exactly `native_expert_grouped`.
+void native_expert_grouped_based(const NativeExpertLayout& L, const void* blob_base, uint64_t blob_span,
+                                 const unsigned long long* grp_ptr, const int32_t* grp_start,
+                                 const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok,
+                                 int64_t cap_groups, int64_t cap_entries, const void* x_q8_1, void* scratch,
+                                 float* out, void* stream,
+                                 float swiglu_limit = std::numeric_limits<float>::infinity());
+
 }  // namespace strata::kernels

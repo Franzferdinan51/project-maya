@@ -25,6 +25,10 @@ CapturedGraph& CapturedGraph::operator=(CapturedGraph&& o) noexcept {
         exec_ = o.exec_;
         done_ = o.done_;
         nodes_ = o.nodes_;
+#ifdef STRATA_USE_METAL
+        body_ = std::move(o.body_);
+        o.body_ = nullptr;
+#endif
         o.graph_ = nullptr;
         o.exec_ = nullptr;
         o.done_ = nullptr;
@@ -32,6 +36,17 @@ CapturedGraph& CapturedGraph::operator=(CapturedGraph&& o) noexcept {
     }
     return *this;
 }
+
+#ifdef STRATA_USE_METAL
+bool CapturedGraph::adopt_body(std::function<void()> body, std::string& err) {
+    if (!body) { err = "adopt_body: an empty body is a wiring mistake, not a graph"; return false; }
+    body_ = std::move(body);
+    nodes_ = 1;  // not a node count (there is no graph); nonzero so "recorded nothing" checks stay honest
+    const cudaError_t e = cudaEventCreateWithFlags(&done_, cudaEventDisableTiming);
+    if (e != cudaSuccess) return fail(err, "cudaEventCreateWithFlags", e);
+    return true;
+}
+#endif
 
 void CapturedGraph::reset() {
     // ORDER MATTERS: destroying a graph exec BLOCKS until the launch it is destroying has completed, so
@@ -41,6 +56,9 @@ void CapturedGraph::reset() {
     if (exec_) { cudaGraphExecDestroy(exec_); exec_ = nullptr; }
     if (graph_) { cudaGraphDestroy(graph_); graph_ = nullptr; }
     if (done_) { cudaEventDestroy(done_); done_ = nullptr; }
+#ifdef STRATA_USE_METAL
+    body_ = nullptr;
+#endif
     nodes_ = 0;
 }
 
@@ -73,6 +91,22 @@ bool CapturedGraph::end(void* stream, std::string& err) {
 }
 
 bool CapturedGraph::launch(void* stream, std::string& err) const {
+#ifdef STRATA_USE_METAL
+    if (body_) {
+        // No graph exists: replay IS invoking the recorded body on the live stream.
+        // The body reads its per-step values from the same fixed device buffers the
+        // capture contract already requires (graph.hpp NOTE 2/3), so invoking it is
+        // semantically the replay, not an approximation of it.
+        (void) cudaGetLastError();  // clear first: wait_ms polls cudaEventQuery, whose
+                                    // NotReady returns would otherwise read as body errors
+        body_();
+        const cudaError_t be = cudaGetLastError();
+        if (be != cudaSuccess) return fail(err, "the replayed body left a CUDA error", be);
+        const cudaError_t e = cudaEventRecord(done_, (cudaStream_t) stream);
+        if (e != cudaSuccess) return fail(err, "cudaEventRecord", e);
+        return true;
+    }
+#endif
     if (!exec_) { err = "launch: not recorded"; return false; }
     cudaError_t e = cudaGraphLaunch(exec_, (cudaStream_t) stream);
     if (e != cudaSuccess) return fail(err, "cudaGraphLaunch", e);
@@ -104,6 +138,21 @@ bool CapturedGraph::wait_ms(int timeout_ms) const {
 bool GraphRegistry::record(LayerType type, int n_tokens, const std::function<void()>& body, std::string& err) {
     const Key k{(int) type, n_tokens};
     if (graphs_.count(k)) return true;              // already recorded: the point of a registry
+
+#ifdef STRATA_USE_METAL
+    // Metal: keep the body, run nothing now. The body launches the layer's ops when
+    // launch() invokes it, against the state as it stands at that token - which is
+    // what a replay would compute (the body's arguments are fixed buffers, per the
+    // header's capture contract). Running it here as well would execute the layer
+    // once at record time, at whatever position the recorder happened to be at.
+    {
+        CapturedGraph g;
+        if (!g.adopt_body(body, err)) return false;
+        graphs_.emplace(k, std::move(g));
+        ++captures_;
+        return true;
+    }
+#endif
 
     CapturedGraph g;
     if (!g.begin(stream_, err)) return false;

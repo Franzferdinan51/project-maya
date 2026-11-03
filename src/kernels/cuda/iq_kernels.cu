@@ -1029,6 +1029,20 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     check("native_expert_grouped/down");
 }
+
+void native_expert_grouped_based(const NativeExpertLayout& L, const void* blob_base, uint64_t blob_span,
+                                 const unsigned long long* grp_ptr, const int32_t* grp_start,
+                                 const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok,
+                                 int64_t cap_groups, int64_t cap_entries, const void* x_q8_1, void* scratch,
+                                 float* out, void* stream, float swiglu_limit) {
+    // CUDA device pointers dereference directly, so the base-relative form the Metal backend needs is
+    // exactly the plain grouped entry here (the caller guarantees the blobs lie inside the base allocation,
+    // which is the only thing the base could add).
+    (void) blob_base;
+    (void) blob_span;
+    native_expert_grouped(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1,
+                          scratch, out, stream, swiglu_limit);
+}
 }  // namespace strata::kernels
 
 // ---- Volta prompt experts (STRATA_PF_WMMA): a group's experts as one launch of FP16 tensor-core tiles, the weights

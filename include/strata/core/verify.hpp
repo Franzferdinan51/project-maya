@@ -31,6 +31,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -158,6 +159,7 @@ private:
     void* next_user_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     bool capture_commit(std::string& err);
+    bool record_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
     static constexpr int kProfPer = 32;              // stamps per layer
     bool prof_on_ = false;
@@ -165,6 +167,48 @@ private:
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
+    // GRFOLD debug (STRATA_METAL_HASH_RESID, off by default): per-layer
+    // residual fingerprints. Stages: 0 R after gr_read(0), 1 mixed after
+    // gr_read(0), 2 bo after the mixer, 3 R after gr_read(1), 4 bo after
+    // post()'s combine, 5 mixed after gr_read(1) (the FFN input), 6 router
+    // ids+weights, 7 shared expert output, 8 parts after moe_hit_add,
+    // 9 nat_xq (quantize_q8_1_rows output), 10 plan dst, 11 plan tok,
+    // 12 plan counts+start, 13 plan start2, 14 hit_out before moe_hit_add.
+    // Slot = ((l * kResidStages) + stage) * max_t + t.
+    static constexpr int kResidStages = 25;
+    bool hash_on_ = false;
+    unsigned long long* hash_d_ = nullptr;
+    std::vector<unsigned long long> hash_h_;
+    int64_t hash_windows_ = 0;
+    // Per-entry-row parts fingerprints: [layer][t][entry] for stage 8 (final
+    // parts) and stage 13 (parts right after the mapped copy).
+    unsigned long long *hash8_d_ = nullptr, *hash13_d_ = nullptr;
+    std::vector<unsigned long long> hash8_h_, hash13_h_;
+    // Layer-0 value snapshots (debug): hit_out before moe_hit_add and parts
+    // after it, copied device-to-device in stream order inside post().
+    float *snap_hit_ = nullptr, *snap_parts_ = nullptr;
+    int64_t snap_win_ = -1;
+    // GRFOLD debug: strided residual value snapshots [layer][t][sample],
+    // filled where stage 0 is hashed and printed with the RESID block, to
+    // measure per-layer deviation growth between window tilings in VALUES.
+    float* val_d_ = nullptr;
+    std::vector<float> val_h_;
+    static constexpr int kValSamples = 64;
+    bool val_on_ = false;
+    // GRFOLD debug: QSA chain value snapshots [layer][t][which][sample],
+    // which: 0 = attn_ (post attention), 1 = attn32_ (post gate), 2 = bo_
+    // (post o-projection mmvq).
+    float* val2_d_ = nullptr;
+    std::vector<float> val2_h_;
+    // GRFOLD debug: selection snapshots [layer][t][2][64]: block 0 = the
+    // first 64 selected cell ids (bit-cast), block 1 = the 4 step fields.
+    float* val3_d_ = nullptr;
+    std::vector<float> val3_h_;
+    // GRFOLD debug: single-writer probe [4][64]: 0 = attn_ L3 pos27,
+    // 1 = attn32_ L3 pos27, 2 = qcur_ L3 pos27, 3 = attn_ L3 pos26.
+    // Written by exactly one window, so no cross-window slot reuse.
+    float* val4_d_ = nullptr;
+    std::vector<float> val4_h_;
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;
@@ -180,6 +224,26 @@ private:
     cudaStream_t cs_ = nullptr;
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t commit_exec_ = nullptr;
+#ifdef STRATA_USE_METAL
+    // Metal has no stream capture (src/metal-qwen/RISKS.md SS1): capture() and
+    // capture_commit() store their launch sequence as a body, and the launch
+    // sites invoke the body instead of cudaGraphLaunch
+    // (src/metal-qwen/runtime/CAPTURE-NOTES.md). The exec slots still hold
+    // minted (empty) graph execs so the "already captured" checks and the
+    // destructor's destroys keep the CUDA shape. The bodies are plain void():
+    // a Verifier only ever launches on its own stream (cs_), unlike the
+    // session graphs, whose launch stream is the caller's.
+    std::function<void()> window_body_[9];
+    std::function<void()> commit_body_;
+    // STRATA_VERIFY_NODES accounting on Metal: the graph-node introspection
+    // (cudaGraphGetNodes / cudaGraphKernelNodeGetParams) has no analogue, so
+    // the kernel-name list is taken from the stored sequence itself - the
+    // runtime records the body's own launch names around its first launch.
+    // A dry recording pass at capture time is not an option: record_window
+    // mutates the very state (KV appends, GDN recurrence) the window exists
+    // to advance, so the names can only be read as the sequence really runs.
+    bool window_names_pending_[9] = {};
+#endif
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T

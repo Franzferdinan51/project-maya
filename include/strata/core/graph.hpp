@@ -74,7 +74,22 @@ public:
     bool wait_ms(int timeout_ms) const;
 
     size_t nodes() const { return nodes_; }
-    bool valid() const { return exec_ != nullptr; }
+    bool valid() const {
+#ifdef STRATA_USE_METAL
+        return exec_ != nullptr || body_ != nullptr;
+#else
+        return exec_ != nullptr;
+#endif
+    }
+
+#ifdef STRATA_USE_METAL
+    /// Metal has no stream capture (see src/metal-qwen/RISKS.md SS1): instead of a
+    /// captured graph, the registry keeps the recorded body and launch() invokes it -
+    /// correct by construction, at the cost of the per-call host submission the graph
+    /// existed to save. adopt_body stores `body` and creates the completion event
+    /// launch()/wait_ms() poll, exactly as end() does on the capture path.
+    bool adopt_body(std::function<void()> body, std::string& err);
+#endif
 
 private:
     void reset();
@@ -82,6 +97,9 @@ private:
     cudaGraphExec_t exec_ = nullptr;
     cudaEvent_t done_ = nullptr;
     size_t nodes_ = 0;
+#ifdef STRATA_USE_METAL
+    std::function<void()> body_;  // the recorded layer body (Metal: invoked per launch)
+#endif
 };
 
 /// Capture-once, replay-many, keyed by `(layer_type, n_tokens)`.

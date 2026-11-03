@@ -34,6 +34,12 @@
 #define NOMINMAX   // std::numeric_limits<T>::max() below
 #endif
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -263,6 +269,20 @@ bool available_memory_bytes(uint64_t& bytes) {
         }
     }
     return resolved_v2;
+#elif defined(__APPLE__)
+    // The MemAvailable analogue: free + inactive + speculative pages are the ones the VM
+    // can hand out or reclaim without swapping anything live out.
+    vm_statistics64_data_t vmstat{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vmstat, &count) != KERN_SUCCESS)
+        return false;
+    const long page_bytes = sysconf(_SC_PAGESIZE);
+    if (page_bytes <= 0) return false;
+    const uint64_t pages = (uint64_t) vmstat.free_count + (uint64_t) vmstat.inactive_count +
+                           (uint64_t) vmstat.speculative_count;
+    if (pages > std::numeric_limits<uint64_t>::max() / (uint64_t) page_bytes) return false;
+    bytes = pages * (uint64_t) page_bytes;
+    return bytes > 0;
 #else
     const long pages = sysconf(_SC_AVPHYS_PAGES);
     const long page_bytes = sysconf(_SC_PAGESIZE);
@@ -691,7 +711,13 @@ bool FileExpertSource::pin_cache_complement(
             }
             return false;
         }
+#if defined(__APPLE__)
+        // No posix_fadvise on macOS; the call is an advisory page-cache hint, so the
+        // load proceeds without it (the pages age out of the cache on their own).
+        const int advice = 0;
+#else
         const int advice = posix_fadvise(fd_, (off_t) layer_offset, (off_t) layer_bytes, POSIX_FADV_DONTNEED);
+#endif
         if (advice != 0) {
             err = "FileExpertSource: posix_fadvise could not release expert layer " + std::to_string(layer);
             if (arena != nullptr) {
@@ -984,7 +1010,15 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
+#ifdef STRATA_USE_METAL
+        // On Metal the copy engine stages EVERY pcie mode: the mode-1/2 device aliases point into
+        // unregistered host memory that no kernel can bind or dereference, so the staged route is the
+        // only one a grouped kernel can read - Verifier::fetch_dma lands the blobs in staging and
+        // raises flag B, and the body-side fetch_blobs is a no-op (see verify_kernels.cpp).
+        if (P.fetch) P.fetch(P.ctx, dma_src, fetches, (size_t) bb);   // the copy engine, beside the CPU's work
+#else
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
+#endif
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
@@ -1940,7 +1974,7 @@ bool GgufExpertSource::make_resident(const std::vector<std::pair<int32_t, int32_
                     const size_t i = (size_t) l * (size_t) n_expert_ + (size_t) e;
                     if (res_off_[i] == kNone) continue;
                     assemble(l, e, (uint8_t*) res_base_ + res_off_[i]);
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__APPLE__)
                     // the file pages are not needed again: give them back to the page cache's other users
                     const uint8_t* src[3];
                     uint64_t bytes[3], off[3];
@@ -1956,7 +1990,7 @@ bool GgufExpertSource::make_resident(const std::vector<std::pair<int32_t, int32_
         worker();
         for (auto& t : pool) t.join();
     }
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__APPLE__)
     for (const auto& [l, e] : drop) {
         if (!valid(l, e)) continue;
         const uint8_t* src[3];

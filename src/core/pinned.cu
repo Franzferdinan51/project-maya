@@ -24,7 +24,9 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#if defined(__linux__)
 #include <linux/mman.h>
+#endif
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << 26)
 #endif
@@ -84,6 +86,7 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
     got = PageBacking::NormalPages;
     return p;
 #else
+#if defined(__linux__)
     void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
     if (p != MAP_FAILED) {
@@ -92,6 +95,12 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
         return p;
     }
     note = "MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages";
+#else
+    // macOS has no hugetlb: the plain mapping below is the only path (the VM's own large
+    // pages are the OS's business, not the caller's).
+    note = "no hugetlb on this platform; using 4 KB pages";
+    void* p = nullptr;
+#endif
     p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     got = PageBacking::NormalPages;
     return p == MAP_FAILED ? nullptr : p;

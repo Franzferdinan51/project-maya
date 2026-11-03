@@ -26,6 +26,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -105,6 +106,17 @@ private:
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, std::string& err);
     bool capture_step(int j, std::string& err);
+#ifdef STRATA_USE_METAL
+    // Metal has no stream capture (src/metal-qwen/RISKS.md SS1): each capture_* stores
+    // its launch sequence as a body, and the launch sites invoke the body instead of
+    // cudaGraphLaunch (runtime/CAPTURE-NOTES.md). The exec slots still hold a minted
+    // (empty) graph exec so the "already captured" checks and the destructor's
+    // destroys stay exactly the CUDA shape.
+    std::function<void()> prefill_body_[9];
+    std::function<void()> prefill_dev_body_[9];
+    std::function<void()> round_body_[9];
+    std::function<void()> step_body_[9];
+#endif
     cudaGraphExec_t step_exec_[9] = {};
     const float* f32(const char* name) const;
     const uint16_t* bf16(const char* name) const;

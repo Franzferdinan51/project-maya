@@ -539,6 +539,40 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
     return true;
 }
 
+#ifdef STRATA_USE_METAL
+namespace {
+// Mint a real (empty) graph exec through the runtime's graph state machine, so the
+// exec slots are genuine handles the destructor can destroy in the usual way. The
+// work itself lives in the stored body; launching the exec is never how Metal runs it.
+cudaGraphExec_t mint_empty_exec(cudaStream_t cs) {
+    if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) != cudaSuccess) return nullptr;
+    cudaGraph_t graph = nullptr;
+    if (cudaStreamEndCapture(cs, &graph) != cudaSuccess || !graph) return nullptr;
+    cudaGraphExec_t exec = nullptr;
+    cudaGraphInstantiate(&exec, graph, 0);
+    cudaGraphDestroy(graph);
+    return exec;
+}
+
+// Run a captured sequence: the stored body on Metal, the graph everywhere else.
+bool mtp_graph_launch(cudaGraphExec_t exec, const std::function<void()>* body, cudaStream_t cs) {
+    if (body && *body) {
+        (*body)();
+        return cudaGetLastError() == cudaSuccess;
+    }
+    return cudaGraphLaunch(exec, cs) == cudaSuccess;
+}
+
+[[noreturn]] void mtp_body_fail(const char* what, const std::string& err) {
+    std::fprintf(stderr, "strata metal: mtp %s body failed at launch: %s\n", what, err.c_str());
+    std::abort();
+}
+}  // namespace
+#define MTP_LAUNCH(exec, body, cs) (mtp_graph_launch((exec), (body), (cs)))
+#else
+#define MTP_LAUNCH(exec, body, cs) (cudaGraphLaunch((exec), (cs)) == cudaSuccess)
+#endif
+
 namespace {
 bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char* what, std::string& err) {
     cudaGraph_t graph = nullptr;
@@ -562,6 +596,19 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
 
 bool MtpDrafter::capture_prefill(int T, std::string& err) {
     if (prefill_exec_[T]) return true;
+#ifdef STRATA_USE_METAL
+    prefill_body_[T] = [this, T] {
+        using namespace strata::kernels;
+        std::string e;
+        copy_i32_from_mapped(tok_, m_tok_, T, cs_);
+        copy_i32_from_mapped(step_, m_step_, (int64_t) T * 4, cs_);
+        copy_i32_from_mapped(pos_, m_pos_, (int64_t) T * g_->n_head, cs_);
+        if (!record_forward(T, -1, cs_, e)) mtp_body_fail("prefill", e);   // K/V only, rows [0, T)
+    };
+    prefill_exec_[T] = mint_empty_exec(cs_);
+    if (!prefill_exec_[T]) { err = "mtp: prefill capture (Metal)"; return false; }
+    return true;
+#else
     using namespace strata::kernels;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     copy_i32_from_mapped(tok_, m_tok_, T, cs_);
@@ -569,17 +616,50 @@ bool MtpDrafter::capture_prefill(int T, std::string& err) {
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) T * g_->n_head, cs_);
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T)
     return finish_capture(cs_, ok, prefill_exec_[T], "prefill", err);
+#endif
 }
 
 bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
     if (prefill_dev_exec_[T]) return true;
+#ifdef STRATA_USE_METAL
+    prefill_dev_body_[T] = [this, T] {
+        std::string e;
+        if (!record_forward(T, -1, cs_, e)) mtp_body_fail("prefill (device inputs)", e);
+    };
+    prefill_dev_exec_[T] = mint_empty_exec(cs_);
+    if (!prefill_dev_exec_[T]) { err = "mtp: prefill (device inputs) capture (Metal)"; return false; }
+    return true;
+#else
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T); tok_/step_/pos_ filled before launch
     return finish_capture(cs_, ok, prefill_dev_exec_[T], "prefill (device inputs)", err);
+#endif
 }
 
 bool MtpDrafter::capture_round(int T, std::string& err) {
     if (round_exec_[T]) return true;
+#ifdef STRATA_USE_METAL
+    round_body_[T] = [this, T] {
+        using namespace strata::kernels;
+        const int64_t HCN = g_->hc * g_->n_embd;
+        std::string e;
+        copy_i32_from_mapped(tok_, m_tok_, T, cs_);
+        copy_i32_from_mapped(step_, m_step_, (int64_t) 2 * T * 4, cs_);
+        copy_i32_from_mapped(pos_, m_pos_, (int64_t) 2 * T * g_->n_head, cs_);
+        copy_i32_from_mapped(row_, m_row_, 2, cs_);
+        copy_from_mapped(Rin_, window_R_, (int64_t) T * HCN, cs_);
+        const int ra = 2 * max_t_ - 1;
+        if (!record_forward(T, -1, cs_, e)) mtp_body_fail("round", e);
+        mtp_select(Rin_, HCN, tok_, row_, Rin_, tok_, nullptr, 0, cs_);
+        copy_i32_from_mapped(step_ + ra * 4, m_step_ + ra * 4, 4, cs_);
+        copy_i32_from_mapped(pos_ + ra * g_->n_head, m_pos_ + ra * g_->n_head, g_->n_head, cs_);
+        if (!record_forward(1, ra, cs_, e)) mtp_body_fail("round", e);
+        mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
+    };
+    round_exec_[T] = mint_empty_exec(cs_);
+    if (!round_exec_[T]) { err = "mtp: round capture (Metal)"; return false; }
+    return true;
+#else
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
@@ -602,12 +682,28 @@ bool MtpDrafter::capture_round(int T, std::string& err) {
     }
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
     return finish_capture(cs_, ok, round_exec_[T], "round", err);
+#endif
 }
 
 // Chain step j (1..max_t-2): one row at the cell staged in step row `max_t + j - 1`, from the previous step's
 // residual and token (left in Rin_[0] / tok_[0] by mtp_select); draft j and its probability to the mapped outputs.
 bool MtpDrafter::capture_step(int j, std::string& err) {
     if (step_exec_[j]) return true;
+#ifdef STRATA_USE_METAL
+    step_body_[j] = [this, j] {
+        using namespace strata::kernels;
+        const int64_t HCN = g_->hc * g_->n_embd;
+        const int row = max_t_ + j - 1;
+        std::string e;
+        copy_i32_from_mapped(step_ + row * 4, m_step_ + row * 4, 4, cs_);
+        copy_i32_from_mapped(pos_ + row * g_->n_head, m_pos_ + row * g_->n_head, g_->n_head, cs_);
+        if (!record_forward(1, row, cs_, e)) mtp_body_fail("step", e);
+        mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+    };
+    step_exec_[j] = mint_empty_exec(cs_);
+    if (!step_exec_[j]) { err = "mtp: step capture (Metal)"; return false; }
+    return true;
+#else
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     const int row = max_t_ + j - 1;
@@ -617,6 +713,7 @@ bool MtpDrafter::capture_step(int j, std::string& err) {
     bool ok = record_forward(1, row, cs_, err);
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
     return finish_capture(cs_, ok, step_exec_[j], "step", err);
+#endif
 }
 
 void MtpDrafter::kv_restore(int64_t upto) {
@@ -681,7 +778,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
                 cudaMemcpyAsync(pos_, d_ps + c * NHp, (size_t) (T * NHp) * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
                 cudaMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
                                 cs_) != cudaSuccess ||
-                cudaGraphLaunch(prefill_dev_exec_[T], cs_) != cudaSuccess) {
+                !MTP_LAUNCH(prefill_dev_exec_[T], &prefill_dev_body_[T], cs_)) {
                 err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
@@ -708,7 +805,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
         }
         if (cudaMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
                             cs_) != cudaSuccess ||
-            cudaGraphLaunch(prefill_exec_[T], cs_) != cudaSuccess ||
+            !MTP_LAUNCH(prefill_exec_[T], &prefill_body_[T], cs_) ||
             cudaStreamSynchronize(cs_) != cudaSuccess) {
             err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
             return false;
@@ -740,7 +837,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     h_row_[0] = a;
     h_row_[1] = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (cudaGraphLaunch(round_exec_[T], cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
+    if (!MTP_LAUNCH(round_exec_[T], &round_body_[T], cs_) || cudaStreamSynchronize(cs_) != cudaSuccess) {
         err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
@@ -753,7 +850,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (!capture_step(j, err)) return false;
         put(max_t_ + j - 1, p + a + j);
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (cudaGraphLaunch(step_exec_[j], cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
+        if (!MTP_LAUNCH(step_exec_[j], &step_body_[j], cs_) || cudaStreamSynchronize(cs_) != cudaSuccess) {
             err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }

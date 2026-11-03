@@ -153,6 +153,48 @@ void stage_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionS
     }
 }
 
+#ifdef STRATA_USE_METAL
+// ---- capture on Metal: stored bodies instead of graphs (src/metal-qwen/runtime/CAPTURE-NOTES.md) ----
+//
+// Metal has no stream capture and no graph object, so the session captures store
+// each captured sequence as a body and the launch sites invoke it on the launch
+// stream. The exec slots still hold minted (empty) graph execs, so the
+// "already captured" checks and the destroys in session_graphs_free /
+// token_graph_free keep the CUDA shape - the same arrangement as mtp.cpp's
+// capture wrappers and graph.cpp's GraphRegistry.
+cudaGraphExec_t session_mint_empty_exec(cudaStream_t cs) {
+    if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) != cudaSuccess) return nullptr;
+    cudaGraph_t graph = nullptr;
+    if (cudaStreamEndCapture(cs, &graph) != cudaSuccess || !graph) return nullptr;
+    cudaGraphExec_t exec = nullptr;
+    cudaGraphInstantiate(&exec, graph, 0);
+    cudaGraphDestroy(graph);
+    return exec;
+}
+
+// A body that fails at launch has no caller left to return an error to - the
+// launch sites only see the launch itself - and a silently half-run layer
+// would corrupt the token, so it aborts loudly (mtp.cpp's mtp_body_fail rule).
+[[noreturn]] void session_body_fail(const char* what, int64_t layer, const std::string& err) {
+    std::fprintf(stderr, "strata metal: session %s body (layer %lld) failed at launch: %s\n", what,
+                 (long long) layer, err.c_str());
+    std::abort();
+}
+
+// Run a captured sequence: the stored body on Metal, the graph everywhere else.
+bool session_graph_launch(cudaGraphExec_t exec, const std::function<void(void*)>* body, void* stream) {
+    if (body && *body) {
+        (void) cudaGetLastError();   // clear first: a stale error is not the body's
+        (*body)(stream);
+        return cudaGetLastError() == cudaSuccess;
+    }
+    return cudaGraphLaunch(exec, (cudaStream_t) stream) == cudaSuccess;
+}
+#define SESSION_LAUNCH(exec, body, stream) (session_graph_launch((exec), (body), (stream)))
+#else
+#define SESSION_LAUNCH(exec, body, stream) (cudaGraphLaunch((exec), (cudaStream_t) (stream)) == cudaSuccess)
+#endif
+
 bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionState& s, const float* parts,
                      SessionGraphs& gr, std::string& err, bool split) {
     if (gr.captured) return true;
@@ -170,6 +212,30 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
     }
     gr.split_captured = split;
     gr.n = 0;
+#ifdef STRATA_USE_METAL
+    gr.exec_bodies = new std::function<void(void*)>[(size_t) g.n_layers]();
+    gr.post_bodies = new std::function<void(void*)>[(size_t) g.n_layers]();
+    if (split) {
+        gr.preA_bodies = new std::function<void(void*)>[(size_t) g.n_layers]();
+        gr.preB_bodies = new std::function<void(void*)>[(size_t) g.n_layers]();
+        for (int k = 0; k < 5; ++k)
+            gr.preP_bodies[k] = new std::function<void(void*)>[(size_t) g.n_layers]();
+    }
+#endif
+    // The capture lambda's body destinations: the parallel arrays under Metal,
+    // nowhere on the graph backends (the parameter is only stored into there).
+    std::function<void(void*)>* exec_bodies = nullptr;
+    std::function<void(void*)>* post_bodies = nullptr;
+    std::function<void(void*)>* preA_bodies = nullptr;
+    std::function<void(void*)>* preB_bodies = nullptr;
+    std::function<void(void*)>* preP_bodies[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+#ifdef STRATA_USE_METAL
+    exec_bodies = gr.exec_bodies;
+    post_bodies = gr.post_bodies;
+    preA_bodies = gr.preA_bodies;
+    preB_bodies = gr.preB_bodies;
+    for (int k = 0; k < 5; ++k) preP_bodies[k] = gr.preP_bodies[k];
+#endif
 
     int64_t qsa_index = 0;
     for (int64_t l = 0; l < g.n_layers; ++l) {
@@ -181,8 +247,50 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
         // the CPU pool on what it published; `post` combines those experts with THIS layer's weights.  Capturing
         // them together is what the old single graph could not do, and the reason it could not is that
         // `moe_combine` needs the pool's answer and the pool needs the router's.
-        auto capture = [&](bool post, cudaGraphExec_t* out, const char* what, int half = 0,
-                           int stage_prefix = 0) -> bool {
+        auto capture = [&](bool post, cudaGraphExec_t* arr, std::function<void(void*)>* bodies, const char* what,
+                           int half = 0, int stage_prefix = 0) -> bool {
+            (void) bodies;
+#ifdef STRATA_USE_METAL
+            {
+                // No stream capture on Metal: store the layer sequence as a body and
+                // mint a real (empty) exec for the slot. The body re-runs the layer
+                // call at launch, on the launch stream, against the state as it
+                // stands at that token - which is what a replay computes, because
+                // every per-token value reaches the layer through fixed device
+                // buffers (the capture contract), never through arguments. The GDN
+                // state pointer is part of the sequence: the CUDA graph baked it,
+                // so the body re-points it (gdn_point_at) before the layer call.
+                cudaStream_t mcs = nullptr;
+                if (cudaStreamCreate(&mcs) != cudaSuccess) {
+                    err = "session_capture: stream create failed";
+                    return false;
+                }
+                arr[l] = session_mint_empty_exec(mcs);
+                cudaStreamDestroy(mcs);
+                if (!arr[l]) {
+                    err = "session_capture: mint failed at layer " + std::to_string(l);
+                    return false;
+                }
+                const WeightTable* tp = &tables;
+                const ModelGeometry* gp = &g;
+                SessionState* sp = &s;
+                QsaState* qp = &qst;
+                bodies[l] = [tp, gp, sp, parts, qp, post, half, stage_prefix, l](void* stream) {
+                    std::string e;
+                    bool ok = true;
+                    if (post) {
+                        ok = block_layer_post(*tp, *gp, l, sp->k, sp->moe, sp->block, parts, stream, e);
+                    } else {
+                        gdn_point_at(*gp, l, *sp);
+                        ok = block_layer_pre(*tp, *gp, l, 0, 0, sp->gdn, *qp, sp->qsa_bufs, sp->moe, sp->k,
+                                             sp->block, stream, e, sp->db,
+                                             sp->ple.ready() ? &sp->ple : nullptr, half, stage_prefix);
+                    }
+                    if (!ok) session_body_fail(post ? "post" : "pre", l, e);
+                };
+                return true;
+            }
+#endif
             cudaStream_t cs = nullptr;
             if (cudaStreamCreate(&cs) != cudaSuccess) {
                 err = std::string("session_capture: stream create failed");
@@ -212,22 +320,23 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
                       cudaGetErrorString(ce) + " (a synchronous call in the layer?)";
                 return false;
             }
-            if (cudaGraphInstantiate(out, graph, 0) != cudaSuccess) {
+            if (cudaGraphInstantiate(&arr[l], graph, 0) != cudaSuccess) {
                 err = "session_capture: instantiate failed at layer " + std::to_string(l);
                 return false;
             }
             cudaGraphDestroy(graph);
             return true;
         };
-        if (!capture(/*post=*/false, &gr.execs[l], "pre")) return false;
-        if (!capture(/*post=*/true, &gr.posts[l], "post")) return false;
+        if (!capture(/*post=*/false, gr.execs, exec_bodies, "pre")) return false;
+        if (!capture(/*post=*/true, gr.posts, post_bodies, "post")) return false;
         if (split) {
-            if (!capture(/*post=*/false, &gr.preA[l], "preA", /*half=*/1)) return false;
-            if (!capture(/*post=*/false, &gr.preB[l], "preB", /*half=*/2)) return false;
+            if (!capture(/*post=*/false, gr.preA, preA_bodies, "preA", /*half=*/1)) return false;
+            if (!capture(/*post=*/false, gr.preB, preB_bodies, "preB", /*half=*/2)) return false;
             // Prefixes 1..5, ALL through the new parameter - including the fifth, so that it and the fourth
             // differ only in the one stage between them and not in how many nodes their graphs carry.
             for (int k = 1; k <= 5; ++k)
-                if (!capture(/*post=*/false, &gr.preP[k - 1][l], "preP", /*half=*/0, /*stage_prefix=*/k))
+                if (!capture(/*post=*/false, gr.preP[k - 1], preP_bodies[k - 1], "preP", /*half=*/0,
+                             /*stage_prefix=*/k))
                     return false;
         }
         ++gr.n;
@@ -244,9 +353,8 @@ bool session_replay(const ModelGeometry& g, int64_t pos, int32_t pos_base, Sessi
     cudaStream_t cs = (cudaStream_t) stream;
     stage_token(g, pos, pos_base, s);
     for (int64_t l = 0; l < g.n_layers; ++l) {
-        const cudaError_t e = cudaGraphLaunch(gr.execs[l], cs);
-        if (e != cudaSuccess) {
-            err = "session_replay: layer " + std::to_string(l) + ": " + cudaGetErrorString(e);
+        if (!SESSION_LAUNCH(gr.execs[l], &gr.exec_bodies[l], cs)) {
+            err = "session_replay: layer " + std::to_string(l) + ": " + cudaGetErrorString(cudaGetLastError());
             return false;
         }
     }
@@ -264,14 +372,12 @@ bool session_replay_full(const ModelGeometry& g, int64_t pos, int32_t pos_base, 
     for (int64_t l = 0; l < g.n_layers; ++l) {
         // `pre[l]` then `post[l]`, in the order `session_loop` uses.  The two are ordered on one stream, and
         // `post[l]` reads what `pre[l]` wrote, so they cannot be reordered or run concurrently.
-        cudaError_t e = cudaGraphLaunch(gr.execs[l], cs);
-        if (e != cudaSuccess) {
-            err = "session_replay_full: pre[" + std::to_string(l) + "]: " + cudaGetErrorString(e);
+        if (!SESSION_LAUNCH(gr.execs[l], &gr.exec_bodies[l], cs)) {
+            err = "session_replay_full: pre[" + std::to_string(l) + "]: " + cudaGetErrorString(cudaGetLastError());
             return false;
         }
-        e = cudaGraphLaunch(gr.posts[l], cs);
-        if (e != cudaSuccess) {
-            err = "session_replay_full: post[" + std::to_string(l) + "]: " + cudaGetErrorString(e);
+        if (!SESSION_LAUNCH(gr.posts[l], &gr.post_bodies[l], cs)) {
+            err = "session_replay_full: post[" + std::to_string(l) + "]: " + cudaGetErrorString(cudaGetLastError());
             return false;
         }
     }
@@ -303,11 +409,11 @@ bool session_replay_stages_per_layer(const ModelGeometry& g, int64_t pos, int32_
 
     for (int64_t l = 0; l < n; ++l) {
         cudaEventRecord(ev[(size_t) (l * 4 + 0)], cs);
-        if (cudaGraphLaunch(gr.preA[l], cs) != cudaSuccess) { err = "stages: preA"; return false; }
+        if (!SESSION_LAUNCH(gr.preA[l], &gr.preA_bodies[l], cs)) { err = "stages: preA"; return false; }
         cudaEventRecord(ev[(size_t) (l * 4 + 1)], cs);
-        if (cudaGraphLaunch(gr.preB[l], cs) != cudaSuccess) { err = "stages: preB"; return false; }
+        if (!SESSION_LAUNCH(gr.preB[l], &gr.preB_bodies[l], cs)) { err = "stages: preB"; return false; }
         cudaEventRecord(ev[(size_t) (l * 4 + 2)], cs);
-        if (cudaGraphLaunch(gr.posts[l], cs) != cudaSuccess) { err = "stages: post"; return false; }
+        if (!SESSION_LAUNCH(gr.posts[l], &gr.post_bodies[l], cs)) { err = "stages: post"; return false; }
         cudaEventRecord(ev[(size_t) (l * 4 + 3)], cs);
     }
     if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "stages: final sync"; return false; }
@@ -352,11 +458,10 @@ bool session_replay_stage_sweep(const ModelGeometry& g, int64_t pos, int32_t pos
     }
     cudaEventRecord(a, cs);
     for (int64_t l = 0; l < g.n_layers; ++l) {
-        const cudaError_t e = cudaGraphLaunch(gr.preP[k - 1][l], cs);
-        if (e != cudaSuccess) {
+        if (!SESSION_LAUNCH(gr.preP[k - 1][l], &gr.preP_bodies[k - 1][l], cs)) {
             cudaEventDestroy(a);
             cudaEventDestroy(b);
-            err = std::string("session_replay_stage_sweep: launch: ") + cudaGetErrorString(e);
+            err = std::string("session_replay_stage_sweep: launch: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
     }
@@ -416,10 +521,14 @@ bool session_replay_stage_prefixes(const ModelGeometry& g, int64_t pos, int32_t 
             if (k > 1) cudaMemcpyAsync(s.block.R, saved, r_floats * sizeof(float), cudaMemcpyDeviceToDevice, cs);
             cudaEventRecord(ev[(size_t) (l * 6 + k - 1)], cs);
             const cudaGraphExec_t ge = (k == 5) ? gr.execs[l] : gr.preP[k - 1][l];
-            const cudaError_t e = cudaGraphLaunch(ge, cs);
-            if (e != cudaSuccess) {
+#ifdef STRATA_USE_METAL
+            const std::function<void(void*)>* body = (k == 5) ? &gr.exec_bodies[l] : &gr.preP_bodies[k - 1][l];
+#else
+            const std::function<void(void*)>* body = nullptr;
+#endif
+            if (!SESSION_LAUNCH(ge, body, cs)) {
                 err = std::string("session_replay_stage_prefixes: launch prefix ") + std::to_string(k) + ": " +
-                      cudaGetErrorString(e);
+                      cudaGetErrorString(cudaGetLastError());
                 return false;
             }
         }
@@ -474,6 +583,20 @@ void session_graphs_free(SessionGraphs& gr) {
         delete[] gr.preP[k];
         gr.preP[k] = nullptr;
     }
+#ifdef STRATA_USE_METAL
+    delete[] gr.exec_bodies;
+    delete[] gr.post_bodies;
+    delete[] gr.preA_bodies;
+    delete[] gr.preB_bodies;
+    for (int k = 0; k < 5; ++k) {
+        delete[] gr.preP_bodies[k];
+        gr.preP_bodies[k] = nullptr;
+    }
+    gr.exec_bodies = nullptr;
+    gr.post_bodies = nullptr;
+    gr.preA_bodies = nullptr;
+    gr.preB_bodies = nullptr;
+#endif
     gr.preA = nullptr;
     gr.preB = nullptr;
     gr.split_captured = false;
@@ -613,9 +736,8 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
     }
     {
         const auto t0 = std::chrono::steady_clock::now();
-        const cudaError_t le = cudaGraphLaunch(gr.execs[0], cs);
-        if (le != cudaSuccess) {
-            err = "session_loop: launch pre[0]: " + std::string(cudaGetErrorString(le));
+        if (!SESSION_LAUNCH(gr.execs[0], &gr.exec_bodies[0], cs)) {
+            err = "session_loop: launch pre[0]: " + std::string(cudaGetErrorString(cudaGetLastError()));
             return false;
         }
         cudaEventRecord(probe, cs);
@@ -688,9 +810,9 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         // there is no VRAM tier or nothing is resident, which is every layer until the cache warms.
         if (hits != nullptr) hits(user, cs, HitPhase::Combine, nullptr, 0);
         {
-            const cudaError_t pe = cudaGraphLaunch(gr.posts[l], cs);
-            if (pe != cudaSuccess) {
-                err = "session_loop: launch post[" + std::to_string(l) + "]: " + cudaGetErrorString(pe);
+            if (!SESSION_LAUNCH(gr.posts[l], &gr.post_bodies[l], cs)) {
+                err = "session_loop: launch post[" + std::to_string(l) +
+                      "]: " + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
         }
@@ -719,9 +841,9 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         // the two are ordered on one stream and `pre[l+1]`'s first use of `bb.mixed`/`bb.inject` is its own
         // `gr_read`, which comes after `post[l]` has consumed them.
         if (l + 1 < g.n_layers) {
-            const cudaError_t ne = cudaGraphLaunch(gr.execs[l + 1], cs);
-            if (ne != cudaSuccess) {
-                err = "session_loop: launch pre[" + std::to_string(l + 1) + "]: " + cudaGetErrorString(ne);
+            if (!SESSION_LAUNCH(gr.execs[l + 1], &gr.exec_bodies[l + 1], cs)) {
+                err = "session_loop: launch pre[" + std::to_string(l + 1) +
+                      "]: " + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
             cudaEventRecord(probe, cs);
@@ -807,6 +929,63 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
         err = "session_capture_token: the parts staging is not mapped pinned memory";
         return false;
     }
+#ifdef STRATA_USE_METAL
+    {
+        // No stream capture on Metal: store the whole-token sequence as a body
+        // and mint a real (empty) exec for the slot (the session_capture
+        // arrangement). The body re-runs the per-layer sequence - pre, the hit
+        // kernels, the doorbell wait, the parts copy, post - on the launch
+        // stream. The doorbell handoff itself is unchanged: the host side of
+        // the protocol (session_run_token's ring loop) was never in the graph.
+        cudaStream_t mcs = nullptr;
+        if (cudaStreamCreate(&mcs) != cudaSuccess) {
+            err = "session_capture_token: stream create failed";
+            return false;
+        }
+        tg.exec = session_mint_empty_exec(mcs);
+        cudaStreamDestroy(mcs);
+        if (!tg.exec) { err = "session_capture_token: mint failed"; return false; }
+        const WeightTable* tp = &tables;
+        const ModelGeometry* gp = &g;
+        SessionState* sp = &s;
+        tg.body = [tp, gp, sp, parts_dev, y_dev, parts_bytes, hits](void* stream) {
+            int64_t qsa_index = 0;
+            for (int64_t l = 0; l < gp->n_layers; ++l) {
+                gdn_point_at(*gp, l, *sp);
+                const bool qsa = is_qsa_layer(*gp, l);
+                QsaState& qst = qsa ? sp->qsa_states[qsa_index] : sp->qsa_states[0];
+                std::string e;
+                if (!block_layer_pre(*tp, *gp, l, 0, 0, sp->gdn, qst, sp->qsa_bufs, sp->moe, sp->k, sp->block,
+                                     stream, e, sp->db, sp->ple.ready() ? &sp->ple : nullptr))
+                    session_body_fail("token pre", l, e);
+                if (hits != nullptr) {
+                    strata::kernels::moe_hit_select(sp->moe.ids, hits->d_res + l * hits->n_expert, (int) sp->k,
+                                                    (int) hits->n_expert, hits->d_slot, hits->d_dst, hits->d_count,
+                                                    stream);
+                    strata::kernels::quantize_q8_0_scaled(sp->block.mixed, hits->x_q8, hits->x_scale, gp->n_embd,
+                                                          stream);
+                    strata::kernels::moe_hit_grouped_s2_dev(hits->cache_base, hits->d_slot, hits->d_dst,
+                                                            hits->d_count, sp->k, hits->blob, hits->x_q8,
+                                                            hits->scratch, hits->hit_out, stream, hits->x_scale);
+                }
+                strata::kernels::doorbell_wait(sp->db->d_flag, sp->db->d_seq, stream);
+                strata::kernels::copy_from_mapped(parts_dev, y_dev, (int64_t) (parts_bytes / sizeof(float)),
+                                                  stream);
+                if (hits != nullptr)
+                    strata::kernels::moe_hit_add(parts_dev, hits->hit_out, hits->d_dst, hits->d_count, sp->k,
+                                                 gp->n_embd, stream);
+                if (!block_layer_post(*tp, *gp, l, sp->k, sp->moe, sp->block, parts_dev, stream, e))
+                    session_body_fail("token post", l, e);
+                if (qsa) ++qsa_index;
+            }
+        };
+        tg.captured = true;
+        tg.n_layers = g.n_layers;
+        tg.y_src = y_miss_host;
+        tg.parts_bytes = parts_bytes;
+        return true;
+    }
+#endif
     cudaStream_t cs = nullptr;
     if (cudaStreamCreate(&cs) != cudaSuccess) { err = "session_capture_token: stream create failed"; return false; }
     if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
@@ -871,8 +1050,10 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
     ++tg.calls;
     stage_token(g, pos, pos_base, s);
     doorbell_reset(*s.db);
-    const cudaError_t le = cudaGraphLaunch(tg.exec, cs);
-    if (le != cudaSuccess) { err = std::string("session_run_token: launch: ") + cudaGetErrorString(le); return false; }
+    if (!SESSION_LAUNCH(tg.exec, &tg.body, cs)) {
+        err = std::string("session_run_token: launch: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
     (void) cudaStreamQuery(cs);                     // one flush, so WDDM submits the graph now
     static const int flush_us = [] {
         const char* e = std::getenv("STRATA_TG_FLUSH_US");

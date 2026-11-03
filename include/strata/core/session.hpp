@@ -20,6 +20,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -173,6 +174,22 @@ struct SessionGraphs {
     cudaGraphExec_t* preP[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
     cudaGraphExec_t* preA = nullptr;   ///< `half == 1`: gr_read -> attention -> gr_write   (the MIXER)
     cudaGraphExec_t* preB = nullptr;   ///< `half == 2`: gr_read -> moe_route              (FFN front + ROUTER)
+#ifdef STRATA_USE_METAL
+    // Metal has no stream capture (src/metal-qwen/RISKS.md SS1): each capture stores
+    // its layer sequence as a body in the array parallel to its exec array, and the
+    // launch sites invoke the body on the launch stream instead of cudaGraphLaunch
+    // (src/metal-qwen/runtime/CAPTURE-NOTES.md). A body takes the launch stream
+    // because session graphs have no stream of their own - the caller's stream is
+    // part of the launch, and the ordering against the caller's own work (the
+    // parts copy, the doorbell probe) is the stream's. The exec slots still hold
+    // minted (empty) graph execs so the captured checks and session_graphs_free's
+    // destroys keep the CUDA shape.
+    std::function<void(void*)>* exec_bodies = nullptr;   ///< parallel to `execs`
+    std::function<void(void*)>* post_bodies = nullptr;   ///< parallel to `posts`
+    std::function<void(void*)>* preA_bodies = nullptr;   ///< parallel to `preA`
+    std::function<void(void*)>* preB_bodies = nullptr;   ///< parallel to `preB`
+    std::function<void(void*)>* preP_bodies[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+#endif
     bool split_captured = false;
 
     /// How many times `session_loop` has run.  `rings_mid_graph` and `ms_to_ring` are CUMULATIVE and the loop
@@ -373,6 +390,12 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
 // yet (the hit decision is a host step between ring and post); the caller falls back to `session_loop` then.
 struct TokenGraph {
     cudaGraphExec_t exec = nullptr;
+#ifdef STRATA_USE_METAL
+    /// The whole-token sequence as a body, invoked on the launch stream in place
+    /// of cudaGraphLaunch (see SessionGraphs' note above). `exec` still holds a
+    /// minted (empty) graph exec for the captured checks and token_graph_free.
+    std::function<void(void*)> body;
+#endif
     bool captured = false;
     int64_t n_layers = 0;
     const float* y_src = nullptr;    ///< the pinned host staging the graph's H2D copies read (baked in)

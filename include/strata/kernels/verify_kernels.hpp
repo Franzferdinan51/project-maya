@@ -40,6 +40,12 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
+/// GRFOLD debug (env-gated at the call site, off by default): a deterministic
+/// order-independent integer hash of x[0..n) into out[slot], in stream order.
+/// h = sum_i (bits(x[i]) + phi) * (i+1) * FNV-prime (mod 2^64) - a fingerprint
+/// for cross-run comparison, not a cryptographic hash.
+void resid_hash(const float* x, int64_t n, unsigned long long* out, int slot, void* stream);
+void resid_sample(const float* x, int64_t n, float* out, int slot, int nsamp, void* stream);
 
 // ---- perf-review E-6: a layer whose routed experts are all in VRAM needs nothing from the host
 /// One group's plan, built on the device when every routed expert of its n*k entries is resident: the host pool's

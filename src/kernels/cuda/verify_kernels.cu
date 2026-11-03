@@ -563,4 +563,26 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     gpu_stamp_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(buf, i);
 }
 
+namespace { __global__ void resid_hash_kernel(const float* x, int64_t n, unsigned long long* out, int slot) {
+    // GRFOLD debug fingerprint; one block, fixed stride partition, integer sum
+    // (same value the Metal kernel computes: the sum is order-independent).
+    unsigned long long h = 0;
+    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const unsigned long long b = (unsigned long long) __float_as_uint(x[i]);
+        h += (b + 0x9e3779b97f4a7c15ull) * (unsigned long long) (i + 1) * 0x100000001b3ull;
+    }
+    __shared__ unsigned long long part[32];
+    for (int o = 16; o > 0; o >>= 1) h += __shfl_xor_sync(0xffffffffu, h, o);
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = h;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned long long s = 0;
+        for (int w = 0; w < (int) (blockDim.x >> 5); ++w) s += part[w];
+        out[slot] = s;
+    }
+} }
+void resid_hash(const float* x, int64_t n, unsigned long long* out, int slot, void* stream) {
+    resid_hash_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(x, n, out, slot);
+}
+
 }  // namespace strata::kernels

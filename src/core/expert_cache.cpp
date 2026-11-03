@@ -2,7 +2,7 @@
 #include "strata/core/expert_cache.hpp"
 
 #include <cuda_runtime.h>
-#if !defined(STRATA_USE_HIP)
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_USE_METAL)
 #include <cuda.h>   // (the virtual memory API's types; its functions come through the runtime's entry points)
 #endif
 
@@ -161,8 +161,9 @@ ExpertCache::~ExpertCache() { close(); }
 // entry points (no link against the driver library): an address range is reserved once and backed by pieces of
 // physical memory, each mapped and then released (the mapping holds it), so unmapping a piece gives its memory back
 // to the driver, and a new piece mapped at the same address later makes the range whole again.  HIP builds keep
-// the one allocation (lendable() is false; the engine then lends only memory that is already free).
-#if !defined(STRATA_USE_HIP)
+// the one allocation (lendable() is false; the engine then lends only memory that is already free).  Metal builds
+// take the same one-allocation path: the compat runtime has no virtual memory API to lend through.
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_USE_METAL)
 namespace {
 struct Vmm {
     CUresult (*dev_get)(CUdevice*, int) = nullptr;
@@ -358,9 +359,9 @@ uint64_t LendableArena::lendable_bytes(uint64_t keep_bytes) const {
     return b;
 }
 #else
-bool LendableArena::open(uint64_t, std::string& err) { err = "a HIP build"; return false; }
+bool LendableArena::open(uint64_t, std::string& err) { err = "a build without the virtual memory API"; return false; }
 void LendableArena::close() {}
-bool LendableArena::map_piece(Piece&, std::string& err) { err = "a HIP build"; return false; }
+bool LendableArena::map_piece(Piece&, std::string& err) { err = "a build without the virtual memory API"; return false; }
 bool LendableArena::lend_tail(uint64_t, uint64_t, uint64_t& from, uint64_t& given, std::string& err) {
     from = UINT64_MAX;
     given = 0;

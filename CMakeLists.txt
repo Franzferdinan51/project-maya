@@ -54,6 +54,7 @@ endif()
 
 option(STRATA_ENABLE_CUDA "Build the CUDA targets (Phase 2+)" OFF)
 option(STRATA_ENABLE_HIP "Build the HIP targets for gfx1100 wave32 hardware" OFF)
+option(STRATA_ENABLE_METAL "Build the Qwen engine's Metal backend for Apple Silicon" OFF)
 option(STRATA_PREFILL_MMQ "Build the GGML MMQ prompt path for HIP (a HIP build needs it)" OFF)
 if(STRATA_PREFILL_MMQ AND NOT STRATA_ENABLE_HIP)
   message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_ENABLE_HIP=ON")
@@ -67,8 +68,14 @@ endif()
 if(STRATA_ENABLE_CUDA AND STRATA_ENABLE_HIP)
   message(FATAL_ERROR "STRATA_ENABLE_CUDA and STRATA_ENABLE_HIP are separate backends; enable only one")
 endif()
+if(STRATA_ENABLE_METAL AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
+  message(FATAL_ERROR "STRATA_ENABLE_METAL is a separate backend; enable only one")
+endif()
 if(STRATA_ENABLE_HIP)
   include(cmake/hip_backend.cmake)
+endif()
+if(STRATA_ENABLE_METAL)
+  include(cmake/metal_qwen_backend.cmake)
 endif()
 # The test suite and the micro benchmarks live in tests/ and bench/micro/, which the published source leaves out.
 set(_strata_tests_default OFF)
@@ -80,6 +87,10 @@ option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 
 # Apple Silicon: maya-metal (GLM-5.3-Flash through ggml's Metal backend, cmake/metal_backend.cmake) and nothing else
 option(MAYA_ENABLE_METAL "Build maya-metal for Apple Silicon (GLM-5.3-Flash on the Metal GPU)" OFF)
+if(MAYA_ENABLE_METAL AND STRATA_ENABLE_METAL)
+  message(FATAL_ERROR "MAYA_ENABLE_METAL (the GLM ggml build) and STRATA_ENABLE_METAL (the Qwen engine's "
+                      "Metal backend) are separate builds; enable only one")
+endif()
 if(MAYA_ENABLE_METAL)   # (the CUDA / AMD options do not apply to this build)
   include(cmake/metal_backend.cmake)
   return()
@@ -317,7 +328,7 @@ target_link_libraries(strata-plan PRIVATE strata_plan)
 
 # ---- strata_core (GPU runtime) ---------------------------------------------
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
-if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_METAL)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
                                src/core/layout.cpp)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -355,6 +366,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # Naive first, each with a parity test against a reference that was itself validated against ggml.  The
   # kernels link `strata_artifact` for the scalar dequantizers, because using the VALIDATED scalar path as the
   # reference is the whole point - a kernel checked against another copy of itself proves nothing.
+  if(STRATA_ENABLE_METAL)
+    # The Metal backend's device entries live in src/metal-qwen (Stage 1: named stubs that
+    # stop loudly; the MSL kernels replace them family by family). The portable host sources
+    # below are shared with the CUDA/HIP list.
+    file(GLOB _strata_metal_qwen_sources CONFIGURE_DEPENDS src/metal-qwen/stubs/*.cpp)
+    add_library(strata_kernels STATIC ${_strata_metal_qwen_sources}
+                            src/kernels/ngram.cpp
+                            src/ngram/ple_reader.cpp
+                            src/platform/direct_file.cpp)
+  else()
   add_library(strata_kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_gemv.cu
                           src/kernels/cuda/s_gemv.cu
                           src/kernels/cuda/s2_gemv_quads.cu
@@ -411,7 +432,22 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
+  endif()
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
+  if(STRATA_ENABLE_METAL)
+    # The Qwen parity oracle (src/metal-qwen/tests/FIXTURE-FORMAT.md): the
+    # fixture runner against the real entry points, and the model-level
+    # greedy-compare harness. The full fixture run is the Stage 2 gate and is
+    # driven manually until kernels land (against the Stage 1 stubs every
+    # dispatched case fails by signal, by design); ctest gets the smoke
+    # checks that must stay green in every state of the tree.
+    add_executable(metal_kernel_parity src/metal-qwen/tests/metal_kernel_parity.cpp)
+    target_include_directories(metal_kernel_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/metal-qwen/tests)
+    target_link_libraries(metal_kernel_parity PRIVATE strata_kernels strata_metal_runtime)
+    add_executable(e2e_greedy_decode src/metal-qwen/tests/e2e_greedy_decode.cpp)
+    add_test(NAME metal_kernel_parity_list COMMAND metal_kernel_parity ${CMAKE_CURRENT_SOURCE_DIR}/src/metal-qwen/tests/fixtures --list)
+    add_test(NAME e2e_greedy_selftest COMMAND e2e_greedy_decode --selftest)
+  endif()
   if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
     add_executable(glm_layer_graph_test tests/glm_layer_graph_test.cu)
     target_link_libraries(glm_layer_graph_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
@@ -541,10 +577,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # already links `strata_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
+  if(STRATA_ENABLE_METAL)
+    # Host sources only: the GLM family's .cu translation units are device code this build
+    # does not compile; their entry points are provided by src/metal-qwen like every other
+    # device entry (Stage 1: stubs), and the Qwen path never reaches them.
+    add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
+      src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp)
+  else()
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/glm_rows.cu
     src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu)
+  endif()
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(WIN32 AND STRATA_ENABLE_CUDA)
@@ -613,7 +657,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
+  if(STRATA_ENABLE_METAL)
+    # prefill.cpp is the host side; kernels.cu is device code whose entry points
+    # src/metal-qwen provides. gemm.cu is host code (its cuBLAS calls go to the
+    # metal_compat implementation in strata_metal_runtime), compiled as C++.
+    add_library(strata_prefill STATIC src/prefill/prefill.cpp src/prefill/gemm.cu)
+  else()
   add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
+  endif()
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_prefill PUBLIC strata_engine ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)

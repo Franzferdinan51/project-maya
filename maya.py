@@ -2,7 +2,8 @@
 """Project Maya - set up and start GLM-5.3-Flash, DeepSeek-V4.1-Flash-1017, MiniMax-M3.1-Flash or Qwen-3.8-Flash-Next
 (CYBER-FROST) on your own GPU(s).  Qwen-3.8-Flash-Next (CYBER-FROST): CUDA from V100 on and HIP, Linux and Windows, pictures too.
 GLM-5.3-Flash: CUDA on Linux and Windows (experimental); HIP: experimental gfx1100/gfx1201/gfx1151 (gfx1030: not
-validated), Linux and Windows, text only; Metal: experimental, macOS on Apple Silicon, GLM-5.3-Flash only, text only,
+validated), Linux and Windows, text only; Metal: experimental, macOS on Apple Silicon, GLM-5.3-Flash and
+Qwen-3.8-Flash-Next (its own engine's Metal backend), text only,
 one conversation at a time.  DeepSeek-V4.1-Flash-1017 and MiniMax-M3.1-Flash: CUDA from V100 on, Linux
 and Windows; their GGUFs on HIP too (their EXL3 quants: experimental there).
 The quants are named model first, then the tier by the experts' bits (XS, S, M, L): --model glm-maya-s,
@@ -907,11 +908,14 @@ def fix_config_names(cfg: dict) -> bool:
     return done
 
 
-def select_build_backend(backend: str) -> None:
-    """Separate build folders and stamps prevent reusing a binary from the other backend."""
+def select_build_backend(backend: str, family: str = "") -> None:
+    """Separate build folders and stamps prevent reusing a binary from the other backend.  Metal has two engines:
+    GLM-5.3-Flash's `maya-metal` in build-metal/, and the Qwen family's `maya` (its CUDA/HIP target name) in
+    build-metal-qwen/ - `family` names the second one; every other call is as before."""
     global BUILD, EXE, STAMP, DS4_EXE, MM3_EXE
-    BUILD = ROOT / {"hip": "build-hip", "metal": "build-metal"}.get(backend, "build")
-    EXE = BUILD / ("maya-metal" if backend == "metal" else "maya.exe" if WIN else "maya")
+    qwen_metal = backend == "metal" and family == "qwen"
+    BUILD = ROOT / {"hip": "build-hip", "metal": "build-metal-qwen" if qwen_metal else "build-metal"}.get(backend, "build")
+    EXE = BUILD / ("maya" if qwen_metal else "maya-metal" if backend == "metal" else "maya.exe" if WIN else "maya")
     DS4_EXE = BUILD / ("maya-ds4.exe" if WIN else "maya-ds4")
     MM3_EXE = BUILD / ("maya-mm3.exe" if WIN else "maya-mm3")
     STAMP = BUILD / "MAYA-BUILD.json"
@@ -1229,9 +1233,10 @@ def check_hip_pc(a, installed=False, text_only=True) -> dict:
             **({"rocm_bin": str(bindir)} if WIN else {})}
 
 
-def check_metal_pc(a) -> dict:
+def check_metal_pc(a, family: str = "glm") -> dict:
     """The Metal backend's PC check: macOS on Apple Silicon (its GPU always does Metal), the Xcode command line tools'
-    C++ compiler, CMake, RAM and free disk.  Nothing asks nvidia-smi."""
+    C++ compiler, CMake, RAM and free disk.  Nothing asks nvidia-smi.  `family` "qwen": the Qwen engine's own Metal
+    backend (its build folder and binary differ; the check is the same)."""
     if not apple_silicon():
         fail("Maya's Metal backend runs on macOS on Apple Silicon (an M-series Mac)",
              "other PCs: --backend cuda (NVIDIA) or --backend hip (AMD)")
@@ -1243,7 +1248,8 @@ def check_metal_pc(a) -> dict:
     ok(f"using {gpu['name']} ({total:.0f} GB unified memory, about {gpu['vram_gb']:.0f} GB of it for the GPU); "
        "experimental Metal: text only, one conversation at a time")
     if total < 100:
-        warn(f"the model is about 95-100 GB (Maya-S) and this Mac has {total:.0f} GB of unified memory: the routed experts "
+        warn(f"the model is about {'84' if family == 'qwen' else '95-100'} GB ({QWEN_SHOWN if family == 'qwen' else 'Maya-S'}) "
+             f"and this Mac has {total:.0f} GB of unified memory: the routed experts "
              "stream from the SSD while it answers, so decode speed is limited by the SSD (an internal NVMe drive)")
     ok(f"RAM: {total:.0f} GB, {avail:.0f} GB available now")
     if not S.out(["xcode-select", "-p"]).strip() or not S.out(["xcrun", "--find", "clang++"]).strip():
@@ -1269,8 +1275,8 @@ def check_metal_pc(a) -> dict:
             say(f"  [X] {what}")
             say(f"      {how}")
         fail("something Maya needs is missing (above)", f"install it and run {ME} again - the script installs nothing system-wide")
-    select_build_backend("metal")
-    return {"backend": "metal", "gpus": [gpu]}
+    select_build_backend("metal", family)
+    return {"backend": "metal", "gpus": [gpu], **({"metal_family": "qwen"} if family == "qwen" else {})}
 
 
 def nvcc_range(archs) -> tuple:
@@ -1415,8 +1421,10 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
                  "deepseek-maya-xs) are the tested way there")
         return check_hip_pc(a, text_only=not mm3)
     if a.backend == "metal":
+        if family == "qwen":       # (the Qwen engine's own Metal backend: STRATA_ENABLE_METAL, target `maya`)
+            return check_metal_pc(a, "qwen")
         if family != "glm":
-            fail(f"Maya's Metal engine runs GLM-5.3-Flash only (no Metal engine for {ds4 and DS4 or mm3 and MM3 or QWEN_SHOWN})",
+            fail(f"Maya's Metal engines run GLM-5.3-Flash and {QWEN_SHOWN} only (no Metal engine for {ds4 and DS4 or MM3})",
                  "other models: an NVIDIA or AMD GPU (--backend cuda / --backend hip)")
         return check_metal_pc(a)
     if ds4 and not gguf and S.ARM:
@@ -1706,7 +1714,9 @@ def choose_family(a, prev: dict) -> str:
     if a.model:
         return "deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else "qwen" if a.model == QWEN else "glm"
     metal = getattr(a, "backend", None) == "metal"
-    if a.gguf_dir or a.draft or (metal and not a.model_dir):     # (Metal runs GLM only: no question)
+    if metal and not a.model_dir and config_family(prev) == "qwen":   # (a Qwen setup before on this Mac: its family again)
+        return "qwen"
+    if a.gguf_dir or a.draft or (metal and not a.model_dir):     # (Metal with nothing named runs GLM: no question)
         return "glm"
     if a.model_dir:                                    # (an EXL3 folder of GLM or MiniMax; else DeepSeek's files)
         return exl3_folder_family(a.model_dir) or "deepseek"
@@ -2126,11 +2136,44 @@ def compile_engine_metal(llama: Path, src: str, soft=False) -> dict | None:
     return meta
 
 
+def compile_engine_metal_qwen(src: str, soft=False) -> dict | None:
+    """The Qwen engine's Metal backend: the `maya` target (its CUDA/HIP name) with -DSTRATA_ENABLE_METAL=ON in
+    build-metal-qwen/ - Maya's own engine core compiled for Apple Silicon (cmake/metal_qwen_backend.cmake), not the
+    GLM ggml build above.  soft: a failure warns and returns None instead of stopping."""
+    cmake = pick_cmake()
+    if cmake is None:
+        fail("CMake 3.24 or newer is needed", f"pip installs one into .venv: run {ME} --setup")
+    gen = cached_generator()
+    ninja = venv_tool("ninja") or shutil.which("ninja")
+    conf = [cmake]
+    if ninja and gen in (None, "Ninja"):
+        conf += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}"]
+    conf += ["-S", str(ROOT), "-B", str(BUILD), "-DSTRATA_ENABLE_METAL=ON", "-DCMAKE_BUILD_TYPE=Release"]
+    say("  Compiling the Qwen engine for Apple Silicon (Metal) ... (a few minutes first time)")
+    if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", "maya", "-j", str(os.cpu_count() or 4)],
+                   dict(os.environ), ""):
+        if soft:
+            warn("the Qwen Metal engine's rebuild failed; starting the previous engine")
+            return None
+        fail("the Qwen Metal engine build failed", "see the compiler output above (no compiler: xcode-select --install)")
+    meta = {"backend": "metal", "metal_family": "qwen", "src": src, "version": maya_version(),
+            "date": time.strftime("%Y-%m-%d %H:%M"), "targets": ["maya"]}
+    STAMP.write_text(json.dumps(meta, indent=1), encoding="utf-8")
+    ok(f"engine compiled: {EXE}")
+    return meta
+
+
 def build_step(a, pc, llama: Path, target: str = "maya") -> dict:
     step(4, "the engine")
     src = S.source_hash(S.ENGINE_SOURCES)              # src/, include/, third_party/ggml, CMakeLists.txt
     meta = read_json(STAMP)
     exe = exe_for_target(target)
+    if pc.get("backend") == "metal" and pc.get("metal_family") == "qwen":
+        if exe.exists() and not a.rebuild and meta.get("backend") == "metal" and meta.get("metal_family") == "qwen" \
+                and meta.get("src") == src:
+            ok(f"Qwen Metal engine already compiled: {exe}")
+            return meta
+        return compile_engine_metal_qwen(src)
     if pc.get("backend") == "metal":
         if exe.exists() and not a.rebuild and meta.get("backend") == "metal" and meta.get("src") == src:
             ok(f"Metal engine already compiled: {exe}")
@@ -2179,6 +2222,9 @@ def refresh_engine(cfg: dict) -> None:
         compile_engine_hip(pc, llama, src, soft=True, target=target)
         return
     if cfg.get("backend") == "metal":
+        if config_family(cfg) == "qwen":       # (the Qwen engine's Metal build: its own folder, target `maya`)
+            compile_engine_metal_qwen(src, soft=True)
+            return
         llama = Path(meta.get("llama") or ROOT / "third_party/llama.cpp")
         if not (llama / "ggml/CMakeLists.txt").exists():
             warn("llama.cpp's source is missing; starting the previous engine")
@@ -4106,7 +4152,7 @@ def server_command(cfg_path: Path, a) -> tuple:
     if getattr(a, "parallel", None):                   # --parallel given at a start: kept in the config
         set_arg(cfg.setdefault("args", []), "--parallel", a.parallel)
         cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
-    select_build_backend(cfg.get("backend", "cuda"))
+    select_build_backend(cfg.get("backend", "cuda"), config_family(cfg))
     args = cfg.get("args") or []
     ds4 = config_family(cfg) == "deepseek"
     metal = cfg.get("backend") == "metal"
@@ -4445,7 +4491,7 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
             cfg = candidate
             break
     backend = backend or cfg.get("backend", "cuda")
-    select_build_backend(backend)
+    select_build_backend(backend, config_family(cfg))
     stamp = read_json(STAMP)
 
     def add(title, text=""):
@@ -4593,7 +4639,7 @@ def bench(cfg_path: Path, version: str) -> int:
     way the dashboard starts it.  Writes maya-bench.txt (--report includes it).  A few minutes."""
     import urllib.request
     cfg = read_json(cfg_path)
-    select_build_backend(cfg.get("backend", "cuda"))
+    select_build_backend(cfg.get("backend", "cuda"), config_family(cfg))
     if cfg.get("backend") == "hip":
         cfg["exe"] = str(bench_exe(cfg))
     port = cfg.get("port") or 8080
@@ -6529,13 +6575,14 @@ def qwen_pack_step(a, d: Path, files: list, llama: Path) -> Path:
 
 def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int, models: Path, d: Path,
                       vision: dict | None = None) -> Path:
-    """maya-cyber-frost.json (maya-cyber-frost-hip.json on AMD) and its start script.  A setup again keeps what the
-    config before says that this one does not ask: its engine settings, the thinking level and sampling, where the
-    server listens and its key."""
+    """maya-cyber-frost.json (maya-cyber-frost-hip.json on AMD, maya-cyber-frost-metal.json on a Mac) and its start
+    script.  A setup again keeps what the config before says that this one does not ask: its engine settings, the
+    thinking level and sampling, where the server listens and its key."""
     step(8, "the configuration and the start script")
     port = a.port or 8080
     hip = pc.get("backend") == "hip"
-    cfg_path = ROOT / f"{Q.config_stem('qwen', 'q5_k_m')}{'-hip' if hip else ''}.json"
+    metal_qwen = pc.get("backend") == "metal"       # (its exe is build-metal-qwen/maya: select_build_backend set EXE)
+    cfg_path = ROOT / f"{Q.config_stem('qwen', 'q5_k_m')}{'-hip' if hip else '-metal' if metal_qwen else ''}.json"
     old = read_json(cfg_path)
     profile = pack / "expert-profile.bin"
     # the Qwen path: the pack, the model file for its native weights and its n-gram table, decode windows of up to 4
@@ -6553,7 +6600,7 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
     kept = keep_args(old.get("args") or [], args, ("--mtp-max-t", "--kv", "--vram-reserve-mib", "--pool-workers",
                                                    "--experts-from-gguf"))
     cfg = {"exe": str(EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
-           **({"backend": "hip"} if hip else {}),
+           **({"backend": "hip"} if hip else {"backend": "metal"} if metal_qwen else {}),
            "model_name": QWEN_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": dict(QWEN_SAMPLING), "reasoning_effort": QWEN_EFFORT,   # (the model's own, every setup)
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port,
@@ -6747,7 +6794,9 @@ def set_up_qwen(a, prev: dict) -> Path | None:
     pack = qwen_pack_step(a, d, files, llama)          # 6
     vision = qwen_vision_step(a, pc, meta, llama, d, files[0])   # 7
     cfg_path = write_config_qwen(a, pc, meta, pack, files[0], ctx, models, d, vision)   # 8
-    if "mtp_calibration" not in (read_json(cfg_path).get("installer") or {}) or a.calibrate:
+    if pc.get("backend") == "metal":       # (as GLM on Metal: no measurement at this stage - the drafter as built)
+        ok("drafting: the MTP drafter as built (not measured on Metal: the speed calibration does not run there)")
+    elif "mtp_calibration" not in (read_json(cfg_path).get("installer") or {}) or a.calibrate:
         how = drafting_choice(a, "the MTP drafter", "10-40")
         if how != "measure":
             keep_drafting(cfg_path, how == "on")
@@ -7008,7 +7057,7 @@ def main() -> int:
     if a.check:
         ds4 = a.model == DS4 or bool(a.model_dir) and exl3_folder_family(a.model_dir) is None
         quant = choose_ds4_quant(a, prev) if ds4 else None
-        pc = check_pc(a, "deepseek" if ds4 else "glm", gguf=ds4 and quant != "exl3")
+        pc = check_pc(a, "deepseek" if ds4 else "qwen" if a.model == QWEN else "glm", gguf=ds4 and quant != "exl3")
         say()
         if a.backend == "metal":
             say(f"This Mac can run Maya on Metal (experimental). Run {ME} without --check to set it up.")

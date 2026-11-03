@@ -54,7 +54,7 @@ std::vector<int> physical_cores(bool skip_first) {
             }
         }
     }
-#else
+#elif defined(__linux__)
     // The logical CPUs this process may run on, ONE PER PHYSICAL CORE (issue #40): SMT siblings share a core's
     // load/store bandwidth, so a worker on each would put two workers on one core, as the Windows branch above
     // explains.  sysfs names each CPU's (package, core); the first allowed CPU of each pair is kept, so a taskset
@@ -88,6 +88,11 @@ std::vector<int> physical_cores(bool skip_first) {
         }
         cores.push_back(cpu);
     }
+#else
+    // Apple Silicon has no SMT: every logical CPU is a physical core, so the count the OS
+    // reports is already one per core. (Pinning is a no-op on macOS regardless - see
+    // pin_this_thread - so these indices only size and order the pool.)
+    for (unsigned i = 0; i < std::thread::hardware_concurrency(); ++i) cores.push_back((int) i);
 #endif
     if (skip_first && !cores.empty()) cores.erase(cores.begin());
     return cores;
@@ -99,11 +104,15 @@ void pin_this_thread(int core) {
     if (core < 0) return;
 #if defined(_WIN32)
     SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << (core & 63));
-#else
+#elif defined(__linux__)
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(core, &set);
     pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+#else
+    // macOS has no per-core pthread affinity to set (THREAD_AFFINITY_POLICY is a cache-
+    // sharing hint, not a binding); workers run unpinned, which the pool's contracts allow.
+    (void) core;
 #endif
 }
 
@@ -116,7 +125,7 @@ long long pin_current_thread(int core) {
     // why the caller must not treat it as a restorable value.
     const DWORD_PTR prev = SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << (core & 63));
     return prev == 0 ? -1 : (long long) prev;
-#else
+#elif defined(__linux__)
     cpu_set_t prev;
     CPU_ZERO(&prev);
     if (pthread_getaffinity_np(pthread_self(), sizeof prev, &prev) != 0) return -1;
@@ -125,6 +134,9 @@ long long pin_current_thread(int core) {
         if (CPU_ISSET(i, &prev)) mask |= 1ul << i;
     pin_this_thread(core);
     return (long long) mask;
+#else
+    (void) core;
+    return -1;  // nothing pinned, nothing restorable (restore_thread_affinity ignores <= 0)
 #endif
 }
 
@@ -132,12 +144,14 @@ void restore_thread_affinity(long long previous) {
     if (previous <= 0) return;
 #if defined(_WIN32)
     SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) previous);
-#else
+#elif defined(__linux__)
     cpu_set_t set;
     CPU_ZERO(&set);
     for (int i = 0; i < 64; ++i)
         if ((previous >> i) & 1) CPU_SET(i, &set);
     pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+#else
+    (void) previous;  // no affinity was set on this platform (pin_current_thread returned -1)
 #endif
 }
 
