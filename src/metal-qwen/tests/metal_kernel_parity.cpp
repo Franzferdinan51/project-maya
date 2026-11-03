@@ -30,7 +30,9 @@
 
 #include "fixture_format.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/prefill/kernels.hpp"
@@ -905,19 +907,52 @@ bool dispatch(const mqfx::Fixture& fx, std::map<std::string, std::vector<uint8_t
         Dev kp = up(fx, "k_pool"), vp = up(fx, "v_pool"), table = up(fx, "page_table");
         Dev q = up(fx, "q"), ids = up(fx, "ids"), steps = up(fx, "steps");
         const int64_t cap = fx.param_i("cap");
+        const int64_t nq = fx.param_i("nq", 2);
         const k::QsaShapes s = k::qsa_real_shapes();
         k::QsaAttnPools pools;
         pools.k_pool = kp.as<uint16_t>();
         pools.v_pool = vp.as<uint16_t>();
         pools.page_table = table.as<int32_t>();
         const uint64_t stride = k::qsa_decode_attn_scratch_floats(cap, s);
-        Dev scratch((size_t) stride * 2 * 4);
+        Dev scratch((size_t) stride * (size_t) nq * 4);
         CK(cudaMemset(scratch.p, 0, scratch.bytes));
-        Dev attn((size_t) 2 * 24 * 256 * 4);
+        Dev attn((size_t) nq * 24 * 256 * 4);
         k::qsa_decode_attn_batch(q.as<float>(), pools, ids.as<int32_t>(), steps.as<int32_t>(), cap, s,
-                                 scratch.as<float>(), attn.as<float>(), 2, stream());
+                                 scratch.as<float>(), attn.as<float>(), (int) nq, stream());
         CK(cudaStreamSynchronize(g_stream));
         out_bytes("attn", attn);
+        return true;
+    }
+    if (e == "qsa_block_scores") {
+        Dev pooled = up(fx, "pooled"), dead = up(fx, "dead"), qidx = up(fx, "q_idx"), steps = up(fx, "steps");
+        const int64_t nq = fx.param_i("nq"), max_blocks = fx.param_i("max_blocks");
+        Dev scores((size_t)nq * (size_t)max_blocks * 4);
+        if (fx.params_f.size()) scores.fill_f32((float)fx.param_f("out_fill", 0.0), (size_t)nq * (size_t)max_blocks);
+        k::qsa_block_scores(pooled.as<float>(), dead.as<float>(), qidx.as<float>(), steps.as<int32_t>(), (int)nq,
+                            max_blocks, k::qsa_real_shapes(), scores.as<float>(), stream());
+        CK(cudaStreamSynchronize(g_stream));
+        out_bytes("scores", scores);
+        return true;
+    }
+    if (e == "bf16_gemv_fp32_mmvf_multi") {
+        Dev x = up(fx, "x"), w = up(fx, "w");
+        const int64_t n_in = fx.param_i("n_in"), n_out = fx.param_i("n_out"), n_tok = fx.param_i("n_tok");
+        const int64_t ldx = fx.param_i("ldx"), ldy = fx.param_i("ldy");
+        Dev y((size_t)n_tok * (size_t)ldy * 4);
+        k::bf16_gemv_fp32_mmvf_multi(x.as<float>(), ldx, w.as<uint16_t>(), y.as<float>(), ldy, n_in, n_out, (int)n_tok,
+                                     stream());
+        CK(cudaStreamSynchronize(g_stream));
+        out_bytes("y", y);
+        return true;
+    }
+    if (e == "qsa_block_topk") {
+        Dev scores = up(fx, "scores"), steps = up(fx, "steps");
+        const int64_t nq = fx.param_i("nq"), max_blocks = fx.param_i("max_blocks"), cap = fx.param_i("cap");
+        Dev ids((size_t)nq * (size_t)cap * 4);
+        k::qsa_block_topk(scores.as<float>(), steps.as<int32_t>(), (int)nq, max_blocks, cap, k::qsa_real_shapes(),
+                          ids.as<int32_t>(), stream());
+        CK(cudaStreamSynchronize(g_stream));
+        out_bytes("ids", ids);
         return true;
     }
     return false;

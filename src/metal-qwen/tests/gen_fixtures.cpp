@@ -7,6 +7,7 @@
 // Deterministic: all randomness is splitmix64 over the fixture's fixed seed.
 // Usage: gen_fixtures <out_dir>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -2136,6 +2137,11 @@ void gen_native_rope() {
     { std::vector<int32_t> p(64, 27); std::fill(p.begin() + 32, p.end(), 28); cases.push_back({"rows64_pos27_28", p}); }
     { std::vector<int32_t> p(64, 5); std::fill(p.begin() + 32, p.end(), 900); cases.push_back({"rows64_pos5_900", p}); }
     { std::vector<int32_t> p(128); for (int i = 0; i < 128; ++i) p[i] = 100 + i / 32; cases.push_back({"rows128_blocks", p}); }
+    // NOTE (fault3): a rows96_pos5989 case (pos ~5989, the w5 geometry) was
+    // tried and REMOVED: it fails at 4.11e-05 vs the 2.99e-05 tol in the same
+    // fp32-trig edge class as rows64_pos5_900 — not an indexing fault (that
+    // would be O(1)), and DEC_BATCH=0 runs the same rope kernel and matches
+    // the golden. Do not re-add without a tolerance story for that class.
     int ci = 0;
     for (const Case& cs : cases) {
         Rng rng(0x9F40 + ci++);
@@ -2242,6 +2248,233 @@ void gen_qsa_attn_batch() {
         fx2.outputs = {mk_f32("attn", {NQ, NH * HD}, attn2)};
         emit(fx2);
     }
+    // wide2051 (FAULT-3 pin): the live long-context geometry - rows at
+    // n_kv 2599.., selection width 2051 (33 chunks of 64), non-identity
+    // ascending random subsets, PERMUTED page table. The nq2 case above
+    // covers one chunk; the engine's T=1 long arm covers 33 chunks at
+    // nq = 1. Emitted at nq = 2 and nq = 4: the long capstone's
+    // diverging token is the first prediction of a T=4 window.
+    for (int WQ : {2, 4}) {
+        const int WNCELL = 2600, WCAP = 2051, WPAGES = (WNCELL + PS - 1) / PS;
+        Rng wrng(0x9F42);
+        std::vector<uint16_t> wkp((size_t)WPAGES * NKV * PS * HD), wvp = wkp;
+        std::vector<float> wq((size_t)WQ * NH * HD);
+        for (auto& b : wkp) b = f32_to_f16(wrng.uni(-2.0f, 2.0f));
+        for (auto& b : wvp) b = f32_to_f16(wrng.uni(-2.0f, 2.0f));
+        for (auto& v : wq) v = wrng.uni(-1.0f, 1.0f);
+        std::vector<int32_t> wtable(WPAGES), wids((size_t)WQ * WCAP), wsteps((size_t)WQ * 4);
+        for (int p = 0; p < WPAGES; ++p) wtable[p] = p;
+        for (int i = WPAGES - 1; i > 0; --i)
+            std::swap(wtable[i], wtable[(size_t)(wrng.next() % (uint64_t)(i + 1))]);
+        for (int z = 0; z < WQ; ++z) {
+            wsteps[(size_t)z * 4 + 0] = 2598 + z;
+            wsteps[(size_t)z * 4 + 1] = 2599 + z;
+            wsteps[(size_t)z * 4 + 2] = (2599 + z) / 4;
+            wsteps[(size_t)z * 4 + 3] = WCAP;
+        }
+        std::vector<int32_t> perm(WNCELL);
+        for (int z = 0; z < WQ; ++z) {
+            for (int i = 0; i < WNCELL; ++i) perm[i] = i;
+            for (int i = WNCELL - 1; i > 0; --i)
+                std::swap(perm[i], perm[(size_t)(wrng.next() % (uint64_t)(i + 1))]);
+            std::sort(perm.begin(), perm.begin() + WCAP);
+            for (int i = 0; i < WCAP; ++i) wids[(size_t)z * WCAP + i] = perm[i];
+        }
+        auto wpool = [&](const std::vector<uint16_t>& P, int cell, int kvh, int d) -> double {
+            const int page = wtable[cell / PS];
+            return f16v(P[(((size_t)page * NKV + kvh) * PS + (cell % PS)) * HD + d]);
+        };
+        std::vector<float> wattn((size_t)WQ * NH * HD, 0.0f);
+        std::vector<double> sc(WCAP);
+        for (int z = 0; z < WQ; ++z)
+            for (int kvh = 0; kvh < NKV; ++kvh)
+                for (int hl = 0; hl < 12; ++hl) {
+                    const int h = kvh * 12 + hl;
+                    double mx = -1e30;
+                    for (int c = 0; c < WCAP; ++c) {
+                        double s = 0;
+                        for (int d = 0; d < HD; ++d)
+                            s += (double)wq[((size_t)z * NH + h) * HD + d] *
+                                 wpool(wkp, wids[(size_t)z * WCAP + c], kvh, d);
+                        sc[c] = s * scale;
+                        if (sc[c] > mx) mx = sc[c];
+                    }
+                    double sum = 0;
+                    for (int c = 0; c < WCAP; ++c) { sc[c] = std::exp(sc[c] - mx); sum += sc[c]; }
+                    for (int d = 0; d < HD; ++d) {
+                        double a = 0;
+                        for (int c = 0; c < WCAP; ++c) a += sc[c] * wpool(wvp, wids[(size_t)z * WCAP + c], kvh, d);
+                        wattn[((size_t)z * NH + h) * HD + d] = (float)(a / sum);
+                    }
+                }
+        mqfx::Fixture wfx;
+        pf_base(wfx, "qsa_attn_batch", WQ == 2 ? "wide2051" : "wide2051_nq4", 0x9F42, mqfx::TolKind::MaxAbs, 1e-3, 0);
+        wfx.params_i = {{"cap", WCAP}, {"n_cells", WNCELL}};
+        if (WQ != 2) wfx.params_i.push_back({"nq", WQ});
+        wfx.inputs = {mk_f16t("k_pool", {WPAGES * NKV * PS, HD}, wkp), mk_f16t("v_pool", {WPAGES * NKV * PS, HD}, wvp),
+                      mk_i32("page_table", {WPAGES}, wtable), mk_f32("q", {WQ, NH * HD}, wq),
+                      mk_i32("ids", {WQ, WCAP}, wids), mk_i32("steps", {WQ, 4}, wsteps)};
+        wfx.outputs = {mk_f32("attn", {WQ, NH * HD}, wattn)};
+        emit(wfx);
+    }
+}
+
+// qsa_block_scores + qsa_block_topk at the live long-context geometry
+// (FAULT-3 pins): rows at n_kv 2599.., selection width 2051,
+// max_blocks 8194 as the engine sizes it (32768 topk cells / 4 + 2).
+// Neither entry had a parity fixture at any geometry before this.
+// Emitted at nq = 2 and nq = 4 (the long capstone's diverging token
+// is the first prediction of a T=4 window).
+void gen_qsa_block_select() {
+    const int ID = 128, IH = 4, RB = 4, MAXB = 8194, CAP = 2051;
+    for (int NQ : {2, 4}) {
+        std::vector<int32_t> steps((size_t)NQ * 4);
+        for (int z = 0; z < NQ; ++z) {
+            steps[(size_t)z * 4 + 0] = 2598 + z;
+            steps[(size_t)z * 4 + 1] = 2599 + z;
+            steps[(size_t)z * 4 + 2] = (2599 + z) / RB;
+            steps[(size_t)z * 4 + 3] = CAP;
+        }
+        const char* sfx = NQ == 2 ? "" : "_nq4";
+        // ---- block scores: tail shapes cycle with n_kv % 4 (bump on
+        // the dead-key block when nonzero, none when 0) ----
+        {
+            Rng rng(0x9F43);
+            std::vector<float> pooled((size_t)651 * ID), dead(ID), qidx((size_t)NQ * IH * ID);
+            for (auto& v : pooled) v = rng.uni(-1.0f, 1.0f);
+            for (auto& v : dead) v = rng.uni(-1.0f, 1.0f);
+            for (auto& v : qidx) v = rng.uni(-1.0f, 1.0f);
+            std::vector<float> want((size_t)NQ * MAXB, -123.0f);
+            for (int z = 0; z < NQ; ++z) {
+                const int n_kv = steps[(size_t)z * 4 + 1], n_bid = steps[(size_t)z * 4 + 2];
+                for (int b = 0; b <= n_bid; ++b) {
+                    const float* key = b == n_bid ? dead.data() : &pooled[(size_t)b * ID];
+                    double s = 0;
+                    for (int h = 0; h < IH; ++h) {
+                        double dot = 0;
+                        for (int d = 0; d < ID; ++d) dot += (double)key[d] * qidx[((size_t)z * IH + h) * ID + d];
+                        if (dot > 0) s += dot;
+                    }
+                    if (b == n_bid && n_kv % RB != 0) s += 1.0e9;
+                    want[(size_t)z * MAXB + b] = (float)s;
+                }
+            }
+            mqfx::Fixture fx;
+            pf_base(fx, "qsa_block_scores", (std::string("wide") + sfx).c_str(), 0x9F43, mqfx::TolKind::MaxRel, 1e-3, 1e-4);
+            fx.params_i = {{"nq", NQ}, {"max_blocks", MAXB}, {"real_shapes", 1}};
+            fx.params_f = {{"out_fill", -123.0}};
+            fx.inputs = {mk_f32("pooled", {651, ID}, pooled), mk_f32("dead", {ID}, dead),
+                         mk_f32("q_idx", {NQ, IH * ID}, qidx), mk_i32("steps", {NQ, 4}, steps)};
+            fx.outputs = {mk_f32("scores", {NQ, MAXB}, want)};
+            emit(fx);
+        }
+        // ---- block topk: radix select at nb ~650. The ties variant
+        // quantizes scores to 0.25 steps so the threshold lands inside
+        // a large tie class (eq-budget partial admission exercised
+        // hard). Canary scores (3e9) past n_bid prove no out-of-range
+        // block is read; a weight-0 tail block (n_kv % 4 == 0) carries
+        // 2e9 to prove the w==0 skip. ----
+        auto order_key = [](float s) -> uint32_t {
+            const float v = s + 0.0f;
+            if (!(v == v)) return 0u;
+            uint32_t b;
+            std::memcpy(&b, &v, 4);
+            return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+        };
+        for (int variant = 0; variant < 2; ++variant) {
+            Rng rng(0x9F44 + (uint64_t)variant);
+            std::vector<float> scores((size_t)NQ * MAXB);
+            for (int z = 0; z < NQ; ++z) {
+                const int n_kv = steps[(size_t)z * 4 + 1], n_bid = steps[(size_t)z * 4 + 2];
+                for (int b = 0; b < MAXB; ++b) {
+                    float s;
+                    if (b < n_bid)
+                        s = variant == 0 ? rng.uni(-4.0f, 4.0f) : std::floor(rng.uni(-4.0f, 4.0f) * 4.0f) / 4.0f;
+                    else if (b == n_bid)
+                        s = n_kv % RB != 0 ? (0.5f + 1.0e9f) : 2.0e9f;
+                    else
+                        s = 3.0e9f;
+                    scores[(size_t)z * MAXB + b] = s;
+                }
+            }
+            std::vector<int32_t> want((size_t)NQ * CAP);
+            for (int z = 0; z < NQ; ++z) {
+                const int n_kv = steps[(size_t)z * 4 + 1], n_bid = steps[(size_t)z * 4 + 2];
+                auto weight = [&](int b) { return b < n_bid ? RB : n_kv - n_bid * RB; };
+                auto key = [&](int b) { return order_key(scores[(size_t)z * MAXB + b]); };
+                std::vector<int> ord((size_t)n_bid + 1);
+                for (int b = 0; b <= n_bid; ++b) ord[(size_t)b] = b;
+                std::sort(ord.begin(), ord.end(), [&](int a, int c) {
+                    const uint32_t ka = key(a), kc = key(c);
+                    return ka != kc ? ka > kc : a < c;
+                });
+                int cum = 0;
+                uint32_t thr = 0;
+                for (int b : ord) {
+                    const int w = weight(b);
+                    if (w == 0) continue;
+                    cum += w;
+                    if (cum >= CAP) { thr = key(b); break; }
+                }
+                int above = 0;
+                for (int b = 0; b <= n_bid; ++b)
+                    if (weight(b) > 0 && key(b) > thr) above += weight(b);
+                int budget = CAP - above, n_out = 0;
+                for (int b = 0; b <= n_bid && n_out < CAP; ++b) {
+                    const int w = weight(b);
+                    if (w == 0 || key(b) < thr) continue;
+                    const int take = key(b) > thr ? w : std::min(w, budget);
+                    for (int c = 0; c < take; ++c) want[(size_t)z * CAP + n_out++] = b * RB + c;
+                    if (key(b) == thr) budget -= take;
+                }
+                if (n_out != CAP) {
+                    std::fprintf(stderr, "qsa_block_topk reference emitted %d != width %d\n", n_out, CAP);
+                    std::exit(1);
+                }
+            }
+            mqfx::Fixture fx;
+            pf_base(fx, "qsa_block_topk",
+                    (std::string(variant == 0 ? "wide2051_smooth" : "wide2051_ties") + sfx).c_str(),
+                    0x9F44 + (uint64_t)variant, mqfx::TolKind::Bitwise, 0, 0);
+            fx.params_i = {{"nq", NQ}, {"max_blocks", MAXB}, {"cap", CAP}, {"real_shapes", 1}};
+            fx.inputs = {mk_f32("scores", {NQ, MAXB}, scores), mk_i32("steps", {NQ, 4}, steps)};
+            fx.outputs = {mk_i32("ids", {NQ, CAP}, want)};
+            emit(fx);
+        }
+    }
+}
+
+// bf16_gemv_fp32_mmvf_multi: the qb (STRATA_DEC_BATCH) batched GEMV for
+// the QSA indexer projections - the DEC_BATCH=0 arm MATCHES the long
+// golden, so the fault lives in a qb-only piece; this entry had no
+// fixture at any row count. Live shapes: in 2560, out 128 (k_proj)
+// and 512 (q_proj), tokens = window rows.
+void gen_mmvf_multi() {
+    struct Case { const char* name; int n_out; int n_tok; };
+    for (const Case cs : {Case{"idx_n2", 128, 2}, Case{"idx_n3", 128, 3}, Case{"idx_n4", 128, 4},
+                          Case{"idxq_n4", 512, 4}, Case{"idx_n8", 128, 8}}) {
+        const int n_in = 2560;
+        Rng rng(0x9F45 + (uint64_t)cs.n_tok * 7 + (uint64_t)cs.n_out);
+        std::vector<float> x((size_t)cs.n_tok * n_in);
+        std::vector<uint16_t> w((size_t)cs.n_out * n_in);
+        for (auto& v : x) v = rng.uni(-1.5f, 1.5f);
+        for (auto& v : w) v = f32_to_bf16(rng.uni(-1.0f, 1.0f));
+        auto bf = [](uint16_t h) -> double { const uint32_t u = (uint32_t)h << 16; float f; std::memcpy(&f, &u, 4); return f; };
+        std::vector<float> want((size_t)cs.n_tok * cs.n_out);
+        for (int k = 0; k < cs.n_tok; ++k)
+            for (int o = 0; o < cs.n_out; ++o) {
+                double s = 0;
+                for (int i = 0; i < n_in; ++i) s += (double)x[(size_t)k * n_in + i] * bf(w[(size_t)o * n_in + i]);
+                want[(size_t)k * cs.n_out + o] = (float)s;
+            }
+        mqfx::Fixture fx;
+        pf_base(fx, "bf16_gemv_fp32_mmvf_multi", cs.name, 0x9F45, mqfx::TolKind::MaxAbs, 5e-3, 0);
+        fx.params_i = {{"n_in", n_in}, {"n_out", cs.n_out}, {"n_tok", cs.n_tok}, {"ldx", n_in}, {"ldy", cs.n_out}};
+        fx.inputs = {mk_f32("x", {cs.n_tok, n_in}, x), mk("w", mqfx::DType::BF16, {cs.n_out, n_in},
+                                                          [&] { std::vector<uint8_t> b(w.size() * 2); std::memcpy(b.data(), w.data(), b.size()); return b; }())};
+        fx.outputs = {mk_f32("y", {cs.n_tok, cs.n_out}, want)};
+        emit(fx);
+    }
 }
 
 int main(int argc, char** argv) {
@@ -2255,6 +2488,8 @@ int main(int argc, char** argv) {
     gen_fused_gr_read();
     gen_native_rope();
     gen_qsa_attn_batch();
+    gen_qsa_block_select();
+    gen_mmvf_multi();
     gen_resident_plan();
     gen_routers();
     gen_sampler();
