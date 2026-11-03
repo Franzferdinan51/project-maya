@@ -1056,6 +1056,31 @@ def hip_info(bindir) -> str | None:
     return str(p) if p and p.exists() else shutil.which("hipInfo")
 
 
+def installed_hip_info() -> str | None:
+    """hipInfo of a ROCm already installed (ROCM_PATH, HIP_PATH, the newest in C:\\Program Files\\AMD\\ROCm, PATH),
+    only to name the GPUs - not windows_rocm(), whose rocm-sdk init can unpack gigabytes."""
+    base = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "AMD" / "ROCm"
+    roots = [Path(os.environ[k]) for k in ("ROCM_PATH", "HIP_PATH") if os.environ.get(k)] + sorted(
+        base.glob("[0-9]*"), key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)], reverse=True)
+    return next((str(r / "bin" / "hipInfo.exe") for r in roots if (r / "bin" / "hipInfo.exe").exists()),
+                shutil.which("hipInfo"))
+
+
+def first_run_backend() -> str:
+    """The backend of a first run without --backend (nothing set up yet): Metal on a Mac with Apple Silicon, HIP on a
+    PC with an AMD GPU Maya's HIP build takes (check_hip_pc's list, the experimental ones too) and no NVIDIA one, else
+    CUDA.  On Windows the AMD GPUs are named by an installed ROCm's hipInfo first: Windows' adapter table knows the
+    common cards only, and an AMD-only PC whose card it did not know was sent to the CUDA checks, which stop at
+    nvidia-smi (#805)."""
+    if apple_silicon():
+        return "metal"
+    if S.gpus():
+        return "cuda"
+    amd = S.amd_gpus(installed_hip_info()) if WIN else S.amd_gpus()
+    takes = HIP_ARCHS + HIP_ARCHS_UNVALIDATED + HIP_ARCHS_WAVE64
+    return "hip" if any(g["arch"] in takes for g in amd) else "cuda"
+
+
 THEROCK_INDEX = "https://repo.amd.com/rocm/whl-multi-arch/"   # AMD's ROCm for Windows: TheRock's pip wheels
 THEROCK_VERSION = "7.14.1"                                     # 7.14: the first with Gorgon Halo (Ryzen AI Max 400)
 
@@ -2092,8 +2117,14 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
     if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", target, "-j", str(jobs)], env,
                    "build-maya-hip.bat", vcvars=vcvars):
         if soft:
-            warn("HIP rebuild failed; starting the previous engine")
-            return None
+            # (not the engine compiled before: it is from the older source, and this version's server and config
+            #  start it with settings it may not know or silently ignore - #805's start failed that way)
+            fail("Maya's AMD engine changed with this update, and compiling it failed: the engine from before does "
+                 "not match this version, so it is not started",
+                 "the compiler's reason is above - fix it, then start Maya again (it compiles again)" +
+                 ("; build-maya-hip.bat > build-hip.txt 2>&1 runs the same build alone and keeps its output"
+                  if WIN else "") +
+                 (" - " + VS2026_HIP_HINT if vs_2026(vcvars) else ""))
         fail("the HIP engine build failed", "see the compiler output above" +
              (" - " + VS2026_HIP_HINT if vs_2026(vcvars) else ""))
     if WIN:
@@ -2213,8 +2244,11 @@ def refresh_engine(cfg: dict) -> None:
         root = Path(meta.get("rocm") or "/opt/rocm")
         llama = Path(meta.get("llama") or ROOT / "third_party/llama.cpp")
         if hip_clang(root) is None or not (llama / "ggml/CMakeLists.txt").exists():
-            warn("HIP compiler or llama.cpp source is missing; starting the previous engine")
-            return
+            # (the engine from before would run under this version's server and config: not started - #805)
+            fail(f"Maya's AMD engine changed with this update, but the HIP compiler ({root}) or llama.cpp's source "
+                 f"({llama}) it was compiled with is gone: the engine from before does not match this version, so it "
+                 "is not started",
+                 f"{ME} --setup --rebuild finds the compiler and compiles the engine again")
         pc = {"rocm": str(root), "archs": meta["archs"],
               "gpus": [{"index": i} for i in cfg.get("gpu", [0])]}
         if WIN and meta.get("lib_dirs"):
@@ -3343,20 +3377,26 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         env = {**hip_env, **env}
     if env:
         cfg["env"] = env
+    suffix = {"hip": "-hip", "metal": "-metal"}.get(pc.get("backend"), "")
+    cfg_path = ROOT / f"maya-{quant.lower()}{suffix}.json"
+    old_cfg = read_json(cfg_path)
+    # the server's own settings from the config before (the address it listens on, its API key, ...): kept, as the
+    # DeepSeek, MiniMax and Qwen setups keep them - a GLM setup run again dropped them; --host / --api-key given now win
+    for k in ("host", "api_key", "cors_origins", "mcp_servers"):
+        if old_cfg.get(k) is not None:
+            cfg[k] = old_cfg[k]
     if a.host:
         cfg["host"] = a.host
     if a.api_key:
         cfg["api_key"] = a.api_key
     if vision:
         cfg["vision"] = vision
-    suffix = {"hip": "-hip", "metal": "-metal"}.get(pc.get("backend"), "")
-    cfg_path = ROOT / f"maya-{quant.lower()}{suffix}.json"
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     local = choice[1] if choice and choice[0] == "local" else None   # (choose_model's answer)
     if PROFILE.exists() and profile_fits(pack):
         cfg["args"] += ["--expert-profile", str(PROFILE)]
     if cfg_path.exists():
-        old = read_json(cfg_path).get("args") or []
+        old = old_cfg.get("args") or []
         kept = keep_args(old, cfg["args"],
                          ("--expert-cache", "--vram-reserve-mib", "--vram-reserve-later-mib", "--prefill",
                           "--parallel", "--expert-profile-save", "--expert-profile-save-every", "--kv-streaming",
@@ -7009,8 +7049,7 @@ def main() -> int:
     else:
         # nothing set up yet (START-MAYA.bat / ./maya.sh without --backend): Metal on a Mac with Apple Silicon, HIP on
         # a PC with a supported AMD GPU and no NVIDIA one (e.g. Strix Halo)
-        a.backend = ("metal" if apple_silicon() else
-                     "hip" if not S.gpus() and any(g["arch"] in HIP_ARCHS for g in S.amd_gpus()) else "cuda")
+        a.backend = first_run_backend()
     setting_up = a.setup or a.check or a.gguf_dir or a.model or a.model_dir or a.rebuild or a.repack or \
         a.download_model
     if have and not setting_up and (a.calibrate or a.speed_calibration or not a.no_start):
