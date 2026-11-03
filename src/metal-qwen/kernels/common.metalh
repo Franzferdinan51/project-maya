@@ -1,0 +1,330 @@
+// common.metalh - shared prelude for the Metal Qwen backend's MSL library. The
+// runtime prepends this file to every src/metal-qwen/kernels/*.metal file and
+// compiles the concatenation once; each .metal file is self-contained apart from
+// this prelude. Contents: number-format helpers and the ggml block dequantizer
+// used by the dense family (transcribed from the tree's own CUDA dequantizers
+// and the src/artifact scalar reference, which agree element for element).
+
+#include <metal_stdlib>
+using namespace metal;
+
+inline float dq_h2f(ushort bits) { return float(as_type<half>(bits)); }
+inline float dq_bf2f(ushort bits) { return as_type<float>(uint(bits) << 16); }
+inline ushort dq_f2h(float f) { return as_type<ushort>(half(f)); }
+inline ushort dq_f2bf(float f) {
+    uint u = as_type<uint>(f);
+    u += 0x7fffu + ((u >> 16) & 1u);  // round to nearest even, as the CUDA TU
+    return ushort(u >> 16);
+}
+inline ushort dq_ld16(device const uchar* p) { return ushort(p[0]) | (ushort(p[1]) << 8); }
+inline uint dq_ld32(device const uchar* p) {
+    return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24);
+}
+inline float dq_ldf16(device const uchar* p) { return dq_h2f(dq_ld16(p)); }
+
+constant float kIq4NlF[16] = {-127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
+                              1.f,    13.f,   25.f,  38.f,  53.f,  69.f,  89.f,  113.f};
+
+// One element of a ggml block row. `row` points at the row's first block byte,
+// `type` is the ggml type id, `e` the element index inside the row. Covers the
+// formats dequant_bf16 / native_mmvq / iq share: Q4_0 (2), Q5_0 (6), Q8_0 (8),
+// Q3_K (11), Q4_K (12), Q5_K (13), Q6_K (14), IQ4_NL (20), IQ4_XS (23), Q2_0 (42).
+// IQ3_XXS codebook + sign tables (ggml's constant tables, transcribed as data).
+constant uint kIq3XxsGrid[256] = {
+    0x04040404u, 0x04040414u, 0x04040424u, 0x04040c0cu, 0x04040c1cu, 0x04040c3eu,
+    0x04041404u, 0x04041414u, 0x04041c0cu, 0x04042414u, 0x04043e1cu, 0x04043e2cu,
+    0x040c040cu, 0x040c041cu, 0x040c0c04u, 0x040c0c14u, 0x040c140cu, 0x040c142cu,
+    0x040c1c04u, 0x040c1c14u, 0x040c240cu, 0x040c2c24u, 0x040c3e04u, 0x04140404u,
+    0x04140414u, 0x04140424u, 0x04140c0cu, 0x04141404u, 0x04141414u, 0x04141c0cu,
+    0x04141c1cu, 0x04141c3eu, 0x04142c0cu, 0x04142c3eu, 0x04143e2cu, 0x041c040cu,
+    0x041c043eu, 0x041c0c04u, 0x041c0c14u, 0x041c142cu, 0x041c3e04u, 0x04240c1cu,
+    0x04241c3eu, 0x04242424u, 0x04242c3eu, 0x04243e1cu, 0x04243e2cu, 0x042c040cu,
+    0x042c043eu, 0x042c1c14u, 0x042c2c14u, 0x04341c2cu, 0x04343424u, 0x043e0c04u,
+    0x043e0c24u, 0x043e0c34u, 0x043e241cu, 0x043e340cu, 0x0c04040cu, 0x0c04041cu,
+    0x0c040c04u, 0x0c040c14u, 0x0c04140cu, 0x0c04141cu, 0x0c041c04u, 0x0c041c14u,
+    0x0c041c24u, 0x0c04243eu, 0x0c042c04u, 0x0c0c0404u, 0x0c0c0414u, 0x0c0c0c0cu,
+    0x0c0c1404u, 0x0c0c1414u, 0x0c14040cu, 0x0c14041cu, 0x0c140c04u, 0x0c140c14u,
+    0x0c14140cu, 0x0c141c04u, 0x0c143e14u, 0x0c1c0404u, 0x0c1c0414u, 0x0c1c1404u,
+    0x0c1c1c0cu, 0x0c1c2434u, 0x0c1c3434u, 0x0c24040cu, 0x0c24042cu, 0x0c242c04u,
+    0x0c2c1404u, 0x0c2c1424u, 0x0c2c2434u, 0x0c2c3e0cu, 0x0c34042cu, 0x0c3e1414u,
+    0x0c3e2404u, 0x14040404u, 0x14040414u, 0x14040c0cu, 0x14040c1cu, 0x14041404u,
+    0x14041414u, 0x14041434u, 0x14041c0cu, 0x14042414u, 0x140c040cu, 0x140c041cu,
+    0x140c042cu, 0x140c0c04u, 0x140c0c14u, 0x140c140cu, 0x140c1c04u, 0x140c341cu,
+    0x140c343eu, 0x140c3e04u, 0x14140404u, 0x14140414u, 0x14140c0cu, 0x14140c3eu,
+    0x14141404u, 0x14141414u, 0x14141c3eu, 0x14142404u, 0x14142c2cu, 0x141c040cu,
+    0x141c0c04u, 0x141c0c24u, 0x141c3e04u, 0x141c3e24u, 0x14241c2cu, 0x14242c1cu,
+    0x142c041cu, 0x142c143eu, 0x142c240cu, 0x142c3e24u, 0x143e040cu, 0x143e041cu,
+    0x143e0c34u, 0x143e242cu, 0x1c04040cu, 0x1c040c04u, 0x1c040c14u, 0x1c04140cu,
+    0x1c04141cu, 0x1c042c04u, 0x1c04342cu, 0x1c043e14u, 0x1c0c0404u, 0x1c0c0414u,
+    0x1c0c1404u, 0x1c0c1c0cu, 0x1c0c2424u, 0x1c0c2434u, 0x1c14040cu, 0x1c14041cu,
+    0x1c140c04u, 0x1c14142cu, 0x1c142c14u, 0x1c143e14u, 0x1c1c0c0cu, 0x1c1c1c1cu,
+    0x1c241c04u, 0x1c24243eu, 0x1c243e14u, 0x1c2c0404u, 0x1c2c0434u, 0x1c2c1414u,
+    0x1c2c2c2cu, 0x1c340c24u, 0x1c341c34u, 0x1c34341cu, 0x1c3e1c1cu, 0x1c3e3404u,
+    0x24040424u, 0x24040c3eu, 0x24041c2cu, 0x24041c3eu, 0x24042c1cu, 0x24042c3eu,
+    0x240c3e24u, 0x24141404u, 0x24141c3eu, 0x24142404u, 0x24143404u, 0x24143434u,
+    0x241c043eu, 0x241c242cu, 0x24240424u, 0x24242c0cu, 0x24243424u, 0x242c142cu,
+    0x242c241cu, 0x242c3e04u, 0x243e042cu, 0x243e0c04u, 0x243e0c14u, 0x243e1c04u,
+    0x2c040c14u, 0x2c04240cu, 0x2c043e04u, 0x2c0c0404u, 0x2c0c0434u, 0x2c0c1434u,
+    0x2c0c2c2cu, 0x2c140c24u, 0x2c141c14u, 0x2c143e14u, 0x2c1c0414u, 0x2c1c2c1cu,
+    0x2c240c04u, 0x2c24141cu, 0x2c24143eu, 0x2c243e14u, 0x2c2c0414u, 0x2c2c1c0cu,
+    0x2c342c04u, 0x2c3e1424u, 0x2c3e2414u, 0x34041424u, 0x34042424u, 0x34042434u,
+    0x34043424u, 0x340c140cu, 0x340c340cu, 0x34140c3eu, 0x34143424u, 0x341c1c04u,
+    0x341c1c34u, 0x34242424u, 0x342c042cu, 0x342c2c14u, 0x34341c1cu, 0x343e041cu,
+    0x343e140cu, 0x3e04041cu, 0x3e04042cu, 0x3e04043eu, 0x3e040c04u, 0x3e041c14u,
+    0x3e042c14u, 0x3e0c1434u, 0x3e0c2404u, 0x3e140c14u, 0x3e14242cu, 0x3e142c14u,
+    0x3e1c0404u, 0x3e1c0c2cu, 0x3e1c1c1cu, 0x3e1c3404u, 0x3e24140cu, 0x3e24240cu,
+    0x3e2c0404u, 0x3e2c0414u, 0x3e2c1424u, 0x3e341c04u,
+};
+constant uchar kKsignsIq2xs[128] = {
+    0u, 129u, 130u, 3u, 132u, 5u, 6u, 135u, 136u, 9u, 10u, 139u, 12u, 141u, 142u, 15u,
+    144u, 17u, 18u, 147u, 20u, 149u, 150u, 23u, 24u, 153u, 154u, 27u, 156u, 29u, 30u, 159u,
+    160u, 33u, 34u, 163u, 36u, 165u, 166u, 39u, 40u, 169u, 170u, 43u, 172u, 45u, 46u, 175u,
+    48u, 177u, 178u, 51u, 180u, 53u, 54u, 183u, 184u, 57u, 58u, 187u, 60u, 189u, 190u, 63u,
+    192u, 65u, 66u, 195u, 68u, 197u, 198u, 71u, 72u, 201u, 202u, 75u, 204u, 77u, 78u, 207u,
+    80u, 209u, 210u, 83u, 212u, 85u, 86u, 215u, 216u, 89u, 90u, 219u, 92u, 221u, 222u, 95u,
+    96u, 225u, 226u, 99u, 228u, 101u, 102u, 231u, 232u, 105u, 106u, 235u, 108u, 237u, 238u, 111u,
+    240u, 113u, 114u, 243u, 116u, 245u, 246u, 119u, 120u, 249u, 250u, 123u, 252u, 125u, 126u, 255u,
+};
+constant uchar kKmaskIq2xs[8] = { 1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u };
+
+inline float dq_elem(device const uchar* row, int type, uint e) {
+    if (type == 42) {  // Q2_0: 64 elements, 18-byte block {f16 d, qs[16]}
+        device const uchar* b = row + (e / 64) * 18;
+        uint j = e % 64;
+        int code = (b[2 + j / 4] >> ((j % 4) * 2)) & 3;
+        return float(code - 1) * dq_ldf16(b);
+    }
+    if (type == 2) {  // Q4_0: 32 elements, 18-byte block
+        device const uchar* b = row + (e / 32) * 18;
+        uint j = e % 32;
+        int nib = (j < 16) ? (b[2 + j] & 0xF) : (b[2 + j - 16] >> 4);
+        return float(nib - 8) * dq_ldf16(b);
+    }
+    if (type == 6) {  // Q5_0: 32 elements, 22-byte block {f16 d, qh[4], qs[16]}
+        device const uchar* b = row + (e / 32) * 22;
+        uint j = e % 32;
+        uint qh = uint(b[2]) | (uint(b[3]) << 8) | (uint(b[4]) << 16) | (uint(b[5]) << 24);
+        int x = (j < 16) ? int((b[6 + j] & 0xF) | (((qh >> j) << 4) & 0x10))
+                         : int((b[6 + j - 16] >> 4) | (((qh >> (j - 4)) & 0x10)));
+        return float(x - 16) * dq_ldf16(b);
+    }
+    if (type == 8) {  // Q8_0: 32 elements, 34-byte block
+        device const uchar* b = row + (e / 32) * 34;
+        return float(int(char(b[2 + (e % 32)]))) * dq_ldf16(b);
+    }
+    if (type == 20) {  // IQ4_NL: 32 elements, 18-byte block
+        device const uchar* b = row + (e / 32) * 18;
+        uint j = e % 32;
+        int nib = (j < 16) ? (b[2 + j] & 0xF) : (b[2 + j - 16] >> 4);
+        return dq_ldf16(b) * kIq4NlF[nib];
+    }
+    if (type == 11) {  // Q3_K: 256 elements, 110-byte super-block
+        device const uchar* b = row + (e / 256) * 110;
+        uint w = e % 256, gi = w / 32, t = w % 32, n = gi / 4, jj = gi % 4;
+        // repack the 12 scale bytes into 16 six-bit scales, as the reference does
+        uint aux0 = uint(b[96]) | (uint(b[97]) << 8) | (uint(b[98]) << 16) | (uint(b[99]) << 24);
+        uint aux1 = uint(b[100]) | (uint(b[101]) << 8) | (uint(b[102]) << 16) | (uint(b[103]) << 24);
+        uint aux2 = uint(b[104]) | (uint(b[105]) << 8) | (uint(b[106]) << 16) | (uint(b[107]) << 24);
+        uint sc[4];
+        sc[2] = ((aux0 >> 4) & 0x0f0f0f0fu) | (((aux2 >> 4) & 0x03030303u) << 4);
+        sc[3] = ((aux1 >> 4) & 0x0f0f0f0fu) | (((aux2 >> 6) & 0x03030303u) << 4);
+        sc[0] = (aux0 & 0x0f0f0f0fu) | (((aux2 >> 0) & 0x03030303u) << 4);
+        sc[1] = (aux1 & 0x0f0f0f0fu) | (((aux2 >> 2) & 0x03030303u) << 4);
+        uint is = n * 8 + jj * 2 + (t >= 16 ? 1 : 0);
+        int scale = int(char((sc[is / 4] >> ((is % 4) * 8)) & 0xFF));
+        float dl = dq_ldf16(b + 108) * float(scale - 32);
+        uint shift = 2 * jj;
+        uint m = 1u << (n * 4 + jj);
+        int q = int((b[32 + n * 32 + t] >> shift) & 3) - ((b[t] & m) ? 0 : 4);
+        return dl * float(q);
+    }
+    if (type == 12 || type == 13) {  // Q4_K (144 B) / Q5_K (176 B) super-blocks
+        bool k5 = (type == 13);
+        device const uchar* b = row + (e / 256) * (k5 ? 176 : 144);
+        uint w = e % 256, gi = w / 32, j64 = gi / 2, hi = gi % 2, l = w % 32;
+        int sc, mn;
+        if (gi < 4) {
+            sc = b[4 + gi] & 63;
+            mn = b[4 + gi + 4] & 63;
+        } else {
+            sc = (b[4 + gi + 4] & 0xF) | ((b[4 + gi - 4] >> 6) << 4);
+            mn = (b[4 + gi + 4] >> 4) | ((b[4 + gi] >> 6) << 4);
+        }
+        float d1 = dq_ldf16(b) * float(sc);
+        float m1 = dq_ldf16(b + 2) * float(mn);
+        if (!k5) {
+            device const uchar* q = b + 16 + 32 * j64;
+            int nib = hi ? (q[l] >> 4) : (q[l] & 0xF);
+            return d1 * float(nib) - m1;
+        }
+        device const uchar* ql = b + 48 + 32 * j64;
+        uint u = 1u << (2 * j64 + hi);
+        int nib = hi ? (ql[l] >> 4) : (ql[l] & 0xF);
+        return d1 * float(nib + ((b[16 + l] & u) ? 16 : 0)) - m1;
+    }
+    if (type == 14) {  // Q6_K: 256 elements, 210-byte super-block
+        device const uchar* b = row + (e / 256) * 210;
+        uint w = e % 256, gi = w / 32, n = gi / 4, qu = gi % 4, l = w % 32;
+        device const uchar* ql = b + 64 * n;
+        device const uchar* qh = b + 128 + 32 * n;
+        int q;
+        if (qu == 0) q = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
+        else if (qu == 1) q = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+        else if (qu == 2) q = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+        else q = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
+        int scale = int(char(b[192 + 8 * n + (l / 16) + 2 * qu]));
+        return dq_ldf16(b + 208) * float(scale) * float(q - 32);
+    }
+    if (type == 23) {  // IQ4_XS: 256 elements, 136-byte super-block
+        device const uchar* b = row + (e / 256) * 136;
+        uint ib = (e % 256) / 32, j = e % 32;
+        int ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) | int(((dq_ld16(b + 2) >> (2 * ib)) & 3) << 4);
+        float dl = dq_ldf16(b) * float(ls - 32);
+        device const uchar* qs = b + 8 + 16 * ib;
+        int nib = (j < 16) ? (qs[j] & 0xF) : (qs[j - 16] >> 4);
+        return dl * kIq4NlF[nib];
+    }
+    if (type == 18) {  // IQ3_XXS: 98-byte blocks, grid codebook + packed sign/scale aux
+        int ib = (e % 256) / 32, il = (e % 32) / 8, j = e % 8;
+        device const uchar* qs = row + (e / 256) * 98 + 2;
+        uint grid = kIq3XxsGrid[qs[8 * ib + 2 * il + (j >= 4 ? 1 : 0)]];
+        uint aux = dq_ld32(qs + 64 + 4 * ib);
+        float d = dq_ldf16(row + (e / 256) * 98) * (0.5f + float(aux >> 28)) * 0.5f;
+        uchar signs = kKsignsIq2xs[(aux >> (7 * il)) & 127];
+        int gv = int((grid >> (8 * (j % 4))) & 0xFF);
+        if (gv >= 128) gv -= 256;
+        return d * float(gv) * ((signs & kKmaskIq2xs[j]) ? -1.0f : 1.0f);
+    }
+    return 0.0f;  // unsupported type: host side validates before launch
+}
+
+// ggml block geometry for the dq_elem formats: elements and bytes per block.
+inline void dq_geometry(int type, thread uint& elems, thread uint& bytes) {
+    switch (type) {
+        case 2: elems = 32; bytes = 18; break;
+        case 6: elems = 32; bytes = 22; break;
+        case 8: elems = 32; bytes = 34; break;
+        case 20: elems = 32; bytes = 18; break;
+        case 11: elems = 256; bytes = 110; break;
+        case 12: elems = 256; bytes = 144; break;
+        case 13: elems = 256; bytes = 176; break;
+        case 14: elems = 256; bytes = 210; break;
+        case 18: elems = 256; bytes = 98; break;
+        case 23: elems = 256; bytes = 136; break;
+        case 42: elems = 64; bytes = 18; break;
+        default: elems = 0; bytes = 0; break;
+    }
+}
+
+inline float gdn_sigmoid(float x) { return 1.0f / (1.0f + exp(-x)); }
+inline float gdn_silu(float x) { return x / (1.0f + exp(-x)); }
+inline float gdn_softplus(float x) { return x > 20.0f ? x : log(1.0f + exp(x)); }
+// MSL has no log1p: Kahan form, log(u) * e / (u - 1) with u = 1 + e (exact
+// where 1 + e rounds to 1) - the form the reference Metal GDN kernel uses.
+inline float gdn_softplus_log1p(float x) {
+    if (x > 20.0f) return x;
+    float e = exp(x), u = 1.0f + e;
+    return u == 1.0f ? e : log(u) * e / (u - 1.0f);
+}
+inline float bf16_to_f32(ushort h) { return as_type<float>(uint(h) << 16); }
+inline ushort f32_to_bf16(float f) {
+    uint u = as_type<uint>(f); uint lsb = (u >> 16) & 1u;
+    return ushort((u + 0x7FFFu + lsb) >> 16);
+}
+inline float bf16_round(float f) { return bf16_to_f32(f32_to_bf16(f)); }
+// Threadgroup reduction of one float per thread (block <= 1024, power-of-two-ish):
+// every thread ends with the total. tg array of 32 floats reused as scratch.
+inline float tg_sum(float v, threadgroup float* scratch, uint tid, uint tcount) {
+    // simd reduce first
+    v = simd_sum(v);
+    uint lane = tid & 31u, sg = tid >> 5;
+    if (lane == 0u) scratch[sg] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint nsg = (tcount + 31u) >> 5;
+    v = (tid < nsg) ? scratch[tid] : 0.0f;
+    v = simd_sum(v);
+    if (tid == 0u) scratch[0] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return scratch[0];
+}
+inline float moe_f16_at(device const uchar* p) {
+    const ushort bits = ushort(p[0]) | (ushort(p[1]) << 8);
+    return float(as_type<half>(bits));
+}
+
+// bf16 bits -> float (the bits are the top half of the float).
+inline float moe_bf16_to_f32(ushort bits) { return as_type<float>(uint(bits) << 16); }
+
+// Warp reductions in the CUDA xor-butterfly order (mask 16..1), so float sums built on
+// them land on the same rounding as the CUDA kernels they mirror.
+inline float moe_warp_sum_xor(float v) {
+    for (ushort m = 16; m > 0; m >>= 1) v += simd_shuffle_xor(v, m);
+    return v;
+}
+inline float moe_warp_max_xor(float v) {
+    for (ushort m = 16; m > 0; m >>= 1) v = max(v, simd_shuffle_xor(v, m));
+    return v;
+}
+inline float strata_f32_from_f16(ushort h) {
+    const uint sign = (uint)(h & 0x8000u) << 16;
+    const uint ex = (h >> 10) & 0x1fu;
+    const uint man = h & 0x3ffu;
+    uint out;
+    if (ex == 0u) {
+        if (man == 0u) {
+            out = sign;
+        } else {
+            uint m = man;
+            int s = 0;
+            while ((m & 0x400u) == 0u) { m <<= 1u; ++s; }
+            out = sign | ((uint)(113 - s) << 23) | ((m & 0x3ffu) << 13);
+        }
+    } else if (ex == 31u) {
+        out = sign | 0x7f800000u | (man << 13);
+    } else {
+        out = sign | ((ex - 15u + 127u) << 23) | (man << 13);
+    }
+    return as_type<float>(out);
+}
+inline ushort strata_f16_from_f32(float f) {
+    const uint x = as_type<uint>(f);
+    const uint sign = (x >> 16) & 0x8000u;
+    const uint rawexp = (x >> 23) & 0xffu;
+    int exp = (int)rawexp - 127 + 15;
+    uint man = x & 0x7fffffu;
+    if (rawexp == 0xffu) return (ushort)(sign | 0x7c00u | (man ? 0x200u : 0u));
+    if (exp >= 31) return (ushort)(sign | 0x7c00u);
+    if (exp <= 0) {
+        if (exp < -10) return (ushort)sign;
+        man |= 0x800000u;
+        const uint sh = (uint)(14 - exp);
+        uint h = (man >> sh) & 0x3ffu;
+        const uint rem = man & ((1u << sh) - 1u);
+        if (rem > (1u << (sh - 1)) || (rem == (1u << (sh - 1)) && (h & 1u))) ++h;
+        return (ushort)(sign | h);
+    }
+    ushort h = (ushort)(sign | ((uint)exp << 10) | (man >> 13));
+    const uint rem = man & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) ++h;
+    return h;
+}
+
+// ---- M-RoPE position -------------------------------------------------------
+// Mirrors mrope_pos in include/strata/kernels/mrope.hpp: with no table the
+// rotary position is the position itself; with a table (device int32
+// [cells][3] of t/h/w), pair i reads stream (pair % 3). `has_tab` is a kernel
+// argument because a null table is passed as a placeholder buffer.
+inline int strata_mrope_pos(device const int* tab, int has_tab, int pos, int pair) {
+    return has_tab ? tab[pos * 3 + pair % 3] : pos;
+}
+
+// ---- total order on scores for selection -----------------------------------
+// Mirrors order_key in the CUDA selection kernels: NaN sorts below everything
+// (key 0); otherwise the IEEE sign flip makes uint order == float order.
+inline uint strata_order_key(float s) {
+    const float v = s + 0.0f;
+    if (!(v == v)) return 0u;
+    const uint b = as_type<uint>(v);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
