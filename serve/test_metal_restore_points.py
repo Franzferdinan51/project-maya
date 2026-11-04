@@ -53,8 +53,16 @@ class GlmPoints(unittest.TestCase):
 
 class MinimaxPoints(unittest.TestCase):
     def test_turns(self):
-        # a BOS, the system turn at 1, the first user turn at 1800, the last turn at 3200, text to 5000
-        pts = metal_restore_points(ids(5000, {0: 1, 1: B, 1800: B, 3200: B}), turn_id=B)
+        # the real render's shape: the system sp at 1, the developer sp at 168 (the caller's system
+        # text and tools), the first user turn at 1800, the generation prompt at 3200, text to 5000
+        pts = metal_restore_points(ids(5000, {0: 1, 1: B, 168: B, 1800: B, 3200: B}), turn_id=B)
+        self.assertEqual(pts, {"shared": 1800, "tail": 5000 - 512})
+
+    def test_a_history_marks_its_last_conversation_turn(self):
+        # system sp, developer sp, user, ai, user, generation prompt: shared is the first user
+        # turn's start, marks the last one's
+        pts = metal_restore_points(
+            ids(5000, {1: B, 168: B, 1800: B, 2600: B, 3200: B, 4000: B}), turn_id=B)
         self.assertEqual(pts, {"shared": 1800, "marks": [3200], "tail": 5000 - 512})
 
     def test_a_single_long_turn_gets_only_a_tail(self):

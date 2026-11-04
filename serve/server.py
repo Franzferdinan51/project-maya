@@ -802,9 +802,11 @@ def metal_restore_points(ids, user_id=None, system_id=None, obs_id=None, turn_id
       system prompt and its tools ("shared": another conversation behind the same start goes back there); the
       last turn of any of them is where an edited or resent message leaves the prompt ("marks");
     - MiniMax (turn_id given): every turn opens with the same token (]~b]) and the role is written as text
-      after it, which the ids alone cannot tell apart - so "shared" is the second turn's start (the first
-      turn is the system prompt; a conversation without one simply never matches that entry) and "marks"
-      the last turn's start.
+      after it, which the ids alone cannot tell apart.  The template always opens with two scaffold
+      turns - the system sp, then the developer sp carrying the caller's system text and tools - so the
+      first conversation turn is the third opener: "shared" is its start (another conversation behind
+      the same system+tools goes back there), "marks" the last conversation turn's start (the final
+      opener is the generation prompt, not a conversation turn).
 
     Positions under `least` are left out, exactly as the DeepSeek points: a start that short is read again in
     about the time a point costs.  And a point is only a place the engine is asked to remember - its entry
@@ -816,14 +818,16 @@ def metal_restore_points(ids, user_id=None, system_id=None, obs_id=None, turn_id
         turns = [i for i, t in enumerate(ids) if t == turn_id]
         if not turns:
             return {}
-        first = turns[1] if len(turns) > 1 else None
-        last = turns[-1]
+        # the two scaffold turns (system sp, developer sp) always lead, and the generation prompt
+        # always closes: the conversation's own turns stand between them
+        first = turns[2] if len(turns) > 2 else None
+        last = turns[-2] if len(turns) > 2 else None
         if first is not None and first >= least:
             out["shared"] = first
-        if last >= least and last != first:
+        if last is not None and last >= least and last != first:
             out["marks"] = [last]
         t = len(ids) - tail
-        if tail > 0 and t >= least and t > last:
+        if tail > 0 and t >= least and t > turns[-1]:
             out["tail"] = t
         return out
     if user_id is None:
