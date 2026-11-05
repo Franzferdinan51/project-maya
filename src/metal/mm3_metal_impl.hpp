@@ -4,7 +4,6 @@
 #pragma once
 
 #include "glm_metal_impl.hpp"   // TensorLoc, Weights, free_memory (maya::metal)
-#include "mm3_dspark.hpp"
 #include "mm3_metal.hpp"
 
 #include "ggml-backend.h"
@@ -49,15 +48,10 @@ struct Mm3Metal::Impl {
     ggml_tensor* c_h = nullptr;    // [n_embd, n_ubatch] F32 the slice's residual stream
     ggml_tensor* c_q = nullptr;    // [head_dim, n_head, n_ubatch] F32
     ggml_tensor* c_iq = nullptr;   // [ix_dim, ix_heads, n_ubatch] BF16 (the values the scores are made of)
-    ggml_tensor* c_blk = nullptr;  // [n_ctx] F32: the indexer block of every position (s / ix_blk),
-                                   // filled once in init_state for the in-graph mask build
     std::vector<uint8_t> arena;    // the graphs' ggml context (metadata only), kept between forwards
     int64_t n_ctx = 0;
     int64_t pos = 0;
     int64_t snap_pos = -1;
-
-    Mm3Draft draft;        // the DSpark draft (empty until load_draft)
-    bool has_draft = false;
 
     ~Impl();
     bool open_files(const std::string& path, std::string& err);
@@ -69,10 +63,7 @@ struct Mm3Metal::Impl {
     ggml_tensor* wl(int il, const char* suffix) const;  // blk.<il>.<suffix>
     bool compute(ggml_cgraph* gf, const std::vector<std::pair<ggml_tensor*, std::vector<uint8_t>>>& up,
                  std::string& err);
-    // logits_rows > 1 (with rows_out): the last layer's graph also writes that many rows of
-    // logits (the slice's rows, row-major) - a verify window reads them all
-    bool run_slice(const int32_t* tok, int T, std::vector<float>& logits, std::string& err,
-                   int logits_rows = 1, std::vector<float>* rows_out = nullptr);
+    bool run_slice(const int32_t* tok, int T, std::vector<float>& logits, std::string& err);
 };
 
 }  // namespace maya::metal

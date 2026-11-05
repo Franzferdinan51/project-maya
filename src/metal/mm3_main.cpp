@@ -23,8 +23,6 @@ void usage() {
                  "usage: maya-metal-mm3 --gguf MODEL.gguf [--serve | --ids 1,2,3 [--n N]]\n"
                  "  --max-context N      tokens the KV cache holds (default 32768)\n"
                  "  --ubatch N           prompt tokens per slice (default 512)\n"
-                 "  --dspark-dir DIR     the DSpark draft's folder (config.json + the safetensors);\n"
-                 "                       default: a dspark/ folder beside the GGUF, when it has one\n"
                  "  --cpu                run on ggml-cpu instead of the GPU (reference runs)\n");
 }
 
@@ -54,7 +52,6 @@ int main(int argc, char** argv) {
     std::vector<int32_t> ids;
     int n_gen = 32;
     maya::metal::Mm3Options o;
-    std::string dspark_dir;
     std::vector<std::string> rest;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -66,7 +63,6 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "--gguf") gguf = next();
-        else if (a == "--dspark-dir") dspark_dir = next();
         else if (a == "--max-context") max_ctx = std::atoll(next());
         else if (a == "--serve") serve = true;
         else if (a == "--ids") ids = parse_ids(next());
@@ -94,21 +90,6 @@ int main(int argc, char** argv) {
     }
     const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::fprintf(stderr, "maya-metal-mm3: loaded in %.1f s: %s\n", load_s, model.describe().c_str());
-    if (dspark_dir.empty()) {   // a dspark/ folder beside the GGUF loads itself, as a pack's does
-        const std::string auto_dir = gguf.substr(0, gguf.find_last_of('/')) + "/dspark";
-        FILE* probe = std::fopen((auto_dir + "/config.json").c_str(), "r");
-        if (probe) {
-            std::fclose(probe);
-            dspark_dir = auto_dir;
-        }
-    }
-    if (!dspark_dir.empty() && !model.load_draft(dspark_dir, err)) {
-        std::fprintf(stderr, "maya-metal-mm3: %s\n", err.c_str());
-        return 1;
-    }
-    if (model.draft_block() > 0)
-        std::fprintf(stderr, "maya-metal-mm3: DSpark draft loaded from %s (block %d)\n",
-                     dspark_dir.c_str(), model.draft_block());
     if (serve) return maya::metal::serve(model, rest);
 
     std::vector<float> logits;

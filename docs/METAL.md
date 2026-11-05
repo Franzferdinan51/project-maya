@@ -50,23 +50,18 @@ not resident, and so on the SSD.
 
 ## MiniMax-M3.1-Flash
 
-`maya-metal-mm3` (src/metal/mm3_metal.cpp, beside the GLM engine) runs MiniMax-M3.1-Flash from Maya's own GGUF
+**Experimental**, and newer than the GLM engine. `maya-metal-mm3` (src/metal/mm3_metal.cpp, beside the GLM engine) runs MiniMax-M3.1-Flash from Maya's own GGUF
 quants (the set's `-maya-indexers.bin` side file is read automatically). Its graph follows `tools/mm3/ref.py` op
 for op: Gemma norms, per-head q/k norms, NeoX partial RoPE, MiniMax Sparse Attention on every layer (the indexer
-selection runs fused on the GPU and keeps the top blocks exactly as the reference selects them;
-MAYA_MM3_HOST_SELECT=1 restores the original host read-back), swigluoai MLPs,
+scores read back to the host, which keeps the top blocks exactly as the reference selects them), swigluoai MLPs,
 sigmoid routing with the correction bias. Sampling and the serve protocol are the GLM engine's, shared code and
 all (`maya-metal-mm3 --serve`, driven by serve/server.py like the other engines).
 
 The memory plan is the simple one the quants were made for: **every expert is resident**. Maya-XS (93 GB) fits a
 128 GB Mac with room for the caches; Maya-S (122 GB) is past a 128 GB Mac's GPU working set, so XS is the Mac
-quant. With nothing streamed there is no expert pool. Drafting is DSpark (the set's own drafter, loaded
-automatically when present), tuned per request with the `spec` keys: it wins large on predictable text and can
-lose on open prose, so the confidence floor is worth setting per workload. Drafted and plain decoding write
-identical tokens, except that batched
-verify rows can flip a pick whose top-2 logits are within ~1e-4 (the standard speculative-decoding numerics
-caveat); counting/predictable text never flipped in testing. Pictures are not wired (the vision tower stays
-with the CUDA engine for now), so MiniMax on a Mac is text only. `./maya.sh --backend metal --setup` does not offer MiniMax yet; run
+quant. With nothing streamed there is no expert pool and no drafting yet (a request's `spec` keys are accepted;
+plain decoding writes the same tokens), and pictures are not wired (the vision tower stays with the CUDA engine
+for now), so MiniMax on a Mac is text only. `./maya.sh --backend metal --setup` does not offer MiniMax yet; run
 it by hand:
 
 ```sh
@@ -79,8 +74,8 @@ Its parity gate is `metal_mm3_test` (in the same `ctest` run): a synthetic 3-lay
 layer, two MoE layers, 17 index blocks so the selection must drop one) against a numpy port of the reference
 forward in `tools/mm3_metal_fixture.py` - logits within 4.2e-5 relative L2 on the Metal GPU (gate 1e-3), a
 sliced prompt equal to a one-shot one, greedy decoding token for token; `tools/test_mm3_serve.py`
-(`metal_mm3_serve_test`) drives the serve protocol the same way. The real model has not run on a Mac yet: the
-first bench numbers are as welcome here as GLM's.
+(`metal_mm3_serve_test`) drives the serve protocol the same way. The contributor ran the real Maya-XS set on a 128 GB Mac Studio (M5 Max); bench
+numbers from other Macs are as welcome here as GLM's. The port's notes: [PORT-MINIMAX-METAL.md](PORT-MINIMAX-METAL.md).
 
 ## Speed
 

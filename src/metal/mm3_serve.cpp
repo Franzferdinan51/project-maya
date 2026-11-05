@@ -7,12 +7,8 @@
 //
 // Sampling is the shared chain (sampler.cpp): same keys, same defaults, same Philox draws, so a seeded
 // request repeats.  The differences from the GLM engine's serve are the model's, not the protocol's:
-// DSpark drafting when a draft is loaded (mm3_dspark.cpp; the spec keys steer it, and a verify
-// window writes the same tokens plain decoding would), no images (GENI is refused: the vision
-// tower is not wired on this backend yet), cross-request restore points (GEN marks=/shared=,
-// the GLM engine's P5 protocol: named prefix depths recorded during prefill that a later request
-// whose prompt starts with that prefix resumes from - here an entry is just a position, since the
-// caches are positional), no expert
+// no drafting (the spec keys are accepted; plain decoding writes the same tokens a verify window
+// would), no images (GENI is refused: the vision tower is not wired on this backend yet), no expert
 // pool (every expert is resident, so the STAT lines report a 1.0 hit rate and no pool), and the stop
 // tokens are the GGUF's own eos ids instead of a hardcoded set.  PAUSE and the prefix snapshot are
 // cheaper here than anywhere: the caches are positional, so a snapshot is a position and restoring
@@ -99,64 +95,13 @@ struct Input {
     }
 };
 
-// a request's restore points (GEN keys marks=/shared=, the DS4 engine's spellings, as on the GLM
-// engine): positions in the prompt where prefill should record a reusable prefix, shared= the one
-// another conversation may resume from
-struct Restore {
-    std::vector<int64_t> marks;
-    int64_t shared = -1;
-};
-
 struct Server {
     Mm3Metal& model;
     Input in;
     std::vector<int32_t> cached;      // the previous prompt less its last token: what the snapshot holds
-    // cross-request restore points (P5): prefixes an earlier request recorded at its marks=/shared=
-    // points.  An entry certifies "the first toks.size() positions hold this prefix" - the caches are
-    // positional, so the state at a depth is the buffer itself and restoring is rewind_to(depth).
-    // run() keeps that true by dropping every entry deeper than a request's reuse depth before that
-    // request's prefill overwrites from there, and by clearing the table wherever it resets.
-    struct PrefixEntry {
-        std::vector<int32_t> toks;    // the prefix (its size is the position)
-        bool shared = false;          // recorded from a shared= point: the eviction victim of last resort
-    };
-    std::vector<PrefixEntry> entries;
-    static constexpr size_t kMaxEntries = 8;
     const int loop_w_think = env_int("MAYA_MM3_LOOP_THINK", 256);
     const int loop_w_answer = env_int("MAYA_MM3_LOOP_ANSWER", 1024);
     int chunk = 512;                  // prompt tokens a forward() takes (serve())
-    bool spec_on = true;        // DSpark drafting when a draft is loaded (a GEN's spec= overrides)
-    float conf_floor = 0.7f;    // a round verifies the drafts before the first below this confidence
-    float draft_cost = 0.0f;    // > 0: ... and before the first whose confidences' product is below it
-
-    void drop_entry(size_t i) { entries.erase(entries.begin() + (long) i); }
-
-    // every entry dies (the engine's state was reset or discarded: the positions no longer certify
-    // the prefixes they held)
-    void clear_entries() { entries.clear(); }
-
-    // capture the prefix at position p (the prompt's first p tokens, just prefilled) as an entry
-    void record_point(const std::vector<int32_t>& prompt, int64_t p, bool is_shared) {
-        for (size_t i = 0; i < entries.size();) {   // one entry per depth: this request's prefix replaces it
-            if ((int64_t) entries[i].toks.size() == p) drop_entry(i);
-            else ++i;
-        }
-        if (entries.size() >= kMaxEntries) {   // full: the deepest non-shared entry goes (the root stays)
-            long victim = -1;
-            for (size_t i = 0; i < entries.size(); ++i)
-                if (!entries[i].shared && (victim < 0 || entries[i].toks.size() >= entries[(size_t) victim].toks.size()))
-                    victim = (long) i;
-            if (victim < 0)   // every entry is a shared root: the deepest goes
-                for (size_t i = 0; i < entries.size(); ++i)
-                    if (victim < 0 || entries[i].toks.size() >= entries[(size_t) victim].toks.size())
-                        victim = (long) i;
-            if (victim >= 0) drop_entry((size_t) victim);
-        }
-        PrefixEntry e;
-        e.toks.assign(prompt.begin(), prompt.begin() + (long) p);
-        e.shared = is_shared;
-        entries.push_back(std::move(e));
-    }
 
     void err(const std::string& m) {
         std::printf("ERR %s\n", m.c_str());
@@ -173,11 +118,8 @@ struct Server {
         bool any_key = false, greedy_req = false;
         int64_t think_budget = 0;
         int32_t think_end = -1;
-        int spec_req = -1;      // GEN spec: -1 the engine default, 0/1 off, >= 2 on
-        float conf_req = -1.0f;   // GEN dspark_conf / spec_min_p: the round's confidence floor
         int pen_n = 0;
         float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
-        Restore restore;
         std::string ids_s, bias_err;
         const int n_vocab = model.geometry().n_vocab;
         while (ss >> tok) {
@@ -197,30 +139,8 @@ struct Server {
             else if (k == "seed") sp.seed = (uint64_t) std::atoll(v.c_str());
             else if (k == "think_budget") think_budget = std::atoll(v.c_str());
             else if (k == "think_end") think_end = std::atoi(v.c_str());
-            else if (k == "spec") {   // the CUDA serve's modes: 1 is off, 2 and up are on
-                const int sv = std::atoi(v.c_str());
-                spec_req = sv == 1 ? 0 : sv >= 2 ? 1 : spec_req;
-            }
-            else if (k == "dspark_conf" || k == "spec_min_p") conf_req = (float) std::atof(v.c_str());
-            else if (k == "marks") {   // restore points to record during prefill: <pos>,<pos>,...
-                for (size_t at = 0; at < v.size();) {
-                    const size_t end = v.find(',', at);
-                    const std::string one = v.substr(at, end == std::string::npos ? end : end - at);
-                    char* p = nullptr;
-                    const long long pos = std::strtoll(one.c_str(), &p, 10);
-                    if (p != one.c_str() && *p == '\0' && pos > 0) restore.marks.push_back(pos);
-                    if (end == std::string::npos) break;
-                    at = end + 1;
-                }
-            }
-            else if (k == "shared") {   // the restore point another conversation may resume from
-                char* p = nullptr;
-                const long long pos = std::strtoll(v.c_str(), &p, 10);
-                if (p != v.c_str() && *p == '\0' && pos > 0) restore.shared = pos;
-            }
-            else if (k == "spec_n_min" || k == "spec_cum") {
-                // accepted, as on the GLM engine; the DSpark round's cut is the confidence floor
-                // (and the survival product, an engine flag) - these two change nothing here
+            else if (k == "spec" || k == "spec_min_p" || k == "spec_n_min" || k == "spec_cum") {
+                // accepted, as on the GLM engine; plain decoding writes the same tokens drafting would
             }
             else if (k == "penalty_last_n") pen_n = std::atoi(v.c_str());
             else if (k == "penalty_repeat") pen_repeat = std::strtof(v.c_str(), nullptr);
@@ -285,11 +205,11 @@ struct Server {
         if (max_new <= 0)
             return err("the prompt (" + std::to_string(prompt.size()) + " tokens) fills the context (" +
                        std::to_string(model.max_context()) + ")");
-        run(prompt, max_new, sp, think_budget, think_end, spec_req, conf_req, restore);
+        run(prompt, max_new, sp, think_budget, think_end);
     }
 
     void run(const std::vector<int32_t>& prompt, int64_t max_new, Sampling sp, int64_t think_budget,
-             int32_t think_end, int spec_req, float conf_req, const Restore& restore) {
+             int32_t think_end) {
         const int n_vocab = model.geometry().n_vocab;
         const std::vector<int32_t>& eos = model.geometry().eos;
         std::string e;
@@ -303,34 +223,9 @@ struct Server {
         if (snap > 0 && (size_t) snap == cached.size() && (size_t) snap <= n - 1 &&
             std::equal(cached.begin(), cached.end(), prompt.begin()) && model.snapshot_restore())
             reuse = (size_t) snap;
-        else {
-            // a restore point an earlier request recorded: this prompt resumes from the deepest one
-            // it starts with (a matching entry is never deeper than a matching snapshot - the
-            // invalidation below saw to that - so the snapshot above keeps its first claim).
-            // Restoring is a rewind: the caches are positional and the entry's positions still
-            // hold its prefix.  The DSpark draft context needs no handling here - snapshot_restore
-            // does not touch it either, and the forwards after a restore re-feed from the depth.
-            int best = -1;
-            for (size_t i = 0; i < entries.size(); ++i) {
-                const PrefixEntry& e = entries[i];
-                if (e.toks.size() <= n - 1 && (best < 0 || e.toks.size() > entries[(size_t) best].toks.size()) &&
-                    std::equal(e.toks.begin(), e.toks.end(), prompt.begin()))
-                    best = (int) i;
-            }
-            if (best >= 0) {
-                model.rewind_to((int64_t) entries[(size_t) best].toks.size());
-                reuse = entries[(size_t) best].toks.size();
-            } else
-                model.reset();
-        }
+        else
+            model.reset();
         cached.clear();
-        // this request writes every position from reuse on: entries standing deeper are overwritten
-        // by its prefill, so they die here unless the prefill records them again; entries at or
-        // above the reuse depth keep the state they certify
-        for (size_t i = 0; i < entries.size();) {
-            if (entries[i].toks.size() > reuse) drop_entry(i);
-            else ++i;
-        }
 
         std::vector<float> logits;
         auto pp = [&](size_t read) {
@@ -338,45 +233,18 @@ struct Server {
             std::printf("PP %zu %zu %.1f %.1f %zu\n", read, n, ms, ms > 0 ? (read - reuse) * 1000.0 / ms : 0.0, reuse);
             std::fflush(stdout);
         };
-        // the restore points to record while prefilling: this request's shared= and marks= inside
-        // the span prefill actually writes (a point at or below the reuse depth is already behind
-        // us; the snapshot itself stands at the last one, n - 1)
-        std::vector<std::pair<int64_t, bool>> points;   // (position, is_shared), ascending, unique
-        if (restore.shared > (int64_t) reuse && restore.shared <= (int64_t) n - 1)
-            points.emplace_back(restore.shared, true);
-        for (const int64_t p : restore.marks)
-            if (p > (int64_t) reuse && p <= (int64_t) n - 1) points.emplace_back(p, false);
-        std::stable_sort(points.begin(), points.end(),
-                         [](const std::pair<int64_t, bool>& a, const std::pair<int64_t, bool>& b) {
-                             return a.first < b.first;
-                         });
-        points.erase(std::unique(points.begin(), points.end(),
-                                 [](const std::pair<int64_t, bool>& a, const std::pair<int64_t, bool>& b) {
-                                     return a.first == b.first;
-                                 }),
-                     points.end());
-        size_t next_pt = 0;
-        for (size_t at = reuse; at + 1 < n;) {   // every prompt token but the last
+        for (size_t at = reuse; at + 1 < n; at += (size_t) chunk) {   // every prompt token but the last
             if (in.stop.load()) {
                 finish = "cancel";
                 break;
             }
-            size_t k = std::min((size_t) chunk, n - 1 - at);
-            if (next_pt < points.size() && points[next_pt].first > (int64_t) at &&
-                points[next_pt].first < (int64_t) (at + k))
-                k = (size_t) (points[next_pt].first - (int64_t) at);   // land exactly on the point
+            const size_t k = std::min((size_t) chunk, n - 1 - at);
             if (!model.forward(std::vector<int32_t>(prompt.begin() + (long) at, prompt.begin() + (long) (at + k)),
                                logits, e)) {
                 model.reset();
-                clear_entries();
                 return err(e);
             }
             pp(at + k);
-            at += k;
-            if (next_pt < points.size() && points[next_pt].first == (int64_t) at) {
-                record_point(prompt, points[next_pt].first, points[next_pt].second);
-                ++next_pt;
-            }
         }
         int64_t produced = 0;
         auto t1 = std::chrono::steady_clock::now();
@@ -386,14 +254,12 @@ struct Server {
             if (!model.forward({prompt.back()}, logits, e)) {
                 model.reset();
                 cached.clear();
-                clear_entries();
                 return err(e);
             }
             pp(n);
             t1 = std::chrono::steady_clock::now();
         } else {
             model.reset();   // a cut prompt leaves no state worth keeping
-            clear_entries();
         }
 
         std::vector<int32_t> pen_hist;
@@ -482,7 +348,6 @@ struct Server {
             }
             return produced < max_new;
         };
-        long long d_acc = 0, d_off = 0;
         if (std::strcmp(finish, "cancel") != 0) {
             bool bad = false;
             auto pick_one = [&](const float* l) -> int32_t {
@@ -499,116 +364,28 @@ struct Server {
                 sp.counter += 1;
                 return t;
             };
-            // DSpark: a round drafts after the token, verifies the token and its drafts in one
-            // forward and keeps the drafts the target agrees with - every pick is the plain
-            // loop's own pick over that row (penalties, the loop guard's forcing and the
-            // sampler all run per row, in order), so the tokens are plain decoding's, only
-            // more of them per pass over the weights (the CUDA serve's loop, mm3_main.cpp)
-            const int B = model.draft_block();
-            const bool spec = B > 0 && (spec_req < 0 ? spec_on : spec_req != 0);
-            const float floor_c = conf_req >= 0.0f ? conf_req : conf_floor;
             if (!in.stop.load()) {
-                int32_t y = pick_one(logits.data());
+                const int32_t y = pick_one(logits.data());
                 if (bad) {
                     model.reset();
                     cached.clear();
-                    clear_entries();
                     return err("non-finite logits");
                 }
-                bool go = on_token(y);   // (on_token checked STOP: the last token written is never fed)
-                while (go) {
-                    const int64_t pos = model.position();   // y sits at pos, not fed yet
-                    if (!spec) {
-                        if (!model.forward({y}, logits, e)) {
+                if (on_token(y)) {
+                    for (int32_t t = y;;) {   // (on_token checked STOP: the last token written is never fed)
+                        if (!model.forward({t}, logits, e)) {
                             model.reset();
                             cached.clear();
-                            clear_entries();
                             return err(e);
                         }
-                        y = pick_one(logits.data());
+                        t = pick_one(logits.data());
                         if (bad) {
                             model.reset();
                             cached.clear();
-                            clear_entries();
                             return err("non-finite logits");
                         }
-                        go = on_token(y);
-                        continue;
+                        if (!on_token(t)) break;
                     }
-                    long long room = std::min<long long>(max_new - produced, model.max_context() - pos - 1);
-                    if (in_think) room = std::min(room, think_budget - produced);
-                    if (in.wrap.load()) room = 0;
-                    std::vector<int32_t> drafts;
-                    std::vector<float> confs;
-                    int k = 0;
-                    if (room > 0) {
-                        if (!model.draft_propose(y, pos, B, drafts, confs, e)) {
-                            model.reset();
-                            cached.clear();
-                            clear_entries();
-                            return err(e);
-                        }
-                        double surv = 1.0;
-                        while (k < (int) drafts.size() && k < room && confs[(size_t) k] >= floor_c) {
-                            surv *= confs[(size_t) k];
-                            if (draft_cost > 0.0f && surv < draft_cost) break;
-                            ++k;
-                        }
-                    }
-                    if (k == 0) {
-                        if (!model.forward({y}, logits, e)) {
-                            model.reset();
-                            cached.clear();
-                            clear_entries();
-                            return err(e);
-                        }
-                        y = pick_one(logits.data());
-                        if (bad) {
-                            model.reset();
-                            cached.clear();
-                            clear_entries();
-                            return err("non-finite logits");
-                        }
-                        go = on_token(y);
-                        continue;
-                    }
-                    std::vector<int32_t> win(1, y);
-                    win.insert(win.end(), drafts.begin(), drafts.begin() + k);
-                    std::vector<float> rows;
-                    if (!model.forward_rows(win, rows, e)) {
-                        model.reset();
-                        cached.clear();
-                        clear_entries();
-                        return err(e);
-                    }
-                    d_off += k;
-                    int kept = 0;
-                    int32_t next = -1;
-                    bool ended = false;
-                    for (int i = 0; i <= k; ++i) {
-                        const int32_t cand = pick_one(rows.data() + (size_t) i * n_vocab);
-                        if (bad) {
-                            model.reset();
-                            cached.clear();
-                            clear_entries();
-                            return err("non-finite logits");
-                        }
-                        if (i == k || cand != drafts[(size_t) i]) {
-                            next = cand;
-                            break;
-                        }
-                        ++d_acc;
-                        if (!on_token(drafts[(size_t) i])) {   // written, but never fed (the rewind below)
-                            ended = true;
-                            kept = i;
-                            break;
-                        }
-                        kept = i + 1;
-                    }
-                    model.rewind_to(pos + 1 + kept);
-                    if (ended) break;
-                    y = next;
-                    go = on_token(y);
                 }
             } else {
                 finish = "cancel";
@@ -623,12 +400,10 @@ struct Server {
             cached.assign(prompt.begin(), prompt.end());
             cached.insert(cached.end(), emitted.begin(), emitted.end() - 1);
         }
-        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", (long long) produced, n,
+        std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0\n", (long long) produced, n,
                     std::chrono::duration<double, std::milli>(t1 - t0).count(),
-                    std::chrono::duration<double, std::milli>(t2 - t1).count(), finish, d_acc, d_off, reuse);
+                    std::chrono::duration<double, std::milli>(t2 - t1).count(), finish, reuse);
         std::fflush(stdout);
-        if (d_off > 0)
-            std::fprintf(stderr, "maya-metal-mm3: DSpark kept %lld of %lld drafts\n", d_acc, d_off);
         if (produced > 0) {
             const double s = std::chrono::duration<double>(t2 - t1).count();
             std::fprintf(stderr, "maya-metal-mm3: %lld tokens, %.2f tok/s\n", (long long) produced,
@@ -640,25 +415,17 @@ struct Server {
 }  // namespace
 
 int serve(Mm3Metal& model, const std::vector<std::string>& args) {
+    (void) args;   // the server's CUDA-engine flags mean nothing here
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     Server s{model, {}, {}};
-    for (size_t i = 0; i < args.size(); ++i) {   // the CUDA engine's drafting flags, honoured here
-        if (args[i] == "--dspark" && i + 1 < args.size()) s.spec_on = args[++i] != "off";
-        else if (args[i] == "--dspark-conf" && i + 1 < args.size())
-            s.conf_floor = (float) std::atof(args[++i].c_str());
-        else if (args[i] == "--dspark-cost" && i + 1 < args.size())
-            s.draft_cost = (float) std::atof(args[++i].c_str());
-    }
     s.chunk = model.ubatch();
     if (const char* c = std::getenv("MAYA_METAL_PP_CHUNK")) s.chunk = std::max(1, std::atoi(c));
     const auto& st = model.stats();
-    std::printf("INFO engine=%s context=%lld logit_bias=1 kv_ctx=%lld kv_gb=%.3f vram_gb=%.1f vram_slots=0 "
-                "dspark=%d\n",
+    std::printf("INFO engine=%s context=%lld logit_bias=1 kv_ctx=%lld kv_gb=%.3f vram_gb=%.1f vram_slots=0\n",
                 MAYA_VERSION, (long long) model.max_context(), (long long) model.max_context(),
-                st.state_bytes / 1e9, (st.weight_bytes + st.state_bytes) / 1e9,
-                model.draft_block() > 0 && s.spec_on ? 1 : 0);
+                st.state_bytes / 1e9, (st.weight_bytes + st.state_bytes) / 1e9);
     std::printf("NOTE %s\n", model.describe().c_str());
-    std::printf("READY %lld stop pause restore\n", (long long) model.max_context());
+    std::printf("READY %lld stop pause\n", (long long) model.max_context());
     std::fflush(stdout);
     std::thread reader([&] { s.in.run(); });
     reader.detach();   // blocked in getline until stdin closes; the process exits around it
