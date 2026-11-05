@@ -188,6 +188,10 @@ if(MAYA_METAL_TESTS)
              COMMAND ${MAYA_MM3_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_mm3_serve.py $<TARGET_FILE:maya-metal-mm3>
                      ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf)
     set_tests_properties(metal_mm3_serve_test PROPERTIES FIXTURES_REQUIRED metal_mm3_gguf)
+    add_test(NAME metal_mm3_serve_restore_test
+             COMMAND ${MAYA_MM3_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_mm3_serve_restore.py $<TARGET_FILE:maya-metal-mm3>
+                     ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf)
+    set_tests_properties(metal_mm3_serve_restore_test PROPERTIES FIXTURES_REQUIRED metal_mm3_gguf)
     # DSpark (src/metal/mm3_dspark.cpp): the fixture generator is a torch reference
     # (tools/mm3/dspark_ref.py), so its tests register only when a python with torch is found
     add_executable(metal_mm3_dspark_test src/metal/metal_mm3_dspark_test.cpp)
