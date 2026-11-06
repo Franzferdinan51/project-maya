@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <numeric>
 
@@ -330,7 +331,7 @@ bool Mm3Metal::Impl::run_slice(const int32_t* tok, int T, std::vector<float>& lo
     std::vector<float> scores((size_t) Tk * g.ix_heads * T);
     std::vector<std::vector<float>> masks;
     // the draft's taps: this slice's output streams at the tap layers, tap-major [NT][T][dim]
-    const std::vector<int>& dtaps = has_draft ? draft.geo().taps : std::vector<int>();
+    const std::vector<int>& dtaps = has_draft ? draft_taps() : std::vector<int>();
     std::vector<float> taps_stage;
     if (has_draft) taps_stage.assign((size_t) dtaps.size() * T * g.n_embd, 0.0f);
     auto tap_j = [&](int il) {
@@ -408,7 +409,7 @@ bool Mm3Metal::Impl::run_slice(const int32_t* tok, int T, std::vector<float>& lo
             }
         }
     }
-    if (has_draft && !draft.context(taps_stage.data(), T, pos, err)) return false;
+    if (has_draft && !draft_context(taps_stage.data(), T, pos, err)) return false;
     return true;
 }
 
@@ -436,7 +437,7 @@ bool Mm3Metal::load(const std::string& path, int64_t max_ctx, std::string& err) 
 void Mm3Metal::reset() {
     p_->pos = 0;
     p_->snap_pos = -1;
-    if (p_->has_draft) p_->draft.reset_context();
+    if (p_->has_draft) p_->draft_reset();
 }
 
 void Mm3Metal::snapshot_save() { p_->snap_pos = p_->pos; }
@@ -471,12 +472,26 @@ bool Mm3Metal::forward(const std::vector<int32_t>& tokens, std::vector<float>& l
 
 bool Mm3Metal::load_draft(const std::string& dir, std::string& err) {
     Impl& m = *p_;
-    if (!m.draft.load(dir, m.w("token_embd.weight"), m.w("output.weight"), m.n_ctx, err)) return false;
+    // the dir's config says which draft it holds: a dflash_config object is DFlash2
+    // (mm3_dflash2.cpp); anything else is the DSpark head (mm3_dspark.cpp)
+    std::string cfg;
+    {
+        std::ifstream f(dir + "/config.json");
+        if (!f) f = std::ifstream(dir + "/dflash2/config.json");
+        if (f) cfg.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    }
+    if (cfg.find("\"dflash_config\"") != std::string::npos) {
+        if (!m.draft2.load(dir, m.w("token_embd.weight"), m.w("output.weight"), m.n_ctx, err)) return false;
+        m.draft_kind = 2;
+    } else {
+        if (!m.draft.load(dir, m.w("token_embd.weight"), m.w("output.weight"), m.n_ctx, err)) return false;
+        m.draft_kind = 1;
+    }
     m.has_draft = true;
     return true;
 }
 
-int Mm3Metal::draft_block() const { return p_->has_draft ? p_->draft.geo().block : 0; }
+int Mm3Metal::draft_block() const { return p_->has_draft ? p_->active_draft_block() : 0; }
 
 bool Mm3Metal::draft_propose(int32_t anchor, int64_t pos, int n, std::vector<int32_t>& drafts,
                              std::vector<float>& confs, std::string& err) {
@@ -485,7 +500,7 @@ bool Mm3Metal::draft_propose(int32_t anchor, int64_t pos, int n, std::vector<int
         confs.clear();
         return true;
     }
-    return p_->draft.propose(anchor, pos, n, drafts, confs, err);
+    return p_->draft_propose(anchor, pos, n, drafts, confs, err);
 }
 
 bool Mm3Metal::forward_rows(const std::vector<int32_t>& tokens, std::vector<float>& rows, std::string& err) {
