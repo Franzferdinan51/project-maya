@@ -361,6 +361,7 @@ bool Mm3Metal::Impl::init_state(std::string& err) {
     c_h = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, g.n_embd, U);
     c_q = ggml_new_tensor_3d(sctx, GGML_TYPE_F32, g.head_dim, g.n_head, U);
     c_iq = ggml_new_tensor_3d(sctx, GGML_TYPE_BF16, g.ix_dim, g.ix_heads, U);
+    c_blk = ggml_new_tensor_1d(sctx, GGML_TYPE_F32, n_ctx);
     ggml_backend_buffer_type_t bt = gpu_dev ? ggml_backend_dev_buffer_type(gpu_dev) : ggml_backend_cpu_buffer_type();
     sbuf = ggml_backend_alloc_ctx_tensors_from_buft(sctx, bt);
     if (!sbuf) {
@@ -368,6 +369,12 @@ bool Mm3Metal::Impl::init_state(std::string& err) {
         return false;
     }
     st.state_bytes = ggml_backend_buffer_get_size(sbuf);
+    {   // the block of every position, filled once: the in-graph mask build (mm3_metal.cpp's
+        // Builder::select) gathers block rows and query blocks with it
+        std::vector<float> blk((size_t) n_ctx);
+        for (int64_t i = 0; i < n_ctx; ++i) blk[(size_t) i] = (float) (i / g.ix_blk);
+        ggml_backend_tensor_set(c_blk, blk.data(), 0, blk.size() * sizeof(float));
+    }
     return true;
 }
 

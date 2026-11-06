@@ -4,6 +4,7 @@
 #pragma once
 
 #include "glm_metal_impl.hpp"   // TensorLoc, Weights, free_memory (maya::metal)
+#include "mm3_dflash2.hpp"
 #include "mm3_dspark.hpp"
 #include "mm3_metal.hpp"
 
@@ -49,13 +50,33 @@ struct Mm3Metal::Impl {
     ggml_tensor* c_h = nullptr;    // [n_embd, n_ubatch] F32 the slice's residual stream
     ggml_tensor* c_q = nullptr;    // [head_dim, n_head, n_ubatch] F32
     ggml_tensor* c_iq = nullptr;   // [ix_dim, ix_heads, n_ubatch] BF16 (the values the scores are made of)
+    ggml_tensor* c_blk = nullptr;  // [n_ctx] F32: the indexer block of every position (s / ix_blk),
+                                   // filled once in init_state for the in-graph mask build
     std::vector<uint8_t> arena;    // the graphs' ggml context (metadata only), kept between forwards
     int64_t n_ctx = 0;
     int64_t pos = 0;
     int64_t snap_pos = -1;
 
-    Mm3Draft draft;        // the DSpark draft (empty until load_draft)
+    Mm3Draft draft;          // the DSpark draft (empty until load_draft)
+    Mm3DFlash2 draft2;       // the DFlash2 draft (ditto; a draft dir holds one or the other)
+    int draft_kind = 0;      // 0 = none, 1 = DSpark, 2 = DFlash2 (load_draft sniffs the config)
     bool has_draft = false;
+
+    // the active draft, whichever kind is loaded (both expose the same interface shape)
+    const std::vector<int>& draft_taps() const { return draft_kind == 2 ? draft2.geo().taps : draft.geo().taps; }
+    int active_draft_block() const { return draft_kind == 2 ? draft2.geo().block : draft.geo().block; }
+    void draft_reset() {
+        if (draft_kind == 2) draft2.reset_context();
+        else draft.reset_context();
+    }
+    bool draft_context(const float* taps, int T, int64_t pos0, std::string& err) {
+        return draft_kind == 2 ? draft2.context(taps, T, pos0, err) : draft.context(taps, T, pos0, err);
+    }
+    bool draft_propose(int32_t anchor, int64_t pos, int n, std::vector<int32_t>& drafts,
+                       std::vector<float>& confs, std::string& err) {
+        return draft_kind == 2 ? draft2.propose(anchor, pos, n, drafts, confs, err)
+                               : draft.propose(anchor, pos, n, drafts, confs, err);
+    }
 
     ~Impl();
     bool open_files(const std::string& path, std::string& err);
