@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Project Maya - set up and start GLM-5.3-Flash, DeepSeek-V4.1-Flash-1017, MiniMax-M3.1-Flash or Qwen-3.8-Flash-Next
 (CYBER-FROST) on your own GPU(s).  Qwen-3.8-Flash-Next (CYBER-FROST): CUDA from V100 on and HIP, Linux and Windows, pictures too.
-GLM-5.3-Flash: CUDA on Linux and Windows (experimental); HIP: experimental gfx1100/gfx1201/gfx1151 (gfx1030: not
+GLM-5.3-Flash: CUDA on Linux and Windows; HIP: gfx1100/gfx1201/gfx1151 (gfx1030: experimental, not
 validated), Linux and Windows, text only; Metal: experimental, macOS on Apple Silicon, GLM-5.3-Flash only, text only,
 one conversation at a time.  DeepSeek-V4.1-Flash-1017 and MiniMax-M3.1-Flash: CUDA from V100 on, Linux
-and Windows; their GGUFs on HIP too (their EXL3 quants: experimental there).
+and Windows; on HIP too (their GGUFs and their EXL3 quants).
 The quants are named model first, then the tier by the experts' bits (XS, S, M, L): --model glm-maya-s,
 deepseek-maya-xs, minimax-maya-xs ... (tools/maya_quants.py); every name used before still works.
 
@@ -34,7 +34,7 @@ no tuning step - it balances its own split):
      (on Windows AMD's ROCm SDK wheels in .venv, offered when they are not there)
   2. asks: which GPUs (one, or several that split the layers), how much context, which model to download (GLM-5.3 ·
      Maya-S, Maya-S24, Maya-M, Maya-M-Derisked or Maya-L; or turboderp's EXL3 quant at 3.05 or 4.05 bits or the
-     self-calibrated one at 4.10, experimental: NVIDIA, and AMD)
+     self-calibrated one at 4.10: NVIDIA from V100, and AMD)
   3. Python packages into .venv, llama.cpp's source at the pinned commit (it lists them and asks first)
   4. compiles the engine (`build/maya`, or `build-hip/maya`) for your GPU(s): 10-30 minutes, once
   5. the model: GGUF files you already have (--gguf-dir), or a download it shows you first - the exact commands
@@ -266,7 +266,7 @@ MODELS = {
     # downloaded, and how a download is known whole); "revision": the branch's commit the hashes belong to.
     "EXL3-3.05bpw": {
         "about": "turboderp's EXL3 quant at 3.05 bits per weight (exllamav3's trellis format, which the engine reads "
-                 "in place from its safetensors), with the MTP draft block - experimental (NVIDIA; AMD too)",
+                 "in place from its safetensors), with the MTP draft block - NVIDIA from V100, and AMD",
         "format": "exl3", "repo": "turboderp/GLM-5.3-Flash-exl3", "branch": "3.05bpw",
         "revision": "332ab457b709b7ba30dd9a448be5de03b80a7ac9", "folder": "", "download_gb": 125.3,
         "files": {
@@ -349,7 +349,7 @@ MODELS = {
     # tensors are in its shards (3.05bpw has them in kpool_aux.safetensors)
     "EXL3-4.05bpw": {
         "about": "turboderp's EXL3 quant at 4.05 bits per weight (exllamav3's trellis format, which the engine reads "
-                 "in place from its safetensors), with the MTP draft block - experimental (NVIDIA; AMD too)",
+                 "in place from its safetensors), with the MTP draft block - NVIDIA from V100, and AMD",
         "format": "exl3", "repo": "turboderp/GLM-5.3-Flash-exl3", "branch": "4.05bpw",
         "revision": "2a30229e67012798ba9f0cd832bb78abf4c363d5", "folder": "", "download_gb": 165.2,
         "files": {
@@ -440,7 +440,7 @@ MODELS = {
     "EXL3-sc_4.10bpw": {
         "about": "turboderp's self-calibrated EXL3 quant at 4.10 bits per weight (exllamav3's trellis format, which the "
                  "engine reads in place from its safetensors): 4-bit routed experts like EXL3-4.05bpw, 8-bit "
-                 "attention and shared experts, with the MTP draft block - experimental (NVIDIA; AMD too)",
+                 "attention and shared experts, with the MTP draft block - NVIDIA from V100, and AMD",
         "format": "exl3", "repo": "turboderp/GLM-5.3-Flash-exl3", "branch": "sc_4.10bpw",
         "revision": "c6b8ac3f6069173343e253e1cba90536ed2c72dc", "folder": "", "download_gb": 167.8,
         "files": {
@@ -623,8 +623,8 @@ MM3_PACK_TOOLS = ("tools/mm3/pack.py", "tools/mm3/st.py", "tools/strata_tokenize
 MM3_DIR = "MiniMax-M3.1-Flash-EXL3-3.5bpw"
 # Where its EXL3 quant is offered: everywhere DeepSeek's EXL3 runs (NVIDIA from V100, cc 7.0 = DS4_MIN_CC; Linux and
 # Windows) once maya-mm3 builds and runs there - MM3_ALL_PLATFORMS, the one switch.  Until then: Linux, RTX 30 / A100 or
-# newer (validated on sm_86 and sm_120); MAYA_MM3_MIN_CC=70 takes a V100 for testing.  AMD (HIP): experimental, as GLM's
-# EXL3 quants there - maya-mm3's EXL3 kernels take the shared exl3.cu's HIP paths (their tests pass on a Radeon 8065S).
+# newer (validated on sm_86 and sm_120); MAYA_MM3_MIN_CC=70 takes a V100 for testing.  AMD (HIP): too, as GLM's EXL3
+# quants there - maya-mm3's EXL3 kernels take the shared exl3.cu's HIP paths.
 MM3_ALL_PLATFORMS = True
 MM3_MIN_CC = 70                                    # (with MM3_ALL_PLATFORMS: DeepSeek's EXL3 reach)
 MM3_MIN_CC_NOW = 80                                # (until then)
@@ -706,6 +706,15 @@ QWEN_PROFILE = ROOT / "data" / "expert-profile-qwen.bin"
 # the attention's time the same as FP16's, half its VRAM left to experts)
 QWEN_KV = "int8"
 QWEN_KV_BYTES = 12 * (2 * 2 * 256 + 2 * 2 * 256 // 64 * 2 + 128)
+# Qwen3.8-Flash-Next itself in unsloth's UD-IQ2_XS GGUF (v1.1.54; the only one of unsloth's UD quants listed): the same
+# Qwen path, three shards (1 the metadata, 2 the weights, 3 the n-gram table alone) and its MTP head as a separate GGUF
+# (tools/qwen/download_unsloth.json: pinned, sha256-checked; shard 3 from Maya's own repo, byte for byte unsloth's).  The
+# n-gram table is memory-mapped (--ple-io mmap: the page cache, never loaded into RAM by the engine).
+QWEN_UD = "ud-iq2_xs"                              # (its key: --qwen-quant, the installer record's qwen_quant)
+QWEN_UD_DIR = "Qwen3.8-Flash-Next-UD-IQ2_XS"       # (its folder in the models folder, the installer's "quant")
+QWEN_UD_MANIFEST = ROOT / "tools" / "qwen" / "download_unsloth.json"
+QWEN_UD_MODEL_NAME = "qwen3.8-flash-next"
+QWEN_QUANTS = ("q5_k_m", QWEN_UD)
 FAMILIES = ("glm", "deepseek", "minimax", "qwen")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
@@ -941,6 +950,10 @@ def hip_clang(root: Path) -> Path | None:
     slots = sorted((root / "lib" / "llvm").glob(f"*/bin/{exe}"),
                    key=lambda p: [int(x) for x in re.findall(r"\d+", p.parent.parent.name)],
                    reverse=True) if not WIN else []
+    # Debian/Ubuntu's own ROCm packages: hipcc drives the distribution's LLVM, /usr/lib/llvm-<N>/bin
+    slots += sorted((root / "lib").glob(f"llvm-[0-9]*/bin/{exe}"),
+                    key=lambda p: [int(x) for x in re.findall(r"\d+", p.parent.parent.name)],
+                    reverse=True) if not WIN else []
     return next((p for p in (root / "llvm" / "bin" / exe, root / "lib" / "llvm" / "bin" / exe,
                              root / "lib64" / "rocm" / "llvm" / "bin" / exe, *slots, root / "bin" / exe)
                  if p.exists()), None)
@@ -1052,6 +1065,31 @@ def hip_info(bindir) -> str | None:
     return str(p) if p and p.exists() else shutil.which("hipInfo")
 
 
+def installed_hip_info() -> str | None:
+    """hipInfo of a ROCm already installed (ROCM_PATH, HIP_PATH, the newest in C:\\Program Files\\AMD\\ROCm, PATH),
+    only to name the GPUs - not windows_rocm(), whose rocm-sdk init can unpack gigabytes."""
+    base = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "AMD" / "ROCm"
+    roots = [Path(os.environ[k]) for k in ("ROCM_PATH", "HIP_PATH") if os.environ.get(k)] + sorted(
+        base.glob("[0-9]*"), key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)], reverse=True)
+    return next((str(r / "bin" / "hipInfo.exe") for r in roots if (r / "bin" / "hipInfo.exe").exists()),
+                shutil.which("hipInfo"))
+
+
+def first_run_backend() -> str:
+    """The backend of a first run without --backend (nothing set up yet): Metal on a Mac with Apple Silicon, HIP on a
+    PC with an AMD GPU Maya's HIP build takes (check_hip_pc's list, the experimental ones too) and no NVIDIA one, else
+    CUDA.  On Windows the AMD GPUs are named by an installed ROCm's hipInfo first: Windows' adapter table knows the
+    common cards only, and an AMD-only PC whose card it did not know was sent to the CUDA checks, which stop at
+    nvidia-smi (#805)."""
+    if apple_silicon():
+        return "metal"
+    if S.gpus():
+        return "cuda"
+    amd = S.amd_gpus(installed_hip_info()) if WIN else S.amd_gpus()
+    takes = HIP_ARCHS + HIP_ARCHS_UNVALIDATED + HIP_ARCHS_WAVE64
+    return "hip" if any(g["arch"] in takes for g in amd) else "cuda"
+
+
 THEROCK_INDEX = "https://repo.amd.com/rocm/whl-multi-arch/"   # AMD's ROCm for Windows: TheRock's pip wheels
 THEROCK_VERSION = "7.14.1"                                     # 7.14: the first with Gorgon Halo (Ryzen AI Max 400)
 
@@ -1098,7 +1136,7 @@ def vs_2026(vcvars) -> bool:
 
 def check_hip_pc(a, installed=False, text_only=True) -> dict:
     if not WIN and (not sys.platform.startswith("linux") or S.is_wsl()):
-        fail("Maya's experimental HIP backend runs on native Linux or Windows")
+        fail("Maya's HIP backend runs on native Linux or Windows")
     vcvars = S.find_vcvars(cuda=False) if WIN else None
     if WIN and vcvars is None:      # (before ROCm's download: ROCm's clang needs its headers)
         fail("Visual Studio Build Tools (2022 or 2026) are needed: ROCm's compiler uses their headers and libraries",
@@ -1176,20 +1214,26 @@ def check_hip_pc(a, installed=False, text_only=True) -> dict:
         root = root.resolve()
         clang = hip_clang(root)
         if (clang is None or clang.parent == root / "bin"
-                or not any(list((root / d).glob("libhipblas.so*")) for d in ("lib", "lib64"))):
+                or not any(list((root / d).glob("libhipblas.so*"))
+                           for d in ("lib", "lib64", *(q.relative_to(root) for q in (root / "lib").glob("*-linux-gnu"))))):
             fail("ROCm's HIP compiler and hipBLAS are required", "install ROCm 7, or set ROCM_PATH to its root")
         if tool_version(str(root / "bin/hipcc")) < (7, 0):
-            fail("Maya's HIP port requires ROCm 7 or newer")
+            if os.environ.get("MAYA_HIP_ALLOW_ROCM6") != "1":
+                fail("Maya's HIP port requires ROCm 7 or newer",
+                     "or set MAYA_HIP_ALLOW_ROCM6=1 to try a ROCm 6.x (untested, e.g. a distribution's packages)")
+            warn("ROCm older than 7 (MAYA_HIP_ALLOW_ROCM6=1): untested, the build or the engine may fail")
         if not shutil.which("c++"):
             fail("a C++ compiler is needed", "Ubuntu/Debian: sudo apt install build-essential")
     cpu, avx2, avx512 = S.cpu_info()
     if not avx2:
-        fail(f"the CPU ({cpu}) needs AVX2 for the expert lane")
+        # as on CUDA (#32): the CPU expert lane falls back to ggml's own kernels (src/kernels/cpu/expert_layout.cpp)
+        warn(f"the CPU ({cpu}) has no AVX2: the engine runs, its CPU expert lane on ggml's own kernels (slower). "
+             "MAYA_GLM_CPU_LANE=0 turns it off")
     total, avail = mem_gb()
     split = f"{len(chosen)} GPUs (layer split)" if len(chosen) > 1 else "one GPU"
-    ok(f"using {' + '.join(gpu_label(g) for g in chosen)}; experimental HIP, {split}" +
+    ok(f"using {' + '.join(gpu_label(g) for g in chosen)}; HIP, {split}" +
        (", text only" if text_only else ""))
-    ok(f"ROCm: {root}; CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2'})")
+    ok(f"ROCm: {root}; CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
     ok(f"RAM: {total:.0f} GB, {avail:.0f} GB available now")
     if any(hip_unified_memory(g) for g in chosen) and WIN:
         # Windows gives the APU's GPU a fixed carve-out, which it does not count as RAM: the engine sizes the pool
@@ -1401,35 +1445,28 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
     step(1, "checking this PC")
     ds4 = family == "deepseek"
     mm3 = family == "minimax"
-    if mm3 and a.backend == "hip" and not gguf:   # (as GLM's EXL3 quants on AMD: experimental)
-        warn(f"{MM3}'s EXL3 quant on AMD is experimental: its kernels pass their tests on AMD GPUs, but the whole "
-             f"model has not been run on one yet - Maya's GGUF quants (--model minimax-maya-xs / minimax-maya-s) are the tested "
-             "way there")
     if mm3 and WIN and not MM3_ALL_PLATFORMS:
         fail(f"{MM3}'s engine (maya-mm3) runs on Linux only for now (its Windows build is on the way)",
              f"set it up on a Linux PC with an NVIDIA GPU ({mm3_gpus()})")
     if a.backend == "hip":
-        if ds4 and not gguf:   # (as GLM's and MiniMax's EXL3 quants on AMD: experimental)
-            warn(f"{DS4}'s EXL3 quants on AMD are experimental: their kernels pass their tests on AMD GPUs, but the "
-                 f"whole model has not been measured on one - Maya's GGUF quants (--model deepseek-maya-s / "
-                 "deepseek-maya-xs) are the tested way there")
         return check_hip_pc(a, text_only=not mm3)
     if a.backend == "metal":
         if family != "glm":
-            fail(f"Maya's Metal engine runs GLM-5.3-Flash only (no Metal engine for {ds4 and DS4 or mm3 and MM3 or QWEN_SHOWN})",
-                 "other models: an NVIDIA or AMD GPU (--backend cuda / --backend hip)")
+            fail(f"Maya's setup runs GLM-5.3-Flash only on a Mac (not {ds4 and DS4 or mm3 and MM3 or QWEN_SHOWN})",
+                 (f"{MM3} has an experimental Metal engine (maya-metal-mm3) that you build and start by hand: "
+                  "see docs/METAL.md; " if mm3 else "")
+                 + "other models: an NVIDIA or AMD GPU (--backend cuda / --backend hip)")
         return check_metal_pc(a)
-    if ds4 and not gguf and S.ARM:
-        # the EXL3 quant's expert kernels are x86 (AVX2/AVX-512): this CPU has neither
-        fail(f"{DS4}'s EXL3 quants need the x86 expert kernels (AVX2/AVX-512), which this ARM CPU does not have",
+    if ds4 and not gguf and (S.ARM or S.PPC):
+        # the EXL3 quant's expert kernels are x86 (AVX2/AVX-512): neither this ARM nor this POWER CPU has them
+        fail(f"{DS4}'s EXL3 quants need the x86 expert kernels (AVX2/AVX-512), which this {platform.machine()} CPU "
+             "does not have",
              f"set up one of Maya's GGUF quants instead: {ME} --setup --model deepseek-maya-s (or deepseek-maya-xs)")
     if not (WIN or sys.platform.startswith("linux")):
         fail("Project Maya runs on Linux and Windows (and on Apple Silicon: --backend metal)",
              "the engine needs an NVIDIA GPU and CUDA")
     min_cc = ((DS4_GGUF_MIN_CC if gguf else DS4_MIN_CC) if ds4 else (MM3_GGUF_MIN_CC if gguf else mm3_min_cc()) if mm3
               else QWEN_MIN_CC if family == "qwen" else MIN_CC)
-    if WIN:
-        warn("Windows support is new (experimental): Maya is developed and measured on Linux - tell us how it runs")
     if S.is_wsl():
         warn("this is WSL2, which Maya does not support: WSL2's driver pins only about 1 GB of "
              "RAM for the GPU, and Maya's RAM tier pins tens of GB. Use a native Linux install.")
@@ -1705,6 +1742,8 @@ def choose_family(a, prev: dict) -> str:
     is the default."""
     if a.model:
         return "deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else "qwen" if a.model == QWEN else "glm"
+    if getattr(a, "qwen_quant", None):                 # (--qwen-quant alone: Qwen's files named)
+        return "qwen"
     metal = getattr(a, "backend", None) == "metal"
     if a.gguf_dir or a.draft or (metal and not a.model_dir):     # (Metal runs GLM only: no question)
         return "glm"
@@ -1719,8 +1758,8 @@ def choose_family(a, prev: dict) -> str:
     rows = [("GLM-5.3-Flash", None,
              "Z.ai's GLM-5.3-Flash in Project Maya's GGUF quants (GLM-5.3-Flash-Maya-S to -Maya-L, 95-156 GB) or "
              "turboderp's EXL3 quants: from one GPU up, the experts that do not fit in VRAM from RAM and the SSD; "
-             "NVIDIA (AMD: experimental); pictures with its vision encoder."),
-            (DS4, "experimental",
+             "NVIDIA and AMD; pictures with its vision encoder."),
+            (DS4, None,
              "DeepSeek's DeepSeek-V4.1-Flash-1017 (748B) on its own engine: unsloth's GGUF (UD-Q8_K_XL, 508 GB; "
              "NVIDIA from V100 on or AMD, Linux or Windows), orcarouter's abliterated one (Mix-128G or "
              "Mix-256G, its refusals removed) or LibertAIDAI's EXL3 quants at 2.9 or "
@@ -1740,7 +1779,8 @@ def choose_family(a, prev: dict) -> str:
              f"{QWEN_SHOWN}: 180B, 10 of 512 experts a token; Blackfrost-AI's cybersecurity fine-tune of Qwen3.8-Flash-Next "
              "in peasantsmith's GGUF, on Maya's own Qwen path; NVIDIA from V100 on or AMD, Linux or Windows; all its "
              f"experts in about {qwen_entry()['memory_gb']:.0f} GB of VRAM and RAM together{here}, with less the others "
-             "read from the SSD; tool calls, its three reasoning efforts, MTP drafting, up to a 256K context; text only.")]
+             "read from the SSD; tool calls, its three reasoning efforts, MTP drafting, up to a 256K context; text only. "
+             f"Or the base model itself in unsloth's UD-IQ2_XS GGUF ({qwen_entry(QWEN_UD)['download_gb']:.0f} GB).")]
     pick = choose("Model?", ["Which model to set up:"], rows, FAMILIES.index(default), a.yes)
     return FAMILIES[pick]
 
@@ -1780,7 +1820,7 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
         rows.append((f"{Q.shown('glm', q)}: " + (f"downloaded, in {d}" if have else
                                                  f"download {m['download_gb']:.1f} GB from Hugging Face"),
                      ("recommended for cards of 24 GB or less" if q == "Maya-S24" else "recommended") if q == rec
-                     else "experimental" if is_exl3(q) else None, m["about"]))
+                     else None, m["about"]))
     pick = choose("Which GLM-5.3-Flash?", ["The model to download (GLM-5.3-Flash GGUF files you already have: "
                                            "--gguf-dir <file or folder>):"], rows, opts.index(default), a.yes)
     return "download", opts[pick]
@@ -1844,8 +1884,8 @@ def toolkit_root_defs(nvcc) -> list:
 def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, soft=False,
                    target: str = "maya") -> dict | None:
     """cmake configure + build of the `maya` target (DeepSeek: `maya-ds4`) in build/; the exact commands are
-    printed as they run.  soft: a failure warns and returns None (the engine already there keeps working) instead of
-    stopping."""
+    printed as they run.  soft: an update's rebuild (refresh_engine) - a failure stops with the reason and says that
+    the engine from before is not started (#805)."""
     def stop(what):
         msg = f"the engine build stopped while {what} (the reason is above)"
         hint = ("common causes: 'unsupported Microsoft Visual Studio version' - CUDA 12.x needs Visual Studio 2019 or "
@@ -1857,8 +1897,11 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
                 "again "
                 "(it continues)")
         if soft:
-            warn(msg + "; starting the engine compiled before")
-            return None
+            # (not the engine compiled before: it is from the older source, and this version's server and config
+            #  start it with settings it may not know or silently ignore - #805, on NVIDIA as on AMD)
+            fail("Maya's NVIDIA engine changed with this update, and " + msg + ": the engine from before does not "
+                 "match this version, so it is not started",
+                 hint + "\n       fix the reason, then start Maya again (it compiles again)")
         fail(msg, hint)
 
     cmake = pick_cmake()
@@ -2034,6 +2077,15 @@ def hip_toolchain(pc: dict) -> tuple:
     env.setdefault("CCACHE_DIR", str(BUILD / ".ccache"))
     if WIN:
         env["HIP_DEVICE_LIB_PATH"] = str(clang.parent.parent / "amdgcn" / "bitcode")
+    elif (clang.parent.parent.parent == root / "lib" and re.fullmatch(r"llvm-\d+", clang.parent.parent.name)
+          and not (root / "amdgcn" / "bitcode").is_dir() and "HIP_DEVICE_LIB_PATH" not in env):
+        # Debian/Ubuntu's rocm-device-libs-<N>: the bitcode sits in the LLVM's clang resource folder
+        # (/usr/lib/llvm-<N>/lib/clang/<N>/amdgcn/bitcode), not under ROCM_PATH, where clang looks with ROCM_PATH set.
+        # Only for that layout's compiler (<root>/lib/llvm-<N>/bin): every other ROCm builds as before
+        found = sorted(clang.parent.parent.glob("lib/clang/*/amdgcn/bitcode"),
+                       key=lambda p: [int(x) for x in re.findall(r"\d+", p.parent.parent.name)])
+        if found:
+            env["HIP_DEVICE_LIB_PATH"] = str(found[-1])
     return root, clang, bindir, env
 
 
@@ -2082,8 +2134,14 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
     if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", target, "-j", str(jobs)], env,
                    "build-maya-hip.bat", vcvars=vcvars):
         if soft:
-            warn("HIP rebuild failed; starting the previous engine")
-            return None
+            # (not the engine compiled before: it is from the older source, and this version's server and config
+            #  start it with settings it may not know or silently ignore - #805's start failed that way)
+            fail("Maya's AMD engine changed with this update, and compiling it failed: the engine from before does "
+                 "not match this version, so it is not started",
+                 "the compiler's reason is above - fix it, then start Maya again (it compiles again)" +
+                 ("; build-maya-hip.bat > build-hip.txt 2>&1 runs the same build alone and keeps its output"
+                  if WIN else "") +
+                 (" - " + VS2026_HIP_HINT if vs_2026(vcvars) else ""))
         fail("the HIP engine build failed", "see the compiler output above" +
              (" - " + VS2026_HIP_HINT if vs_2026(vcvars) else ""))
     if WIN:
@@ -2101,7 +2159,8 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
 
 def compile_engine_metal(llama: Path, src: str, soft=False) -> dict | None:
     """`maya-metal` (GLM-5.3-Flash on ggml's Metal backend) in build-metal/; the commands are printed as they run.
-    soft: a failure warns and returns None (the engine compiled before keeps working) instead of stopping."""
+    soft: an update's rebuild (refresh_engine) - a failure stops with the reason and says that the engine from before
+    is not started (#805)."""
     cmake = pick_cmake()
     if cmake is None:
         fail("CMake 3.24 or newer is needed", f"pip installs one into .venv: run {ME} --setup")
@@ -2116,8 +2175,11 @@ def compile_engine_metal(llama: Path, src: str, soft=False) -> dict | None:
     if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", "maya-metal", "-j", str(os.cpu_count() or 4)],
                    dict(os.environ), ""):
         if soft:
-            warn("the Metal engine's rebuild failed; starting the previous engine")
-            return None
+            # (the engine from before would run under this version's server and config: not started - #805)
+            fail("Maya's Metal engine changed with this update, and compiling it failed: the engine from before does "
+                 "not match this version, so it is not started",
+                 "the compiler's reason is above (no compiler: xcode-select --install) - fix it, then start Maya "
+                 "again (it compiles again)")
         fail("the Metal engine build failed", "see the compiler output above (no compiler: xcode-select --install)")
     meta = {"backend": "metal", "src": src, "llama": str(llama), "version": maya_version(),
             "date": time.strftime("%Y-%m-%d %H:%M"), "targets": ["maya-metal"]}
@@ -2170,8 +2232,11 @@ def refresh_engine(cfg: dict) -> None:
         root = Path(meta.get("rocm") or "/opt/rocm")
         llama = Path(meta.get("llama") or ROOT / "third_party/llama.cpp")
         if hip_clang(root) is None or not (llama / "ggml/CMakeLists.txt").exists():
-            warn("HIP compiler or llama.cpp source is missing; starting the previous engine")
-            return
+            # (the engine from before would run under this version's server and config: not started - #805)
+            fail(f"Maya's AMD engine changed with this update, but the HIP compiler ({root}) or llama.cpp's source "
+                 f"({llama}) it was compiled with is gone: the engine from before does not match this version, so it "
+                 "is not started",
+                 f"{ME} --setup --rebuild finds the compiler and compiles the engine again")
         pc = {"rocm": str(root), "archs": meta["archs"],
               "gpus": [{"index": i} for i in cfg.get("gpu", [0])]}
         if WIN and meta.get("lib_dirs"):
@@ -2181,16 +2246,20 @@ def refresh_engine(cfg: dict) -> None:
     if cfg.get("backend") == "metal":
         llama = Path(meta.get("llama") or ROOT / "third_party/llama.cpp")
         if not (llama / "ggml/CMakeLists.txt").exists():
-            warn("llama.cpp's source is missing; starting the previous engine")
-            return
+            # (the engine from before would run under this version's server and config: not started - #805)
+            fail(f"Maya's Metal engine changed with this update, but llama.cpp's source ({llama}) it was compiled "
+                 "with is gone: the engine from before does not match this version, so it is not started",
+                 f"{ME} --setup --rebuild fetches it and compiles the engine again")
         compile_engine_metal(llama, src, soft=True)
         return
     say("  The engine's source changed since it was compiled (an update): compiling what changed ...")
     nvcc, llama = meta.get("nvcc"), Path(meta.get("llama") or ROOT / "third_party" / "llama.cpp")
     if not nvcc or not Path(nvcc).exists() or not (llama / "ggml" / "CMakeLists.txt").exists():
-        warn("the compiler or llama.cpp's source it was built with is gone: starting the engine compiled before "
-             f"({ME} --setup --rebuild compiles it again)")
-        return
+        # (the engine from before would run under this version's server and config: not started - #805)
+        fail(f"Maya's NVIDIA engine changed with this update, but the CUDA compiler ({nvcc}) or llama.cpp's source "
+             f"({llama}) it was compiled with is gone: the engine from before does not match this version, so it is "
+             "not started",
+             f"{ME} --setup --rebuild finds the compiler and compiles the engine again")
     gpu_ids = meta.get("gpu_ids") or (cfg.get("gpu") if isinstance(cfg.get("gpu"), list) else [0])
     compile_engine(meta["archs"], gpu_ids, nvcc, meta.get("host_compiler"), llama, src, soft=True, target=target)
 
@@ -2410,6 +2479,9 @@ def import_catalog(models: Path) -> list:
     q = tolerant(qwen_entry)
     if q:
         entry(QWEN, QWEN, q)
+    q = tolerant(qwen_entry, QWEN_UD)
+    if q:
+        entry(QWEN_UD_DIR, QWEN_UD_DIR, q)
     return cat
 
 
@@ -3297,20 +3369,26 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         env = {**hip_env, **env}
     if env:
         cfg["env"] = env
+    suffix = {"hip": "-hip", "metal": "-metal"}.get(pc.get("backend"), "")
+    cfg_path = ROOT / f"maya-{quant.lower()}{suffix}.json"
+    old_cfg = read_json(cfg_path)
+    # the server's own settings from the config before (the address it listens on, its API key, ...): kept, as the
+    # DeepSeek, MiniMax and Qwen setups keep them - a GLM setup run again dropped them; --host / --api-key given now win
+    for k in ("host", "api_key", "cors_origins", "mcp_servers"):
+        if old_cfg.get(k) is not None:
+            cfg[k] = old_cfg[k]
     if a.host:
         cfg["host"] = a.host
     if a.api_key:
         cfg["api_key"] = a.api_key
     if vision:
         cfg["vision"] = vision
-    suffix = {"hip": "-hip", "metal": "-metal"}.get(pc.get("backend"), "")
-    cfg_path = ROOT / f"maya-{quant.lower()}{suffix}.json"
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     local = choice[1] if choice and choice[0] == "local" else None   # (choose_model's answer)
     if PROFILE.exists() and profile_fits(pack):
         cfg["args"] += ["--expert-profile", str(PROFILE)]
     if cfg_path.exists():
-        old = read_json(cfg_path).get("args") or []
+        old = old_cfg.get("args") or []
         kept = keep_args(old, cfg["args"],
                          ("--expert-cache", "--vram-reserve-mib", "--vram-reserve-later-mib", "--prefill",
                           "--parallel", "--expert-profile-save", "--expert-profile-save-every", "--kv-streaming",
@@ -5174,8 +5252,8 @@ def choose_ds4_quant(a, prev: dict) -> str:
         return ds4_abl_recommended(getattr(a, "backend", None) == "hip") if a.ds4_quant == DS4_ABL_ALIAS else a.ds4_quant
     hip = getattr(a, "backend", None) == "hip"
     maya = [k for k in DS4_MAYA if ds4_maya_published(k)]
-    # the EXL3 quants where they run: NVIDIA V100 or newer (compute capability 7.0+), and AMD (experimental, as GLM's
-    # EXL3 quants there) - a PC whose NVIDIA GPUs are all older is not offered them (nvidia-smi silent: offered, the
+    # the EXL3 quants where they run: NVIDIA V100 or newer (compute capability 7.0+), and AMD (as GLM's EXL3 quants
+    # there) - a PC whose NVIDIA GPUs are all older is not offered them (nvidia-smi silent: offered, the
     # PC check says)
     try:
         ccs = [] if hip else [int(g["arch"]) for g in S.gpus()]
@@ -5231,11 +5309,10 @@ def choose_ds4_quant(a, prev: dict) -> str:
     label = {k: (Q.shown("deepseek", k, gb.get(k)), about[k]) for k in DS4_QUANTS}
     pick = choose(f"Which files of {DS4}?", ["The GGUFs run on any NVIDIA GPU from Volta (V100) on and on AMD, whatever "
                                              "the memory: the experts that do not", "fit in VRAM are read from RAM and "
-                                             "the SSD. The EXL3 quants need a V100 or newer (AMD: experimental) and "
+                                             "the SSD. The EXL3 quants need a V100 or newer, or AMD, and "
                                              "~230 / ~280 GB of VRAM + RAM:"],
                   [(label[k][0], "recommended" if k == keys[0] else
-                    "abliterated: fits this PC" if k == abl else
-                    "experimental on AMD" if hip and k in DS4_EXL3 else None, label[k][1]) for k in keys],
+                    "abliterated: fits this PC" if k == abl else None, label[k][1]) for k in keys],
                   keys.index(default), a.yes or a.check)
     return keys[pick]
 
@@ -6031,7 +6108,7 @@ def mm3_memory_gb(quant: str, own: Path | None = None) -> float:
 
 def choose_mm3_quant(a, prev: dict) -> str:
     """--mm3-quant, else the one set up before, else asked among those this PC runs: Maya's GGUF quants once published
-    and the EXL3 quant (on AMD: experimental) - by this PC's memory the one recommended."""
+    and the EXL3 quant - by this PC's memory the one recommended."""
     if getattr(a, "mm3_quant", None):
         return a.mm3_quant
     if mm3_own_dir(a, "exl3") is not None:            # --model-dir names an EXL3 folder of your own: its files are the quant
@@ -6051,15 +6128,15 @@ def choose_mm3_quant(a, prev: dict) -> str:
     if len(keys) == 1:
         return keys[0]
     gb = {k: mm3_models()[0]["download_gb"] if k == "exl3" else mm3_gguf_entry(k)["download_gb"] for k in keys}
-    about = {"exl3": f"Mia-AiLab's quant: pictures and DSpark drafting; ~{MM3_MEMORY_GB} GB of VRAM + RAM" + ("; experimental on AMD" if hip else ""),
+    about = {"exl3": f"Mia-AiLab's quant: pictures and DSpark drafting; ~{MM3_MEMORY_GB} GB of VRAM + RAM",
              "gguf-xs": "Maya's quant: experts in ~1.6 bits, the whole model in a 128 GB PC's memory",
              "gguf-s": "Maya's quant: experts in ~2.1 bits"}
     pics = "; pictures and DSpark drafting (their files, ~4 GB, beside it)"
     label = {k: (Q.shown("minimax", k, gb[k]), about[k] + ("" if k == "exl3" else pics)) for k in keys}
     order = sorted(keys, key=lambda k: k != rec)
     default = before if before in order else rec
-    pick = choose(f"Which files of {MM3}?", ["Maya's GGUF quants run on NVIDIA from V100 on and on AMD; the EXL3 quant "
-                                             "on NVIDIA (on AMD: experimental):"],
+    pick = choose(f"Which files of {MM3}?", ["Maya's GGUF quants and the EXL3 quant run on NVIDIA from V100 on and "
+                                             "on AMD:"],
                   [(label[k][0], "recommended" if k == rec else None, label[k][1]) for k in order],
                   order.index(default), a.yes or a.check)
     return order[pick]
@@ -6429,8 +6506,28 @@ def set_up_mm3(a, prev: dict) -> Path | None:
 
 
 # ------------------------------------------------------------------------------------------------ CYBER-FROST-3.8-PS
-def qwen_entry() -> dict:
-    """CYBER-FROST-3.8-PS's download (tools/qwen/download.json) as a MODELS entry (offer_download's form)."""
+def qwen_entry(quant: str = "q5_k_m") -> dict:
+    """CYBER-FROST-3.8-PS's download (tools/qwen/download.json) as a MODELS entry (offer_download's form); quant
+    QWEN_UD: unsloth's UD-IQ2_XS of Qwen3.8-Flash-Next (tools/qwen/download_unsloth.json: its n-gram shard from Maya's
+    repo, its MTP head from the repo's top - "sources")."""
+    if quant == QWEN_UD:
+        man = read_json(QWEN_UD_MANIFEST)
+        if not man.get("files") or not man.get("revision") or not man.get("ngram") or not man.get("mtp"):
+            fail(f"{QWEN_UD_MANIFEST} is missing or damaged",
+                 "restore it (git checkout tools/qwen/download_unsloth.json)")
+        src = man.get("sources") or {}
+        return {"about": f"Qwen3.8-Flash-Next in unsloth's UD-IQ2_XS GGUF ({man.get('about', '')}); "
+                         f"{man.get('license', 'the Qwen Community License')}",
+                "format": "qwen-gguf", "repo": man["repo"], "revision": man["revision"],
+                "folder": man.get("folder", ""),
+                "files": {k: v[0] for k, v in man["files"].items()},
+                "sha256": {k: v[1] for k, v in man["files"].items()},
+                "sources": {k: (v["repo"], v["revision"]) for k, v in src.items()},
+                "source_folders": {k: v.get("folder", "") for k, v in src.items()},
+                "ngram": man["ngram"], "mtp": man["mtp"],
+                "download_gb": sum(v[0] for v in man["files"].values()) / 1e9,
+                "ngram_gb": man["files"][man["ngram"]][0] / 1e9,
+                "memory_gb": float(man.get("memory_gb") or 47)}
     man = read_json(QWEN_MANIFEST)
     if not man.get("files") or not man.get("revision"):
         fail(f"{QWEN_MANIFEST} is missing or damaged", "restore it (git checkout tools/qwen/download.json)")
@@ -6456,43 +6553,87 @@ def qwen_recommended_context(vram: float, starved: bool = False) -> int:
     return max(fits) if fits else QWEN_CONTEXTS[0]
 
 
-def qwen_dir(a, models: Path, prev: dict) -> Path:
-    """The model's folder: --model-dir, else the folder of the setup before (its pack is inside it), else
-    <models folder>/CYBER-FROST-3.8-PS."""
+def qwen_dir(a, models: Path, prev: dict, quant: str = "q5_k_m") -> Path:
+    """The model's folder: --model-dir, else the folder of the setup before of the same files (its pack is inside it),
+    else <models folder>/CYBER-FROST-3.8-PS (unsloth's UD-IQ2_XS: <models folder>/Qwen3.8-Flash-Next-UD-IQ2_XS)."""
     if a.model_dir:
         return Path(a.model_dir).expanduser().resolve()
     args = prev.get("args") or []
-    if "--native" in args[:-1]:
+    if "--native" in args[:-1] and ((prev.get("installer") or {}).get("qwen_quant") or "q5_k_m") == quant:
         d = Path(args[args.index("--native") + 1]).parent
         if d.is_dir():
             return d
-    return models / QWEN
+    return models / (QWEN_UD_DIR if quant == QWEN_UD else QWEN)
 
 
-def qwen_model_step(a, d: Path) -> list | None:
-    """The GGUF in d (downloaded when it is not there, then checked against its published sha256): [the file], or None
-    when nothing was downloaded."""
-    step(5, f"the model ({QWEN_SHOWN})")
-    m = qwen_entry()
+def link_published(dst: Path, size: int, sha: str, places: list) -> Path | None:
+    """dst missing, the same published file (its size, then its sha256 - never assumed) whole in one of `places`:
+    hard-linked from it (one copy on the disk, no second download), with its sha256 record.  The source linked, or None
+    (none there, or on another drive: the download fetches it)."""
+    if dst.exists():
+        return None
+    for src in dict.fromkeys(Path(p) for p in places):
+        try:
+            if src.resolve() == dst.resolve() or not src.is_file() or src.stat().st_size != size:
+                continue
+            if not sha256_checked(src, sha):
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.link(src, dst)
+        except OSError:
+            continue
+        seen = read_json(src.parent / VERIFIED).get(src.name)
+        if seen:   # (a hard link: the same size and time - its check still holds)
+            book = read_json(dst.parent / VERIFIED)
+            book[dst.name] = seen
+            try:
+                (dst.parent / VERIFIED).write_text(json.dumps(book, indent=1), encoding="utf-8")
+            except OSError:
+                pass
+        ok(f"{dst.name}: linked from {src.parent} (the same file, one copy)")
+        return src
+    return None
+
+
+def qwen_places(models: Path, rel: str) -> list:
+    """Where another Qwen setup keeps the file `rel` (relative to its model folder): both quants' default folders in the
+    models folder and the folders of the Qwen configs here."""
+    dirs = [models / QWEN, models / QWEN_UD_DIR]
+    for c in configs():
+        cfg = read_json(c)
+        if config_family(cfg) == "qwen" and (cfg.get("installer") or {}).get("model_dir"):
+            dirs.append(Path(cfg["installer"]["model_dir"]))
+    return [x / rel for x in dirs]
+
+
+def qwen_model_step(a, d: Path, quant: str = "q5_k_m", models: Path | None = None) -> list | None:
+    """The model's files in d (downloaded when they are not there, then checked against their published sha256): [the
+    GGUF, or unsloth's shards and MTP head - the first shard first], or None when nothing was downloaded.  A file
+    another Qwen setup here already has (the same sha256) is hard-linked from it."""
+    step(5, f"the model ({Q.shown('qwen', quant)})")
+    m = qwen_entry(quant)
     files = [d / n for n in m["files"]]
+    for f in files:
+        if file_incomplete(m, f) and models is not None:
+            link_published(f, m["files"][f.name], m["sha256"][f.name], qwen_places(models, f.name))
     missing = [f for f in files if file_incomplete(m, f)]
-    if missing and not offer_download(a, Q.shown("qwen", "q5_k_m", m["download_gb"]), d, files, m):
+    if missing and not offer_download(a, Q.shown("qwen", quant, m["download_gb"]), d, files, m):
         return None
     for f in files:                                    # (a file that was already there: checked once, then remembered)
         if not sha256_checked(f, m["sha256"][f.name]):
             fail(f"{f.name}: the sha256 does not match the published one - still being downloaded, or damaged",
                  f"let the download finish, or delete the file and run {ME} --download-model")
-    ok(f"{QWEN_SHOWN}: {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}")
+    ok(f"{Q.shown('qwen', quant)}: {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}")
     if rotational(d):
-        warn(f"{d} is on a spinning hard disk: the engine reads the n-gram table (52 GB) from it row by row on every "
-             "token, and the experts RAM cannot hold - use an NVMe SSD (--models-dir)")
+        warn(f"{d} is on a spinning hard disk: the engine reads the n-gram table ({m.get('ngram_gb', 52):.0f} GB) from "
+             "it row by row on every token, and the experts RAM cannot hold - use an NVMe SSD (--models-dir)")
     return files
 
 
-def qwen_pack_step(a, d: Path, files: list, llama: Path) -> Path:
+def qwen_pack_step(a, d: Path, files: list, llama: Path, mtp_gguf: Path | None = None) -> Path:
     """tools/iq_pack.py's pack in <model>/pack (the index of every tensor, the small float weights, the tokenizer with
-    the GGUF's chat template), and the MTP drafter built from the GGUF's NextN block (<pack>/mtp, tools/mtp_from_gguf.py)
-    - built again when its tools or the model file changed."""
+    the GGUF's chat template), and the MTP drafter built from the GGUF's NextN block (<pack>/mtp, tools/mtp_from_gguf.py;
+    mtp_gguf: unsloth's separate MTP head) - built again when its tools or the model files changed."""
     step(6, "the pack (the engine's index of the model file) and the MTP drafter")
     pack = d / "pack"
     tools = S.source_hash(QWEN_PACK_TOOLS)
@@ -6515,8 +6656,8 @@ def qwen_pack_step(a, d: Path, files: list, llama: Path) -> Path:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
     say("  The MTP drafter from the model's NextN block (its 512 experts requantized to 2 bits for the drafts; a few "
         "minutes) ...")
-    run([sys.executable, str(ROOT / "tools" / "mtp_from_gguf.py"), "--gguf", str(files[0]), "--out", str(pack / "mtp")],
-        env=env)
+    run([sys.executable, str(ROOT / "tools" / "mtp_from_gguf.py"), "--gguf", str(mtp_gguf or files[0]),
+         "--out", str(pack / "mtp")], env=env)
     if QWEN_PROFILE.exists():                          # (the shipped ranking of the experts: which start in VRAM)
         shutil.copyfile(QWEN_PROFILE, pack / "expert-profile.bin")
     stamp_pack(pack, files)
@@ -6528,21 +6669,24 @@ def qwen_pack_step(a, d: Path, files: list, llama: Path) -> Path:
 
 
 def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int, models: Path, d: Path,
-                      vision: dict | None = None) -> Path:
-    """maya-cyber-frost.json (maya-cyber-frost-hip.json on AMD) and its start script.  A setup again keeps what the
-    config before says that this one does not ask: its engine settings, the thinking level and sampling, where the
-    server listens and its key."""
+                      vision: dict | None = None, quant: str = "q5_k_m", ple: Path | None = None) -> Path:
+    """maya-cyber-frost.json (maya-cyber-frost-hip.json on AMD; unsloth's UD-IQ2_XS: maya-qwen-ud-iq2_xs.json) and its
+    start script.  A setup again keeps what the config before says that this one does not ask: its engine settings,
+    where the server listens and its key; the model's own sampling and thinking level every setup.  ple: the shard
+    that holds the n-gram table (unsloth's shard 3), else the GGUF itself."""
     step(8, "the configuration and the start script")
     port = a.port or 8080
     hip = pc.get("backend") == "hip"
-    cfg_path = ROOT / f"{Q.config_stem('qwen', 'q5_k_m')}{'-hip' if hip else ''}.json"
+    cfg_path = ROOT / f"{Q.config_stem('qwen', quant)}{'-hip' if hip else ''}.json"
     old = read_json(cfg_path)
     profile = pack / "expert-profile.bin"
     # the Qwen path: the pack, the model file for its native weights and its n-gram table, decode windows of up to 4
     # tokens (prompt-lookup drafts; the MTP drafter where it measures faster - qwen_draft_calibration), prompts in
     # chunks sized from the expert cache it lends them, the expert cache sized from the free VRAM
-    args = ["--pack", str(pack), "--native", str(gguf), "--ple-gguf", str(gguf), "--spec", "4", "--prefill", "auto",
-            "--expert-cache", "auto", "--max-context", str(ctx), "--kv", QWEN_KV]
+    args = ["--pack", str(pack), "--native", str(gguf), "--ple-gguf", str(ple or gguf), "--spec", "4", "--prefill",
+            "auto", "--expert-cache", "auto", "--max-context", str(ctx), "--kv", QWEN_KV]
+    if quant == QWEN_UD:                               # (its n-gram table memory-mapped: the page cache, never loaded)
+        args += ["--ple-io", "mmap"]
     if profile.exists():
         args += ["--expert-profile", str(profile)]
     # (the engine's server needs the MTP drafter loaded - the setup always builds it; drafting off is --mtp-max-t 1)
@@ -6551,11 +6695,14 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
     if vision:                                         # (pictures: GENI requests, each image's rows at its pad tokens)
         args.append("--vision")
     kept = keep_args(old.get("args") or [], args, ("--mtp-max-t", "--kv", "--vram-reserve-mib", "--pool-workers",
-                                                   "--experts-from-gguf"))
+                                                   "--experts-from-gguf", "--ple-io"))
+    inst = {"family": "qwen", "quant": QWEN_UD_DIR if quant == QWEN_UD else QWEN, "qwen_quant": quant}
+    sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup: its card's)
     cfg = {"exe": str(EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            **({"backend": "hip"} if hip else {}),
-           "model_name": QWEN_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
-           "sampling": dict(QWEN_SAMPLING), "reasoning_effort": QWEN_EFFORT,   # (the model's own, every setup)
+           "model_name": QWEN_UD_MODEL_NAME if quant == QWEN_UD else QWEN_MODEL_NAME,
+           "gpu": [g["index"] for g in pc["gpus"]],
+           "sampling": sampling, "reasoning_effort": effort,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port,
            **({"vision": vision} if vision else {})}
     for k in ("host", "api_key", "cors_origins", "mcp_servers", "layer_split"):
@@ -6572,8 +6719,7 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
     if kept:
         ok("kept from the config before: " + ", ".join(kept))
     cfg["log"] = str(cfg_path.with_suffix(".log"))
-    cfg["installer"] = {"family": "qwen", "models_dir": str(models), "quant": QWEN, "qwen_quant": "q5_k_m",
-                        "model_dir": str(d), "written": time.strftime("%Y-%m-%d %H:%M")}
+    cfg["installer"] = {**inst, "models_dir": str(models), "model_dir": str(d), "written": time.strftime("%Y-%m-%d %H:%M")}
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
     ok(f"start script: {write_run_script(cfg_path, port)}")
@@ -6686,10 +6832,12 @@ def vision_encoder_ready(a, pc: dict, meta: dict, llama: Path) -> bool:
     return False
 
 
-def qwen_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path, gguf: Path) -> dict | None:
+def qwen_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path, gguf: Path,
+                     models: Path | None = None) -> dict | None:
     """Step 7: the config's "vision" entry - maya-vision with the model's mmproj (in <model folder>/vision) and the
     GGUF's vocabulary - or None (text only, said why).  The server starts the encoder when a request carries a picture;
-    the engine places its rows at the <|image_pad|> tokens with their M-RoPE positions (--vision: GENI requests)."""
+    the engine places its rows at the <|image_pad|> tokens with their M-RoPE positions (--vision: GENI requests).  The
+    same mmproj serves CYBER-FROST and unsloth's GGUFs of the base model: another Qwen setup's copy is hard-linked."""
     step(7, "images (the vision encoder)")
     if a.no_vision:
         ok("skipped (--no-vision): the model reads text only")
@@ -6700,6 +6848,9 @@ def qwen_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path, gguf: Path) 
         return None
     vd = d / "vision"
     files = [vd / n for n in m["files"]]
+    for f in files:
+        if models is not None and file_incomplete(m, f):
+            link_published(f, m["files"][f.name], m["sha256"][f.name], qwen_places(models, f"vision/{f.name}"))
     if any(file_incomplete(m, f) for f in files) and not offer_download(a, "the vision tower", vd, files, m):
         warn(f"the vision tower was not downloaded: the model reads text only ({ME} --setup asks again)")
         return None
@@ -6714,14 +6865,40 @@ def qwen_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path, gguf: Path) 
     return {"exe": str(VEXE), "mmproj": str(files[0]), "model": str(gguf), "gpu": True}
 
 
+def choose_qwen_quant(a, prev: dict) -> str:
+    """Which Qwen files: --qwen-quant (or a --model id that names them), else asked - CYBER-FROST-3.8-PS's Q5_K_M or
+    unsloth's UD-IQ2_XS of the base model; the files set up before are the default."""
+    given = getattr(a, "qwen_quant", None)
+    if given:
+        return given
+    before = (prev.get("installer") or {}).get("qwen_quant") or "q5_k_m"
+    default = before if before in QWEN_QUANTS else "q5_k_m"
+    rows = []
+    for q in QWEN_QUANTS:
+        m = qwen_entry(q)
+        rows.append((Q.shown("qwen", q, m["download_gb"]), "new" if q == QWEN_UD else None,
+                     "Qwen3.8-Flash-Next itself in unsloth's UD-IQ2_XS GGUF (its n-gram table from Maya's repo, its MTP "
+                     f"head, the experts in about {m['memory_gb']:.0f} GB of VRAM and RAM together)" if q == QWEN_UD else
+                     "Blackfrost-AI's cybersecurity fine-tune in peasantsmith's GGUF (Q5_K experts, all of them in about "
+                     f"{m['memory_gb']:.0f} GB of VRAM and RAM together)"))
+    pick = choose("Which Qwen3.8-Flash-Next?", ["The files to set up:"], rows, QWEN_QUANTS.index(default),
+                  getattr(a, "yes", False))
+    return QWEN_QUANTS[pick]
+
+
 def set_up_qwen(a, prev: dict) -> Path | None:
     """CYBER-FROST-3.8-PS's steps 1-8: the PC (NVIDIA from V100, or AMD), the context (recommended by this PC's VRAM),
     the engine (build/maya), the file (pinned, sha256-checked), the pack and the MTP drafter, the config; then the
     drafter measured."""
     inst = prev.get("installer") or {}
+    quant = choose_qwen_quant(a, prev)
+    if (inst.get("qwen_quant") or "q5_k_m") != quant:   # (the other Qwen files' setup before: its own config's answers)
+        prev = next((c for c in map(read_json, configs()) if config_family(c) == "qwen" and
+                     ((c.get("installer") or {}).get("qwen_quant") or "q5_k_m") == quant), {})
+        inst = prev.get("installer") or inst
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
-    m = qwen_entry()
+    m = qwen_entry(quant)
     pc = check_pc(a, "qwen")                           # 1
     total, _ = mem_gb()
     vram = sum(g["vram_gb"] for g in pc["gpus"])
@@ -6729,7 +6906,8 @@ def set_up_qwen(a, prev: dict) -> Path | None:
         warn(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: below the ~{m['memory_gb']:.0f} GB that hold all of its "
              "experts - the engine reads the others from the SSD when they are routed (slower)")
     step(2, "your choices")                            # 2
-    ok(f"model: {Q.shown('qwen', 'q5_k_m', m['download_gb'])} - a fine-tune of Qwen3.8-Flash-Next "
+    ok(f"model: {Q.shown('qwen', quant, m['download_gb'])} - " +
+       ("unsloth's GGUF of Qwen3.8-Flash-Next " if quant == QWEN_UD else "a fine-tune of Qwen3.8-Flash-Next ") +
        "(Qwen Community License 1.0: LICENSE.qwen-community-1.0; a Model-as-a-Service business needs Qwen's own license)")
     rec = qwen_recommended_context(vram, vram + total < m["memory_gb"])
     ctx = choose_context(a, prev_ctx, QWEN_CONTEXTS, rec)
@@ -6737,16 +6915,18 @@ def set_up_qwen(a, prev: dict) -> Path | None:
        f"; its KV cache: {qwen_kv_gb(ctx):.1f} GB of VRAM")
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
-    d = qwen_dir(a, models, prev)
+    d = qwen_dir(a, models, prev, quant)
     ok(f"model folder: {d}")
     llama = tools_step(a)                              # 3
     meta = build_step(a, pc, llama)                    # 4
-    files = qwen_model_step(a, d)                      # 5
+    files = qwen_model_step(a, d, quant, models)       # 5
     if files is None:
         return None
-    pack = qwen_pack_step(a, d, files, llama)          # 6
-    vision = qwen_vision_step(a, pc, meta, llama, d, files[0])   # 7
-    cfg_path = write_config_qwen(a, pc, meta, pack, files[0], ctx, models, d, vision)   # 8
+    ud = quant == QWEN_UD
+    pack = qwen_pack_step(a, d, files, llama, d / m["mtp"] if ud else None)   # 6
+    vision = qwen_vision_step(a, pc, meta, llama, d, files[0], models)       # 7
+    cfg_path = write_config_qwen(a, pc, meta, pack, files[0], ctx, models, d, vision, quant,
+                                 d / m["ngram"] if ud else None)                # 8
     if "mtp_calibration" not in (read_json(cfg_path).get("installer") or {}) or a.calibrate:
         how = drafting_choice(a, "the MTP drafter", "10-40")
         if how != "measure":
@@ -6791,8 +6971,13 @@ def model_option(a) -> str | None:
     if family == "glm":
         a.model = key
         return None
-    if family == "qwen":                                 # (its one GGUF: no quant to choose)
+    if family == "qwen":                                 # (CYBER-FROST's GGUF, or unsloth's UD-IQ2_XS: --qwen-quant)
+        given = getattr(a, "qwen_quant", None)
+        if key is not None and given and given != key:
+            return (f"--model {a.model} is {Q.shown(family, key)}, but --qwen-quant says {given}: give one of them")
         a.model = QWEN
+        if key is not None:
+            a.qwen_quant = key
         return None
     a.model, flag = (DS4, "ds4_quant") if family == "deepseek" else (MM3, "mm3_quant")
     if key is not None:
@@ -6809,7 +6994,7 @@ def main() -> int:
     stop_signals()            # (SIGTERM / SIGHUP stop it as Ctrl+C does: the server it runs with it)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--backend", choices=["cuda", "hip", "metal"],
-                    help="GPU backend (HIP: experimental gfx1100/gfx1201/gfx1151 on Linux and Windows; Metal: experimental, "
+                    help="GPU backend (HIP: gfx1100/gfx1201/gfx1151 on Linux and Windows; Metal: experimental, "
                          "Apple Silicon Macs, text only; the default on a Mac)")
     ap.add_argument("--setup", action="store_true", help="set up again instead of starting the installed model")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
@@ -6846,7 +7031,7 @@ def main() -> int:
                          "(dense weights Q8_0: less VRAM; chosen by hand only, not in the setup's list), gguf-iq1_s / gguf-iq1_m / "
                          "gguf-iq2_xxs / gguf-q2_k_xl / gguf-iq3_xxs / gguf-iq3_s / gguf-q3_k_xl = its smaller UD quants (experts "
                          "1.6-3.5 bits; chosen by hand too), exl3 = LibertAIDAI's EXL3 quant at 2.9 bits, exl3-3.5 = its "
-                         "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM; both V100 or newer, AMD experimental); "
+                         "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM; both V100 or newer, or AMD); "
                          "abliterated-128g / abliterated-256g = orcarouter's abliterated model (its refusals removed) "
                          "as its Mix-128G / Mix-256G GGUF (~114 / ~236 GB of VRAM + RAM, with Maya's Q6_K n-gram "
                          "tables; a gated repo: HF_TOKEN or `hf auth login`), abliterated = the one that fits this "
@@ -6858,6 +7043,10 @@ def main() -> int:
                          "PC), maya-s (gguf-s) = MiniMax-M3.1-Flash-Maya-S (~2.1 bits, ~122 GB) - the GGUFs on NVIDIA "
                          "from V100 on and on AMD; with --model-dir: the files you have (the same as --model "
                          "minimax-maya-xs / minimax-maya-s)")
+    ap.add_argument("--qwen-quant", choices=list(QWEN_QUANTS),
+                    help=f"Qwen3.8-Flash-Next's files: q5_k_m = {Q.shown('qwen', 'q5_k_m')} (peasantsmith's GGUF), "
+                         f"{QWEN_UD} = Qwen3.8-Flash-Next in unsloth's UD-IQ2_XS GGUF (~81 GB with its vision tower; the same as --model "
+                         "qwen-ud-iq2_xs)")
     ap.add_argument("--draft", choices=list(DRAFTS),
                     help="how the model drafts: mtp = its MTP block (the default), dflash2 = a DFlash2 drafter "
                          f"(downloads {DFLASH['bytes'] / 1e9:.1f} GB; NVIDIA RTX 30 / A100 and newer, Apple Silicon, "
@@ -6960,8 +7149,7 @@ def main() -> int:
     else:
         # nothing set up yet (START-MAYA.bat / ./maya.sh without --backend): Metal on a Mac with Apple Silicon, HIP on
         # a PC with a supported AMD GPU and no NVIDIA one (e.g. Strix Halo)
-        a.backend = ("metal" if apple_silicon() else
-                     "hip" if not S.gpus() and any(g["arch"] in HIP_ARCHS for g in S.amd_gpus()) else "cuda")
+        a.backend = first_run_backend()
     setting_up = a.setup or a.check or a.gguf_dir or a.model or a.model_dir or a.rebuild or a.repack or \
         a.download_model
     if have and not setting_up and (a.calibrate or a.speed_calibration or not a.no_start):
@@ -7015,7 +7203,7 @@ def main() -> int:
         elif a.backend == "hip":
             pick = (f"--gpus {','.join(str(g['index']) for g in pc['gpus'])}" if len(pc["gpus"]) > 1
                     else f"--gpu {pc['gpus'][0]['index']}")
-            say(f"HIP prerequisites found. Run {ME} --backend hip {pick} to try the experimental port.")
+            say(f"HIP prerequisites found. Run {ME} --backend hip {pick} to set it up.")
         else:
             say(f"This PC can run Maya. Run {ME} without --check to set it up.")
         return 0

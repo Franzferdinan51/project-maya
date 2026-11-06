@@ -66,18 +66,6 @@ class Mm3Metal {
     int ubatch() const;
     // appends ids at the current position; logits (n_vocab) of the last token
     bool forward(const std::vector<int32_t>& ids, std::vector<float>& logits, std::string& err);
-    // DSpark drafting (mm3_dspark.hpp): with a draft loaded, every forward also feeds the
-    // draft's context with the slice's taps, and windows can be verified against its proposals
-    bool load_draft(const std::string& dir, std::string& err);
-    int draft_block() const;   // proposals a round offers (0: no draft loaded)
-    bool draft_propose(int32_t anchor, int64_t pos, int n, std::vector<int32_t>& drafts,
-                       std::vector<float>& confs, std::string& err);
-    // appends ids (at most one slice) at the current position; logits of EVERY row out,
-    // row-major [ids][n_vocab]
-    bool forward_rows(const std::vector<int32_t>& ids, std::vector<float>& rows, std::string& err);
-    // rewinds the position (the caches are positional: rows past it are never read, and the
-    // draft's context is position-indexed the same way)
-    void rewind_to(int64_t pos);
     int64_t position() const;
     int64_t max_context() const;
     const Mm3Geometry& geometry() const;

@@ -60,12 +60,12 @@ namespace strata::kernels::glmf {
 namespace {
 
 // ---------------------------------------------------------------- small helpers
-__device__ __forceinline__ float warp_sum(float v) {
+__device__ __forceinline__ float warp_sum_shfl(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
 }
-__device__ __forceinline__ float warp_max(float v) {
+__device__ __forceinline__ float warp_max_shfl(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
     return v;
@@ -118,9 +118,23 @@ __device__ __forceinline__ float warp_max_lanes(float v) {
 }
 #else
 constexpr bool kLaneSum = false;
-__device__ __forceinline__ float warp_sum_lanes(float v) { return warp_sum(v); }
-__device__ __forceinline__ float warp_max_lanes(float v) { return warp_max(v); }
+__device__ __forceinline__ float warp_sum_lanes(float v) { return warp_sum_shfl(v); }
+__device__ __forceinline__ float warp_max_lanes(float v) { return warp_max_shfl(v); }
 #endif
+__device__ __forceinline__ float warp_sum(float v) {
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+    return warp_sum_lanes(v);
+#else
+    return warp_sum_shfl(v);
+#endif
+}
+__device__ __forceinline__ float warp_max(float v) {
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+    return warp_max_lanes(v);
+#else
+    return warp_max_shfl(v);
+#endif
+}
 template<bool L> __device__ __forceinline__ float wsum(float v) { return L ? warp_sum_lanes(v) : warp_sum(v); }
 template<bool L> __device__ __forceinline__ float wmax(float v) { return L ? warp_max_lanes(v) : warp_max(v); }
 // block-wide sum; every thread gets the total.  sh: >= 32 floats.  blockDim % 32 == 0.
@@ -6297,7 +6311,7 @@ __global__ void warp_reduce_check_kernel(const float* __restrict__ in, float* su
                                          float* max_lanes, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const float v = i < n ? in[i] : 0.0f;
-    const float a = warp_sum(v), b = warp_sum_lanes(v), c = warp_max(v), d = warp_max_lanes(v);
+    const float a = warp_sum_shfl(v), b = warp_sum_lanes(v), c = warp_max_shfl(v), d = warp_max_lanes(v);
     if (i < n) {
         sum_shfl[i] = a;
         sum_lanes[i] = b;
@@ -6686,6 +6700,31 @@ void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s) {
     launch_check("moe_prefetch");
 }
 
+__global__ void moe_pf_need_kernel(const int* pf_n, const unsigned int* seq, unsigned int* need) {
+    *need = *pf_n > 0 ? *seq : 0u;
+}
+
+__global__ void moe_pf_wait_kernel(const unsigned int* need, const unsigned int* flag) {
+    const unsigned int n = *(volatile const unsigned int*) need;
+    if (n == 0u) return;
+    for (long long i = 0; i < (1ll << 27); ++i) {
+        if ((int) (*(volatile const unsigned int*) flag - n) >= 0) return;
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700   // (Pascal: no __nanosleep, a plain spin)
+        __nanosleep(200);
+#endif
+    }
+}
+
+void moe_pf_need(const MoeDev& d, unsigned int* need, cudaStream_t s) {
+    moe_pf_need_kernel<<<1, 1, 0, s>>>(d.pf_n, d.seq, need);
+    launch_check("moe_pf_need");
+}
+
+void moe_pf_wait(const unsigned int* need, const unsigned int* flag, cudaStream_t s) {
+    moe_pf_wait_kernel<<<1, 1, 0, s>>>(need, flag);
+    launch_check("moe_pf_wait");
+}
+
 void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s) {
     static int sms = 0;
     if (sms == 0) {
@@ -6719,8 +6758,9 @@ void moe_cpu_wait_rows(const CpuWaitRows& w, int n, int n_embd, cudaStream_t s) 
 #if defined(STRATA_USE_HIP)
 namespace {
 // Limit automatic dispatch to the measured decode geometry and RDNA3/3.5
-// targets. RDNA4 and all other shapes retain the original expert kernels.
-bool rdna3_expert_device(bool allow_gfx1151 = true) {
+// targets (plus opt-in gfx906 when allow_gfx906 is set via STRATA_GLM_GU22_TUNED=1).
+// RDNA4 and all other shapes retain the original expert kernels.
+bool rdna3_expert_device(bool allow_gfx1151 = true, bool allow_gfx906 = false) {
     static const bool legacy = [] {
         const char* v = std::getenv("STRATA_HIP_EXPERTS_LEGACY");
         return v && v[0] == '1';
@@ -6732,15 +6772,17 @@ bool rdna3_expert_device(bool allow_gfx1151 = true) {
     static thread_local bool gfx1100 = false;
     static thread_local bool gfx1151 = false;
     static thread_local bool gfx120x = false;
+    static thread_local bool gfx906 = false;
     if (cached_device != device) {
         hipDeviceProp_t prop{};
         if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
         gfx1100 = std::strncmp(prop.gcnArchName, "gfx1100", 7) == 0;
         gfx1151 = std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
         gfx120x = std::strncmp(prop.gcnArchName, "gfx120", 6) == 0;
+        gfx906 = std::strncmp(prop.gcnArchName, "gfx906", 6) == 0;
         cached_device = device;
     }
-    return gfx1100 || gfx120x || (allow_gfx1151 && gfx1151);
+    return gfx1100 || gfx120x || (allow_gfx1151 && gfx1151) || (allow_gfx906 && gfx906);
 }
 // IQ2_S gate/up (Maya-M's) on IQ2_XXS's tuned path above - opt-in (STRATA_GLM_GU22_TUNED=1) until it is measured end
 // to end: the expert bench's sweep (--exact, gu22/down18) found it bit-identical to the original kernel on gfx1100 and
@@ -6803,7 +6845,7 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
     MoeDev d = d_in;
     d.skip = g_skip;
 #if defined(STRATA_USE_HIP)
-    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true);
+    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true, gu_type == 22 && gu22_tuned());
     if (gu_type == 22) note_gu22(tuned, 0);
     if (tuned) {
         // Packed sign expansion, original 16-wave/four-row geometry, grid in LDS.
@@ -6960,7 +7002,7 @@ bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d_in, int k, int n
     const auto* SH = (const block_q8_1*) sh_hq;
     // gate/up: moe_gate_up's kernel for the type, the (expert, token) blocks of a chunk side by side
     const dim3 ggu((unsigned) ((k + (sh ? 1 : 0)) * T), (unsigned) (n_ff / GU_ROWS));
-    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true);
+    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true, gu_type == 22 && gu22_tuned());
     if (gu_type == 22) note_gu22(tuned, 1);
     if (tuned) {
         if (gu_type == 16)
