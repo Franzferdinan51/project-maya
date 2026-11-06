@@ -1,21 +1,21 @@
 // src/metal/mm3_metal.cpp - Mm3Metal: the forward graph, following tools/mm3/ref.py op for op.
 //
-// One slice of T tokens runs two graphs per layer:
+// One slice of T tokens runs one graph per layer:
 //   graph 1   the attention projections of ref.py's attention(): q/k/v and the indexer's iq/ik, each
 //             Gemma-normed and NeoX-roped, the keys and values written into the layer's BF16 caches, iq
-//             kept (BF16) in a carry, and the indexer scores iq . ik over every cached position read
-//             back to the host;
-//   (host)    the kept blocks, exactly ref.py's msa_select: a block scores the max of its tokens'
-//             scores, the query's own local blocks are forced in, the top blocks are kept;
-//   graph 2   ref.py's msa_attend per KV group (scores, the host's kept-block mask, softmax, the value
+//             kept (BF16) in a carry, and the indexer scores iq . ik over every cached position;
+//   (in-graph) the kept blocks, exactly ref.py's msa_select, built by Builder::select from those
+//             scores without leaving the graph: a block scores the max of its tokens' scores, the
+//             query's own local blocks are forced in, the top blocks are kept - no host round-trip
+//             per layer (the CUDA engine selects on-GPU too);
+//   graph 2   ref.py's msa_attend per KV group (scores, the kept-block mask, softmax, the value
 //             product), the output projection, then the MLP: dense swigluoai, or the MoE - sigmoid
 //             router with the correction bias and renormalised weights in-graph, the shared expert, and
 //             the routed experts (all resident, so mul_mat_id consumes the router's top-k directly:
 //             no pool, no graph cut at the router, unlike the GLM engine).
-// The last layer's second graph also runs the head over the slice's last row.
-// With a DSpark draft loaded, graph 2 also hands back the residual stream at the draft's tap
-// layers (the taps feed the draft's context), and the head can run over a window of rows
-// (forward_rows), so the serve loop verifies a round of drafts in one pass.
+// The last layer's graph also runs the head over the slice's last row.  Geometries the in-graph
+// selection does not cover (see gpu_select_ok) keep the older two-graph path with the host's
+// select_masks, as does MAYA_MM3_HOST_SELECT=1.
 #include "mm3_metal_impl.hpp"
 
 #include "ggml-alloc.h"
@@ -50,8 +50,9 @@ struct Builder {
     int T;          // tokens in the slice
     int64_t p0;     // position of the slice's first token
     std::vector<Upload> uploads;
-    int logits_rows = 1;                  // graph2 (last layer): logits for this many rows (a verify window)
+    int logits_rows = 1;              // graph2 (last layer): logits for this many rows (a verify window)
     ggml_tensor** stream_out = nullptr;   // graph2: also hand back the layer's output stream (a draft tap)
+    ggml_tensor* pos_i = nullptr;         // graph1's position input, kept for select()'s gathers
 
     ggml_tensor* input(ggml_type type, int64_t ne0, int64_t ne1, const void* data, size_t bytes,
                        int64_t ne2 = 1) {
@@ -119,10 +120,11 @@ struct Builder {
         return input(GGML_TYPE_I32, T, 1, p.data(), p.size() * 4);
     }
 
-    // graph 1 of layer il: the projections, the cache writes, the indexer scores (the graph's output)
+    // graph 1 of layer il: the projections, the cache writes, the indexer scores
     ggml_tensor* graph1(int il, ggml_tensor* ids) {
         const Mm3LayerState& s = m.ls[(size_t) il];
         ggml_tensor* pos = pos_input();
+        pos_i = pos;
         ggml_tensor* x;
         if (il == 0) {
             ggml_tensor* e = ggml_get_rows(ctx, m.w("token_embd.weight"), ids);
@@ -160,6 +162,85 @@ struct Builder {
         ggml_set_output(scores);
         expand(scores);
         return scores;
+    }
+
+    // The kept-block masks, built in-graph from graph 1's scores - select_masks' semantics exactly,
+    // with no host round-trip: pool the scores to block maxima (the pool skips out-of-range reads,
+    // which is the causal -inf padding of a block's future tokens), suppress the blocks past the
+    // query's own, boost the local blocks above every real score, take the top-k blocks per
+    // (index head, query), and expand the kept set back to a token mask with the causal term folded
+    // in (0 for a kept causal token, a large negative otherwise - the softmax's exp underflows to
+    // the same exact 0 the host's -inf gives).  Needs ix_local >= 1 like the model ships: the query's
+    // own block is then force-kept, so its pooled score (which includes that block's future tokens)
+    // is never compared - for every other block the pooled max is over causal tokens only, exactly
+    // the host's.  Returns one [Tk, T] F32 mask per index head.
+    std::vector<ggml_tensor*> select(ggml_tensor* scores) {
+        const int64_t Tk = p0 + T;
+        const int H = g.ix_heads;
+        const int64_t blk = g.ix_blk;
+        const int64_t nblk = (Tk + blk - 1) / blk;
+        const int k = (int) std::min<int64_t>(g.ix_topk, nblk);
+        const float one_f = 1.0f;
+        ggml_tensor* one = input(GGML_TYPE_F32, 1, 1, &one_f, 4);
+
+        // block scores [nblk, H, T]: max over each block's tokens (pad the tail block with -inf)
+        ggml_tensor* sc = scores;
+        if (nblk * blk > Tk) {
+            const float neg_f = -INFINITY;   // an input only when consumed: an unused upload gets no buffer
+            ggml_tensor* negc = input(GGML_TYPE_F32, 1, 1, &neg_f, 4);
+            ggml_tensor* first = ggml_view_3d(ctx, sc, 1, H, T, sc->nb[1], sc->nb[2], 0);
+            ggml_tensor* donor = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nblk * blk - Tk, H, T);
+            ggml_tensor* neg = ggml_add(ctx, ggml_scale(ctx, ggml_repeat(ctx, first, donor), 0.0f), negc);
+            sc = ggml_concat(ctx, sc, neg, 0);
+        }
+        ggml_tensor* bs = ggml_pool_1d(ctx, sc, GGML_OP_POOL_MAX, (int) blk, (int) blk, 0);
+
+        // the query's block (gathered from the state table) and the block ids; ggml's binary ops only
+        // broadcast the second operand into the first's shape, so both are repeated to common shapes
+        ggml_tensor* qb = ggml_get_rows(ctx, ggml_view_2d(ctx, m.c_blk, 1, m.n_ctx, m.c_blk->nb[0], 0), pos_i);
+        ggml_tensor* qbt = ggml_reshape_3d(ctx, qb, 1, 1, T);
+        ggml_tensor* bidx = ggml_reshape_3d(ctx, ggml_arange(ctx, 0.0f, (float) nblk, 1.0f), nblk, 1, 1);
+        ggml_tensor* shape_n1t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nblk, 1, T);
+        ggml_tensor* qbt_r = ggml_repeat(ctx, qbt, shape_n1t);
+        ggml_tensor* bidx_r = ggml_repeat(ctx, bidx, shape_n1t);
+        ggml_tensor* bidx_h = ggml_repeat(ctx, bidx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nblk, H, T));
+        auto one_minus = [&](ggml_tensor* x) { return ggml_add(ctx, ggml_scale(ctx, x, -1.0f), one); };
+        // le1[b, t] = 1 iff b <= qb(t); inw adds the local window's lower edge b >= qb - ix_local + 1
+        ggml_tensor* le1 = ggml_clamp(ctx, ggml_add(ctx, ggml_sub(ctx, qbt_r, bidx_r), one), 0.0f, 1.0f);
+        ggml_tensor* inw = ggml_clamp(ctx, ggml_add(ctx, ggml_sub(ctx, bidx_r, qbt_r),
+                                                  ggml_scale(ctx, one, (float) g.ix_local)), 0.0f, 1.0f);
+        ggml_tensor* lb = ggml_mul(ctx, le1, inw);                                     // [nblk, 1, T]
+        // future blocks drop to -1e38 (only picked when nothing real remains, and the causal term
+        // below masks their tokens anyway); local blocks rise to +1e38, above every real score
+        ggml_tensor* eff = ggml_add(ctx, ggml_add(ctx, bs, ggml_scale(ctx, one_minus(le1), -1e38f)),
+                                    ggml_scale(ctx, lb, 1e38f));                       // [nblk, H, T]
+        ggml_tensor* top = ggml_argsort_top_k(ctx, eff, k);                            // [k, H, T] I32
+        // the kept set as a 0/1 block mask: the picks are distinct, so the per-pick indicators sum to 0/1
+        ggml_tensor* kbm = nullptr;
+        for (int j = 0; j < k; ++j) {
+            ggml_tensor* pj = ggml_cast(ctx, ggml_view_3d(ctx, top, 1, H, T, top->nb[1], top->nb[2],
+                                                          (size_t) j * top->nb[0]), GGML_TYPE_F32);
+            ggml_tensor* eq = one_minus(ggml_clamp(ctx, ggml_abs(ctx, ggml_sub(ctx, bidx_h, pj)), 0.0f, 1.0f));
+            kbm = kbm ? ggml_add(ctx, kbm, eq) : eq;
+        }
+        // expand blocks to tokens (each token takes its block's row) and fold in the causal term
+        ggml_tensor* shape_tt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Tk, T);
+        ggml_tensor* sidx = ggml_repeat(ctx, ggml_reshape_2d(ctx, ggml_arange(ctx, 0.0f, (float) Tk, 1.0f), Tk, 1), shape_tt);
+        ggml_tensor* post = ggml_repeat(ctx, ggml_reshape_2d(ctx, ggml_arange(ctx, (float) p0, (float) (p0 + T), 1.0f), 1, T), shape_tt);
+        ggml_tensor* fut = ggml_clamp(ctx, ggml_sub(ctx, sidx, post), 0.0f, 1.0f);      // [Tk, T], 1 where future
+        ggml_tensor* rows = ggml_view_2d(ctx, m.c_blk, Tk, 1, m.c_blk->nb[0], 0);
+        ggml_tensor* donor2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Tk, T);
+        ggml_tensor* bidxT = ggml_cast(ctx, ggml_repeat(ctx, rows, donor2), GGML_TYPE_I32);
+        std::vector<ggml_tensor*> masks;
+        for (int h = 0; h < H; ++h) {
+            ggml_tensor* ah = ggml_view_3d(ctx, kbm, 1, nblk, T, kbm->nb[0], kbm->nb[2],
+                                           (size_t) h * kbm->nb[1]);
+            ggml_tensor* tok = ggml_get_rows(ctx, ah, bidxT);                          // [1, Tk, T]
+            ggml_tensor* tok2 = ggml_view_2d(ctx, tok, Tk, T, tok->nb[2], 0);
+            masks.push_back(ggml_scale(ctx, ggml_add(ctx, one_minus(tok2), fut), -1e38f));
+        }
+        expand(masks.back());
+        return masks;
     }
 
     // graph 2 of layer il: the sparse attention over the host's masks, the MLP, the residual writes;
@@ -276,7 +357,8 @@ bool Mm3Metal::Impl::compute(ggml_cgraph* gf,
 }
 
 // ref.py's msa_select on the host, from graph 1's scores [Tk, ix_heads, T]: per (group, query) the kept
-// blocks become a 0 / -inf mask [Tk, T] per group (graph 2 broadcasts it over the group's query heads)
+// blocks become a 0 / -inf mask [Tk, T] per group (graph 2 broadcasts it over the group's query heads).
+// The fallback path - Builder::select builds the same masks in-graph for the shipped geometry.
 bool select_masks(const Mm3Geometry& g, const float* scores, int64_t Tk, int T, int64_t p0,
                   std::vector<std::vector<float>>& masks) {
     const int64_t nblk = (Tk + g.ix_blk - 1) / g.ix_blk;
@@ -319,6 +401,16 @@ bool select_masks(const Mm3Geometry& g, const float* scores, int64_t Tk, int T, 
         }
     }
     return true;
+}
+
+// Whether Builder::select can build the masks in-graph for this geometry: one mask per index head is
+// what graph 2 consumes (a mask per KV head), the boost arithmetic needs the local window inside the
+// top-k, and ix_local >= 1 keeps the query's own block force-kept so its pooled score (the one block
+// whose max runs over future tokens too) is never compared.  MAYA_MM3_HOST_SELECT forces the host path.
+static bool gpu_select_ok(const Mm3Geometry& g) {
+    if (std::getenv("MAYA_MM3_HOST_SELECT")) return false;
+    return g.ix_heads == g.n_kv && g.ix_blk >= 1 && g.ix_topk >= 1 && g.ix_local >= 1 &&
+           g.ix_local <= g.ix_topk;
 }
 
 bool Mm3Metal::Impl::run_slice(const int32_t* tok, int T, std::vector<float>& logits, std::string& err,
@@ -364,9 +456,36 @@ bool Mm3Metal::Impl::run_slice(const int32_t* tok, int T, std::vector<float>& lo
                     dst[(size_t) t * g.n_embd + d] = h2[(size_t) d + (size_t) t * g.n_embd];
         }
     };
+    const bool gpu_sel = gpu_select_ok(g);
     for (int il = 0; il < g.n_layer; ++il) {
         const bool last = il == g.n_layer - 1;
         ggml_tensor* logits_t = nullptr;
+        if (gpu_sel) {
+            // one fused graph per layer: graph 1, the in-graph mask build, graph 2 - the scores and
+            // the masks never leave the GPU, so the layer costs one pipeline drain instead of two
+            ggml_init_params ip{mem, arena.data(), true};
+            ggml_context* ctx = ggml_init(ip);
+            Builder b{*this, g, ctx, ggml_new_graph_custom(ctx, kGraphNodes, false), T, pos, {}};
+            std::vector<std::pair<ggml_tensor*, std::vector<uint8_t>>> up;
+            ggml_tensor* idt = nullptr;
+            if (il == 0)
+                idt = b.input(GGML_TYPE_I32, T, 1, ids.data(), ids.size() * 4);
+            ggml_tensor* sc = b.graph1(il, idt);
+            std::vector<ggml_tensor*> mt = b.select(sc);
+            ggml_tensor* tap_t = nullptr;
+            const int tj = tap_j(il);
+            b.stream_out = tj >= 0 ? &tap_t : nullptr;
+            if (last) b.logits_rows = logits_rows;
+            b.graph2(il, mt, last, &logits_t);
+            for (Upload& u : b.uploads) up.push_back({u.t, std::move(u.data)});
+            if (!compute(b.gf, up, err)) {
+                ggml_free(ctx);
+                return false;
+            }
+            finish(logits_t, tap_t, tj, last);
+            ggml_free(ctx);
+            continue;
+        }
         for (int part = 0; part < 2; ++part) {
             ggml_init_params ip{mem, arena.data(), true};
             ggml_context* ctx = ggml_init(ip);
