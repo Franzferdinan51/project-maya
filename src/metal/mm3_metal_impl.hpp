@@ -49,6 +49,8 @@ struct Mm3Metal::Impl {
     ggml_tensor* c_h = nullptr;    // [n_embd, n_ubatch] F32 the slice's residual stream
     ggml_tensor* c_q = nullptr;    // [head_dim, n_head, n_ubatch] F32
     ggml_tensor* c_iq = nullptr;   // [ix_dim, ix_heads, n_ubatch] BF16 (the values the scores are made of)
+    ggml_tensor* c_blk = nullptr;  // [n_ctx] F32: the indexer block of every position (s / ix_blk),
+                                   // filled once in init_state for the in-graph mask build
     std::vector<uint8_t> arena;    // the graphs' ggml context (metadata only), kept between forwards
     int64_t n_ctx = 0;
     int64_t pos = 0;
