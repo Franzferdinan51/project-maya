@@ -7,8 +7,9 @@
 //
 // Sampling is the shared chain (sampler.cpp): same keys, same defaults, same Philox draws, so a seeded
 // request repeats.  The differences from the GLM engine's serve are the model's, not the protocol's:
-// no drafting (the spec keys are accepted; plain decoding writes the same tokens a verify window
-// would), no images (GENI is refused: the vision tower is not wired on this backend yet), no expert
+// DSpark drafting when a draft is loaded (mm3_dspark.cpp; the spec keys steer it, and a verify
+// window writes the same tokens plain decoding would), no images (GENI is refused: the vision
+// tower is not wired on this backend yet), no expert
 // pool (every expert is resident, so the STAT lines report a 1.0 hit rate and no pool), and the stop
 // tokens are the GGUF's own eos ids instead of a hardcoded set.  PAUSE and the prefix snapshot are
 // cheaper here than anywhere: the caches are positional, so a snapshot is a position and restoring
@@ -102,6 +103,9 @@ struct Server {
     const int loop_w_think = env_int("MAYA_MM3_LOOP_THINK", 256);
     const int loop_w_answer = env_int("MAYA_MM3_LOOP_ANSWER", 1024);
     int chunk = 512;                  // prompt tokens a forward() takes (serve())
+    bool spec_on = true;        // DSpark drafting when a draft is loaded (a GEN's spec= overrides)
+    float conf_floor = 0.7f;    // a round verifies the drafts before the first below this confidence
+    float draft_cost = 0.0f;    // > 0: ... and before the first whose confidences' product is below it
 
     void err(const std::string& m) {
         std::printf("ERR %s\n", m.c_str());
@@ -118,6 +122,8 @@ struct Server {
         bool any_key = false, greedy_req = false;
         int64_t think_budget = 0;
         int32_t think_end = -1;
+        int spec_req = -1;      // GEN spec: -1 the engine default, 0 off, 1 on
+        float conf_req = -1.0f;   // GEN dspark_conf / spec_min_p: the round's confidence floor
         int pen_n = 0;
         float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
         std::string ids_s, bias_err;
@@ -139,8 +145,14 @@ struct Server {
             else if (k == "seed") sp.seed = (uint64_t) std::atoll(v.c_str());
             else if (k == "think_budget") think_budget = std::atoll(v.c_str());
             else if (k == "think_end") think_end = std::atoi(v.c_str());
-            else if (k == "spec" || k == "spec_min_p" || k == "spec_n_min" || k == "spec_cum") {
-                // accepted, as on the GLM engine; plain decoding writes the same tokens drafting would
+            else if (k == "spec") {   // the CUDA serve's modes: 1 is off, 2 and up are on
+                const int sv = std::atoi(v.c_str());
+                spec_req = sv == 1 ? 0 : sv >= 2 ? 1 : spec_req;
+            }
+            else if (k == "dspark_conf" || k == "spec_min_p") conf_req = (float) std::atof(v.c_str());
+            else if (k == "spec_n_min" || k == "spec_cum") {
+                // accepted, as on the GLM engine; the DSpark round's cut is the confidence floor
+                // (and the survival product, an engine flag) - these two change nothing here
             }
             else if (k == "penalty_last_n") pen_n = std::atoi(v.c_str());
             else if (k == "penalty_repeat") pen_repeat = std::strtof(v.c_str(), nullptr);
@@ -205,11 +217,11 @@ struct Server {
         if (max_new <= 0)
             return err("the prompt (" + std::to_string(prompt.size()) + " tokens) fills the context (" +
                        std::to_string(model.max_context()) + ")");
-        run(prompt, max_new, sp, think_budget, think_end);
+        run(prompt, max_new, sp, think_budget, think_end, spec_req, conf_req);
     }
 
     void run(const std::vector<int32_t>& prompt, int64_t max_new, Sampling sp, int64_t think_budget,
-             int32_t think_end) {
+             int32_t think_end, int spec_req, float conf_req) {
         const int n_vocab = model.geometry().n_vocab;
         const std::vector<int32_t>& eos = model.geometry().eos;
         std::string e;
@@ -348,6 +360,7 @@ struct Server {
             }
             return produced < max_new;
         };
+        long long d_acc = 0, d_off = 0;
         if (std::strcmp(finish, "cancel") != 0) {
             bool bad = false;
             auto pick_one = [&](const float* l) -> int32_t {
@@ -364,28 +377,108 @@ struct Server {
                 sp.counter += 1;
                 return t;
             };
+            // DSpark: a round drafts after the token, verifies the token and its drafts in one
+            // forward and keeps the drafts the target agrees with - every pick is the plain
+            // loop's own pick over that row (penalties, the loop guard's forcing and the
+            // sampler all run per row, in order), so the tokens are plain decoding's, only
+            // more of them per pass over the weights (the CUDA serve's loop, mm3_main.cpp)
+            const int B = model.draft_block();
+            const bool spec = B > 0 && (spec_req < 0 ? spec_on : spec_req != 0);
+            const float floor_c = conf_req >= 0.0f ? conf_req : conf_floor;
             if (!in.stop.load()) {
-                const int32_t y = pick_one(logits.data());
+                int32_t y = pick_one(logits.data());
                 if (bad) {
                     model.reset();
                     cached.clear();
                     return err("non-finite logits");
                 }
-                if (on_token(y)) {
-                    for (int32_t t = y;;) {   // (on_token checked STOP: the last token written is never fed)
-                        if (!model.forward({t}, logits, e)) {
+                bool go = on_token(y);   // (on_token checked STOP: the last token written is never fed)
+                while (go) {
+                    const int64_t pos = model.position();   // y sits at pos, not fed yet
+                    if (!spec) {
+                        if (!model.forward({y}, logits, e)) {
                             model.reset();
                             cached.clear();
                             return err(e);
                         }
-                        t = pick_one(logits.data());
+                        y = pick_one(logits.data());
                         if (bad) {
                             model.reset();
                             cached.clear();
                             return err("non-finite logits");
                         }
-                        if (!on_token(t)) break;
+                        go = on_token(y);
+                        continue;
                     }
+                    long long room = std::min<long long>(max_new - produced, model.max_context() - pos - 1);
+                    if (in_think) room = std::min(room, think_budget - produced);
+                    if (in.wrap.load()) room = 0;
+                    std::vector<int32_t> drafts;
+                    std::vector<float> confs;
+                    int k = 0;
+                    if (room > 0) {
+                        if (!model.draft_propose(y, pos, B, drafts, confs, e)) {
+                            model.reset();
+                            cached.clear();
+                            return err(e);
+                        }
+                        double surv = 1.0;
+                        while (k < (int) drafts.size() && k < room && confs[(size_t) k] >= floor_c) {
+                            surv *= confs[(size_t) k];
+                            if (draft_cost > 0.0f && surv < draft_cost) break;
+                            ++k;
+                        }
+                    }
+                    if (k == 0) {
+                        if (!model.forward({y}, logits, e)) {
+                            model.reset();
+                            cached.clear();
+                            return err(e);
+                        }
+                        y = pick_one(logits.data());
+                        if (bad) {
+                            model.reset();
+                            cached.clear();
+                            return err("non-finite logits");
+                        }
+                        go = on_token(y);
+                        continue;
+                    }
+                    std::vector<int32_t> win(1, y);
+                    win.insert(win.end(), drafts.begin(), drafts.begin() + k);
+                    std::vector<float> rows;
+                    if (!model.forward_rows(win, rows, e)) {
+                        model.reset();
+                        cached.clear();
+                        return err(e);
+                    }
+                    d_off += k;
+                    int kept = 0;
+                    int32_t next = -1;
+                    bool ended = false;
+                    for (int i = 0; i <= k; ++i) {
+                        const int32_t cand = pick_one(rows.data() + (size_t) i * n_vocab);
+                        if (bad) {
+                            model.reset();
+                            cached.clear();
+                            return err("non-finite logits");
+                        }
+                        if (i == k || cand != drafts[(size_t) i]) {
+                            next = cand;
+                            break;
+                        }
+                        ++d_acc;
+                        if (!on_token(drafts[(size_t) i])) {   // written, but never fed (the rewind below)
+                            ended = true;
+                            kept = i;
+                            break;
+                        }
+                        kept = i + 1;
+                    }
+                    model.rewind_to(pos + 1 + kept);
+                    if (ended) break;
+                    y = next;
+                    go = on_token(y);
                 }
             } else {
                 finish = "cancel";
@@ -400,10 +493,12 @@ struct Server {
             cached.assign(prompt.begin(), prompt.end());
             cached.insert(cached.end(), emitted.begin(), emitted.end() - 1);
         }
-        std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0\n", (long long) produced, n,
+        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", (long long) produced, n,
                     std::chrono::duration<double, std::milli>(t1 - t0).count(),
-                    std::chrono::duration<double, std::milli>(t2 - t1).count(), finish, reuse);
+                    std::chrono::duration<double, std::milli>(t2 - t1).count(), finish, d_acc, d_off, reuse);
         std::fflush(stdout);
+        if (d_off > 0)
+            std::fprintf(stderr, "maya-metal-mm3: DSpark kept %lld of %lld drafts\n", d_acc, d_off);
         if (produced > 0) {
             const double s = std::chrono::duration<double>(t2 - t1).count();
             std::fprintf(stderr, "maya-metal-mm3: %lld tokens, %.2f tok/s\n", (long long) produced,
@@ -415,15 +510,23 @@ struct Server {
 }  // namespace
 
 int serve(Mm3Metal& model, const std::vector<std::string>& args) {
-    (void) args;   // the server's CUDA-engine flags mean nothing here
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     Server s{model, {}, {}};
+    for (size_t i = 0; i < args.size(); ++i) {   // the CUDA engine's drafting flags, honoured here
+        if (args[i] == "--dspark" && i + 1 < args.size()) s.spec_on = args[++i] != "off";
+        else if (args[i] == "--dspark-conf" && i + 1 < args.size())
+            s.conf_floor = (float) std::atof(args[++i].c_str());
+        else if (args[i] == "--dspark-cost" && i + 1 < args.size())
+            s.draft_cost = (float) std::atof(args[++i].c_str());
+    }
     s.chunk = model.ubatch();
     if (const char* c = std::getenv("MAYA_METAL_PP_CHUNK")) s.chunk = std::max(1, std::atoi(c));
     const auto& st = model.stats();
-    std::printf("INFO engine=%s context=%lld logit_bias=1 kv_ctx=%lld kv_gb=%.3f vram_gb=%.1f vram_slots=0\n",
+    std::printf("INFO engine=%s context=%lld logit_bias=1 kv_ctx=%lld kv_gb=%.3f vram_gb=%.1f vram_slots=0 "
+                "dspark=%d\n",
                 MAYA_VERSION, (long long) model.max_context(), (long long) model.max_context(),
-                st.state_bytes / 1e9, (st.weight_bytes + st.state_bytes) / 1e9);
+                st.state_bytes / 1e9, (st.weight_bytes + st.state_bytes) / 1e9,
+                model.draft_block() > 0 && s.spec_on ? 1 : 0);
     std::printf("NOTE %s\n", model.describe().c_str());
     std::printf("READY %lld stop pause\n", (long long) model.max_context());
     std::fflush(stdout);

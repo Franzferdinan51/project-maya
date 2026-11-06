@@ -4,6 +4,7 @@
 #pragma once
 
 #include "glm_metal_impl.hpp"   // TensorLoc, Weights, free_memory (maya::metal)
+#include "mm3_dspark.hpp"
 #include "mm3_metal.hpp"
 
 #include "ggml-backend.h"
@@ -53,6 +54,9 @@ struct Mm3Metal::Impl {
     int64_t pos = 0;
     int64_t snap_pos = -1;
 
+    Mm3Draft draft;        // the DSpark draft (empty until load_draft)
+    bool has_draft = false;
+
     ~Impl();
     bool open_files(const std::string& path, std::string& err);
     bool read_geometry(std::string& err);
@@ -63,7 +67,10 @@ struct Mm3Metal::Impl {
     ggml_tensor* wl(int il, const char* suffix) const;  // blk.<il>.<suffix>
     bool compute(ggml_cgraph* gf, const std::vector<std::pair<ggml_tensor*, std::vector<uint8_t>>>& up,
                  std::string& err);
-    bool run_slice(const int32_t* tok, int T, std::vector<float>& logits, std::string& err);
+    // logits_rows > 1 (with rows_out): the last layer's graph also writes that many rows of
+    // logits (the slice's rows, row-major) - a verify window reads them all
+    bool run_slice(const int32_t* tok, int T, std::vector<float>& logits, std::string& err,
+                   int logits_rows = 1, std::vector<float>* rows_out = nullptr);
 };
 
 }  // namespace maya::metal

@@ -13,6 +13,9 @@
 //             the routed experts (all resident, so mul_mat_id consumes the router's top-k directly:
 //             no pool, no graph cut at the router, unlike the GLM engine).
 // The last layer's second graph also runs the head over the slice's last row.
+// With a DSpark draft loaded, graph 2 also hands back the residual stream at the draft's tap
+// layers (the taps feed the draft's context), and the head can run over a window of rows
+// (forward_rows), so the serve loop verifies a round of drafts in one pass.
 #include "mm3_metal_impl.hpp"
 
 #include "ggml-alloc.h"
@@ -47,6 +50,8 @@ struct Builder {
     int T;          // tokens in the slice
     int64_t p0;     // position of the slice's first token
     std::vector<Upload> uploads;
+    int logits_rows = 1;                  // graph2 (last layer): logits for this many rows (a verify window)
+    ggml_tensor** stream_out = nullptr;   // graph2: also hand back the layer's output stream (a draft tap)
 
     ggml_tensor* input(ggml_type type, int64_t ne0, int64_t ne1, const void* data, size_t bytes,
                        int64_t ne2 = 1) {
@@ -227,10 +232,15 @@ struct Builder {
             f = ggml_add(ctx, routed, sh);
         }
         ggml_tensor* h2 = ggml_add(ctx, h, f);
+        if (stream_out) *stream_out = h2;
         expand(ggml_cpy(ctx, h2, cols(m.c_h)));
         if (last) {
-            ggml_tensor* last_col = ggml_view_2d(ctx, h2, g.n_embd, 1, h2->nb[1], (size_t) (T - 1) * h2->nb[1]);
-            ggml_tensor* logits = mm(m.w("output.weight"), rms(last_col, m.w("output_norm.weight")));
+            ggml_tensor* cols_in = logits_rows > 1
+                                       ? ggml_view_2d(ctx, h2, g.n_embd, logits_rows, h2->nb[1],
+                                                      (size_t) (T - logits_rows) * h2->nb[1])
+                                       : ggml_view_2d(ctx, h2, g.n_embd, 1, h2->nb[1],
+                                                      (size_t) (T - 1) * h2->nb[1]);
+            ggml_tensor* logits = mm(m.w("output.weight"), rms(cols_in, m.w("output_norm.weight")));
             ggml_set_output(logits);
             expand(logits);
             *logits_out = logits;
@@ -311,13 +321,49 @@ bool select_masks(const Mm3Geometry& g, const float* scores, int64_t Tk, int T, 
     return true;
 }
 
-bool Mm3Metal::Impl::run_slice(const int32_t* tok, int T, std::vector<float>& logits, std::string& err) {
+bool Mm3Metal::Impl::run_slice(const int32_t* tok, int T, std::vector<float>& logits, std::string& err,
+                               int logits_rows, std::vector<float>* rows_out) {
     const size_t mem = ggml_tensor_overhead() * kGraphNodes + ggml_graph_overhead_custom(kGraphNodes, false);
     if (arena.size() < mem) arena.resize(mem);
     const int64_t Tk = pos + T;
     std::vector<int32_t> ids(tok, tok + T);
     std::vector<float> scores((size_t) Tk * g.ix_heads * T);
     std::vector<std::vector<float>> masks;
+    // the draft's taps: this slice's output streams at the tap layers, tap-major [NT][T][dim]
+    const std::vector<int>& dtaps = has_draft ? draft.geo().taps : std::vector<int>();
+    std::vector<float> taps_stage;
+    if (has_draft) taps_stage.assign((size_t) dtaps.size() * T * g.n_embd, 0.0f);
+    auto tap_j = [&](int il) {
+        for (size_t j = 0; j < dtaps.size(); ++j)
+            if (dtaps[j] == il) return (int) j;
+        return -1;
+    };
+    // the readbacks after a layer's attending graph: the last layer's logits and the draft's taps
+    auto finish = [&](ggml_tensor* logits_t, ggml_tensor* tap_t, int tj, bool last) {
+        if (last) {
+            if (rows_out) {
+                std::vector<float> all((size_t) g.n_vocab * logits_rows);
+                ggml_backend_tensor_get(logits_t, all.data(), 0, all.size() * sizeof(float));
+                rows_out->assign((size_t) T * g.n_vocab, 0.0f);
+                for (int r = 0; r < logits_rows; ++r)
+                    for (int v = 0; v < g.n_vocab; ++v)
+                        (*rows_out)[(size_t) (T - logits_rows + r) * g.n_vocab + v] =
+                            all[(size_t) v + (size_t) r * g.n_vocab];
+                logits.assign(all.begin() + (size_t) (logits_rows - 1) * g.n_vocab, all.end());
+            } else {
+                logits.resize((size_t) g.n_vocab);
+                ggml_backend_tensor_get(logits_t, logits.data(), 0, logits.size() * sizeof(float));
+            }
+        }
+        if (tj >= 0 && tap_t) {
+            std::vector<float> h2((size_t) g.n_embd * T);
+            ggml_backend_tensor_get(tap_t, h2.data(), 0, h2.size() * sizeof(float));
+            float* dst = taps_stage.data() + (size_t) tj * T * g.n_embd;
+            for (int t = 0; t < T; ++t)
+                for (int d = 0; d < g.n_embd; ++d)
+                    dst[(size_t) t * g.n_embd + d] = h2[(size_t) d + (size_t) t * g.n_embd];
+        }
+    };
     for (int il = 0; il < g.n_layer; ++il) {
         const bool last = il == g.n_layer - 1;
         ggml_tensor* logits_t = nullptr;
@@ -347,20 +393,22 @@ bool Mm3Metal::Impl::run_slice(const int32_t* tok, int T, std::vector<float>& lo
                 for (int h = 0; h < g.ix_heads; ++h)
                     mt.push_back(b.input(GGML_TYPE_F32, Tk, T, masks[(size_t) h].data(),
                                          masks[(size_t) h].size() * sizeof(float)));
+                ggml_tensor* tap_t = nullptr;
+                const int tj = tap_j(il);
+                b.stream_out = tj >= 0 ? &tap_t : nullptr;
+                if (last) b.logits_rows = logits_rows;
                 b.graph2(il, mt, last, &logits_t);
                 for (Upload& u : b.uploads) up.push_back({u.t, std::move(u.data)});
                 if (!compute(b.gf, up, err)) {
                     ggml_free(ctx);
                     return false;
                 }
-                if (last) {
-                    logits.resize((size_t) g.n_vocab);
-                    ggml_backend_tensor_get(logits_t, logits.data(), 0, logits.size() * sizeof(float));
-                }
+                finish(logits_t, tap_t, tj, last);
                 ggml_free(ctx);
             }
         }
     }
+    if (has_draft && !draft.context(taps_stage.data(), T, pos, err)) return false;
     return true;
 }
 
@@ -388,6 +436,7 @@ bool Mm3Metal::load(const std::string& path, int64_t max_ctx, std::string& err) 
 void Mm3Metal::reset() {
     p_->pos = 0;
     p_->snap_pos = -1;
+    if (p_->has_draft) p_->draft.reset_context();
 }
 
 void Mm3Metal::snapshot_save() { p_->snap_pos = p_->pos; }
@@ -418,6 +467,53 @@ bool Mm3Metal::forward(const std::vector<int32_t>& tokens, std::vector<float>& l
         m.st.tokens += (uint64_t) n;
     }
     return true;
+}
+
+bool Mm3Metal::load_draft(const std::string& dir, std::string& err) {
+    Impl& m = *p_;
+    if (!m.draft.load(dir, m.w("token_embd.weight"), m.w("output.weight"), m.n_ctx, err)) return false;
+    m.has_draft = true;
+    return true;
+}
+
+int Mm3Metal::draft_block() const { return p_->has_draft ? p_->draft.geo().block : 0; }
+
+bool Mm3Metal::draft_propose(int32_t anchor, int64_t pos, int n, std::vector<int32_t>& drafts,
+                             std::vector<float>& confs, std::string& err) {
+    if (!p_->has_draft) {
+        drafts.clear();
+        confs.clear();
+        return true;
+    }
+    return p_->draft.propose(anchor, pos, n, drafts, confs, err);
+}
+
+bool Mm3Metal::forward_rows(const std::vector<int32_t>& tokens, std::vector<float>& rows, std::string& err) {
+    Impl& m = *p_;
+    if (tokens.empty()) {
+        err = "empty forward";
+        return false;
+    }
+    if ((int64_t) tokens.size() > m.o.n_ubatch) {
+        err = "a verify window is wider than one slice";
+        return false;
+    }
+    if (m.pos + (int64_t) tokens.size() > m.n_ctx) {
+        err = "context full (" + std::to_string(m.n_ctx) + " tokens)";
+        return false;
+    }
+    std::vector<float> logits;
+    if (!m.run_slice(tokens.data(), (int) tokens.size(), logits, err, (int) tokens.size(), &rows))
+        return false;
+    m.pos += (int64_t) tokens.size();
+    m.st.tokens += tokens.size();
+    return true;
+}
+
+void Mm3Metal::rewind_to(int64_t pos) {
+    if (pos < 0) pos = 0;
+    if (pos > p_->n_ctx) pos = p_->n_ctx;
+    p_->pos = pos;
 }
 
 int64_t Mm3Metal::position() const { return p_->pos; }

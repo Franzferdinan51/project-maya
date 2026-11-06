@@ -122,7 +122,8 @@ endif()
 file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/VERSION _maya_version LIMIT_COUNT 1)
 add_library(maya_metal STATIC src/metal/glm_metal.cpp src/metal/glm_metal_load.cpp src/metal/expert_pool.cpp
                               src/metal/glm_metal_dflash.cpp src/metal/spec.cpp src/metal/sampler.cpp
-                              src/metal/mm3_metal.cpp src/metal/mm3_metal_load.cpp src/metal/mm3_serve.cpp)
+                              src/metal/mm3_metal.cpp src/metal/mm3_metal_load.cpp src/metal/mm3_serve.cpp
+                              src/metal/mm3_dspark.cpp)
 target_include_directories(maya_metal PUBLIC src/metal)
 target_compile_definitions(maya_metal PUBLIC MAYA_VERSION="${_maya_version}")
 target_link_libraries(maya_metal PUBLIC ggml ggml-base ggml-cpu ggml-metal)
@@ -186,6 +187,36 @@ if(MAYA_METAL_TESTS)
     add_test(NAME metal_mm3_serve_test
              COMMAND ${MAYA_MM3_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_mm3_serve.py $<TARGET_FILE:maya-metal-mm3>
                      ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf)
+    add_executable(metal_mm3_dspark_test src/metal/metal_mm3_dspark_test.cpp)
+    target_link_libraries(metal_mm3_dspark_test PRIVATE maya_metal)
+    add_executable(metal_mm3_divergence_test src/metal/metal_mm3_divergence_test.cpp)
+    target_link_libraries(metal_mm3_divergence_test PRIVATE maya_metal)
+    # the DSpark draft's fixture and gates need torch + safetensors (the draft is a safetensors dir)
+    find_program(MAYA_MM3_SPEC_PYTHON3 NAMES python3 PATHS ~/ComfyUI/.venv/bin /usr/bin /usr/local/bin)
+    if(MAYA_MM3_SPEC_PYTHON3)
+      execute_process(COMMAND ${MAYA_MM3_SPEC_PYTHON3} -c "import torch, safetensors"
+                      RESULT_VARIABLE _mm3_spec_rc OUTPUT_QUIET ERROR_QUIET)
+      if(NOT _mm3_spec_rc EQUAL 0)
+        set(MAYA_MM3_SPEC_PYTHON3 "")
+      endif()
+    endif()
+    if(MAYA_MM3_SPEC_PYTHON3)
+      add_test(NAME metal_mm3_dspark_gen
+               COMMAND ${MAYA_MM3_SPEC_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/mm3_dspark_fixture.py
+                       --out ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-dspark-synth)
+      set_tests_properties(metal_mm3_dspark_gen PROPERTIES FIXTURES_SETUP metal_mm3_dspark)
+      add_test(NAME metal_mm3_dspark_test
+               COMMAND metal_mm3_dspark_test ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-dspark-synth)
+      add_test(NAME metal_mm3_dspark_test_cpu
+               COMMAND metal_mm3_dspark_test ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-dspark-synth)
+      set_tests_properties(metal_mm3_dspark_test_cpu PROPERTIES ENVIRONMENT MAYA_MM3_CPU=1)
+      set_tests_properties(metal_mm3_dspark_test metal_mm3_dspark_test_cpu
+                           PROPERTIES FIXTURES_REQUIRED "metal_mm3_gguf;metal_mm3_dspark")
+      add_test(NAME metal_mm3_divergence_test
+               COMMAND metal_mm3_divergence_test ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf
+                       ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-dspark-synth)
+      set_tests_properties(metal_mm3_divergence_test PROPERTIES FIXTURES_REQUIRED "metal_mm3_gguf;metal_mm3_dspark")
+    endif()
     set_tests_properties(metal_mm3_serve_test PROPERTIES FIXTURES_REQUIRED metal_mm3_gguf)
   endif()
   # the same gates on ggml-cpu (the oracle backend), and with the expert pool at its floor and small slices
