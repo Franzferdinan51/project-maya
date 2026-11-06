@@ -139,7 +139,7 @@ export async function loadCtxInfo() {
   emit();
   return S.ctxInfo;
 }
-// the Context size slider's stops (Settings > Model and the Models page's Engine settings): CTX_STOPS within a model's
+// the Context size slider's stops (Settings > Chat defaults and the Models page's Engine settings): CTX_STOPS within a model's
 // range ({min, max}: GET /api/context, or /api/models' context_range), and the sizes given (the one now, a draft's)
 export function ctxStopsIn(r, ...sizes) {
   if (!r) return [];
@@ -163,7 +163,7 @@ export function ctxEstimate(n) {
   const expertGb = c.vram_gb && c.vram_slots ? +c.vram_gb / c.vram_slots : null;
   return {gb: est, delta: est - now, experts: expertGb ? Math.round((est - now) / expertGb) : null, vram: +c.vram_gb || null};
 }
-// the Context size slider's line under it (Settings > Model and the Models page alike): what n tokens of context cost.
+// the Context size slider's line under it (Settings > Chat defaults and the Models page alike): what n tokens of context cost.
 // `live`: the running engine's own measurement scaled (ctxEstimate); else from the cache's bytes per token - `ram`: a
 // streamed cache, every position in pinned RAM and `win` of them in VRAM (`whole`: a context up to `win` is not streamed,
 // GLM's), `vram`: a cache wholly in VRAM.  `now`: the size it has now (the change in GB is shown against it).
@@ -231,8 +231,36 @@ export async function watchReload(to) {
     await loadHealth();
     if (rl && rl.state === "failed") toast("error", "The context did not change", rl.error || "the engine did not start with it", 9000);
     else toast("success", "Model reloaded", `It runs with a ${ctxfmt(info.context)} context now.`, 5000);
+    // (the same setting on the Models page: its Engine settings read the run config again)
+    try { window.dispatchEvent(new Event("maya:context")); } catch (e) { /* (no window: a test) */ }
     emit();
     return;
+  }
+}
+
+// ------------------------------------------------------------------ the thinking budget (applies at once, no restart)
+export async function loadThinkBudget() {
+  try { S.thinkBudget = await api("api/thinking-budget"); } catch (e) { S.thinkBudget = null; }
+  emit();
+  return S.thinkBudget;
+}
+export const budgetError = (text) => {
+  const t = String(text).trim();
+  if (!/^\d+$/.test(t)) return "Use a whole number of tokens.";
+  const n = +t;
+  return n === 0 || (n >= 256 && n <= 262144) ? "" : "Use 0 (no limit) or 256 to 262144 tokens.";
+};
+export async function saveThinkBudget(text) {
+  const bad = budgetError(text);
+  if (bad) { toast("error", "The thinking budget did not change", bad, 6000); return false; }
+  try {
+    S.thinkBudget = await api("api/thinking-budget", {method: "POST", body: {budget: +String(text).trim()}});
+    emit();
+    toast("success", "Thinking budget saved", +text ? `Thinking stops at ${fmt(+text)} tokens, from the next answer.` : "Thinking has no limit, from the next answer.", 5000);
+    return true;
+  } catch (e) {
+    toast("error", "The thinking budget did not change", e.message, 6000);
+    return false;
   }
 }
 

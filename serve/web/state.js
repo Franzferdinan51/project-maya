@@ -11,6 +11,7 @@ export const S = {
   mcp: {servers: [], tools: 0},
   ctxInfo: null,            // GET /api/context
   portInfo: null,           // GET /api/port
+  thinkBudget: null,        // GET /api/thinking-budget: {budget, supported, saved}
   update: null,             // GET /api/update
   updateWatch: null,        // {to, down}: an update in progress
   reload: null,             // {to}: a context reload in progress (the composer waits)
@@ -141,9 +142,10 @@ export const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k:
                          mcp: true, system: "", sys_default: false, thinking_v: 2,
                          repetition_penalty: "", frequency_penalty: "", presence_penalty: ""};
 export const PENALTIES = ["repetition_penalty", "frequency_penalty", "presence_penalty"];
-// CYBER-FROST-3.8-PS (Qwen3.8's template, thinking always on): its three reasoning efforts, low / medium / xhigh
+// CYBER-FROST-3.8-PS (Qwen3.8's template, thinking always on): Off (the think block closed the way its Qwen base writes
+// thinking off - frontend.ChatTemplate) and its three reasoning efforts, low / medium / xhigh
 const THINK_LEVELS = {glm: ["none", "low", "high", "max"], deepseek: ["none", "low", "high", "max"],
-                      minimax: ["none", "auto", "low", "medium", "high", "xhigh", "max"], qwen: ["low", "medium", "xhigh"]};
+                      minimax: ["none", "auto", "low", "medium", "high", "xhigh", "max"], qwen: ["none", "low", "medium", "xhigh"]};
 const THINK_DEFAULT = {glm: "max", deepseek: "high", minimax: "auto", qwen: "xhigh"};   // (the run config's level wins: loadHealth)
 const LEVEL = {none: ["Off", "Answers right away"], auto: ["Auto", "It decides whether to think"], low: ["Low", "A short think"],
                medium: ["Medium", "A moderate think"], high: ["High", "Thinks it through"], xhigh: ["XHigh", "Thinks hard"],
@@ -160,7 +162,7 @@ export const THINK_TITLES = {
             high: "Effort high: it decides whether to think, and thinks it through",
             xhigh: "Effort extra-high: it decides whether to think, and thinks hard",
             max: "Effort max: it decides whether to think - the most thorough, and the longest"},
-  qwen: {low: "Reasoning effort low: a short think", medium: "Reasoning effort medium: thinks it through",
+  qwen: {none: "No thinking: it answers right away", low: "Reasoning effort low: a short think", medium: "Reasoning effort medium: thinks it through",
          xhigh: "Reasoning effort xhigh (its default): checks its assumptions and alternatives - the most thorough"},
 };
 // the running model's family, its thinking levels (THINKING, LEVELS: live bindings) and their titles

@@ -21,6 +21,7 @@ import maya_quants as Q  # noqa: E402
 # old name -> (family, the setup's key): every --model / --ds4-quant / --mm3-quant value of v1.1.29 and before
 ALIASES = {
     "Maya-S-v2-IQ2_XXS": ("glm", "Maya-S-v2-IQ2_XXS"), "Maya-S24": ("glm", "Maya-S24"), "Maya-M": ("glm", "Maya-M"),
+    "Maya-XS-IQ1_S": ("glm", "Maya-XS-IQ1_S"),
     "Maya-M-Derisked": ("glm", "Maya-M-Derisked"), "Maya-L": ("glm", "Maya-L"),
     "EXL3-3.05bpw": ("glm", "EXL3-3.05bpw"), "EXL3-4.05bpw": ("glm", "EXL3-4.05bpw"),
     "EXL3-sc_4.10bpw": ("glm", "EXL3-sc_4.10bpw"),
@@ -30,6 +31,7 @@ ALIASES = {
 IDS = {
     "glm-maya-s": ("glm", "Maya-S-v2-IQ2_XXS", "GLM-5.3 · Maya-S"),
     "glm-maya-s24": ("glm", "Maya-S24", "GLM-5.3 · Maya-S24"),
+    "glm-maya-xs": ("glm", "Maya-XS-IQ1_S", "GLM-5.3 · Maya-XS"),
     "glm-maya-m": ("glm", "Maya-M", "GLM-5.3 · Maya-M"),
     "glm-maya-m-derisked": ("glm", "Maya-M-Derisked", "GLM-5.3 · Maya-M-Derisked"),
     "glm-maya-l": ("glm", "Maya-L", "GLM-5.3 · Maya-L"),
@@ -209,6 +211,10 @@ class OldConfigs(unittest.TestCase):
         # (a DeepSeek config from before its quants were recorded: the EXL3 quant's; a hand-written one: no label)
         self.assertEqual(Q.config_label({"exe": "/b/maya-ds4", "args": ["--pack", "/p"], "installer": {}}),
                          "DeepSeek V4.1 · EXL3 2.9 bpw")
+        # (an EXL3 quant of other bits set up by hand under the "exl3" key: its folder's bits - turboderp's 2.25 bpw)
+        self.assertEqual(Q.config_label({"exe": "/b/maya-ds4", "args": [
+            "--pack", "/m/DeepSeek-V4.1-Flash-1017-EXL3-2.25bpw/maya-ds4"], "installer": {"ds4_quant": "exl3"}}),
+            "DeepSeek V4.1 · EXL3 2.25 bpw")
         self.assertIsNone(Q.config_label({"exe": "/b/maya", "args": [], "model_name": "qwen3.8-flash-next"}))
 
     def test_the_next_setups_default(self):

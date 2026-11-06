@@ -190,6 +190,11 @@ public:
     /// verify() alike: over the last `last_n` tokens the state has consumed (at most 4096; a verify window's row counts
     /// the drafts before it).  last_n 0 (or every penalty neutral): none, the picks exactly as without.
     void set_penalties(int last_n, float repeat, float freq, float present);
+    /// The request's logit_bias (GEN logit_bias=<id>:<bias>,...) for every pick after this - sample(), sample_multi(),
+    /// verify() and verify_multi() alike: each bias is added to its token's logit before the penalties and the
+    /// request's sampling (-100 bans the token).  The drafter's own proposals are not biased; the verify judges them
+    /// by the biased logits.  Empty: none, the picks exactly as without.
+    void set_logit_bias(const std::vector<std::pair<int, float>>& entries);
     /// The request's log-probabilities (GEN logprobs=<k>, ds4_logprobs.hpp) for every pick after this - sample(),
     /// sample_multi(), verify() and verify_multi() alike: logprobs() then holds a row for each token the pick returned
     /// (verify: the accepted drafts, then the token after them), each its token's logprob and its row's top k, from the
@@ -256,6 +261,10 @@ public:
     /// prompt's start is then not usable: restore() a checkpoint kept before the feed, or reset().
     void set_cancel(std::function<bool()> f);
     bool cancelled() const;   // the last feed() / feed_mark() ended early on a Stop
+    /// After a request: true when no later one can trust this process - a layer GPU took a fault inside a kernel (its
+    /// context returns that error from then on) or the prompt path's room was not handed back.  The serve loop then
+    /// ends the engine (exit 3) once the request's DONE is out, and the server starts a fresh one for the next request.
+    bool broken();
     /// Asked while a run of chunks goes through the layers: true (a yield) ends it at a chunk every GPU reaches, as a
     /// Stop does, but keeps the chunks read - feed() / feed_mark() return true having taken fed() of their tokens (the
     /// rest a later feed's; feed_mark's checkpoint then not kept).  Not on a run that goes layer by layer.

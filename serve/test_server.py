@@ -35,6 +35,28 @@ class RecordingEngine(MockEngine):
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
 
+class StampedLog(unittest.TestCase):
+    """#783: a time before each of the server's own `[maya]` lines; the engine's lines and other text are untouched."""
+
+    def test_only_maya_lines_get_a_time(self):
+        import io
+        import re
+        from serve.server import StampedStdout
+        buf = io.StringIO()
+        out = StampedStdout(buf)
+        print("[maya] request 1 done", file=out)
+        print("[maya] in", "pieces", end="", file=out)
+        print(" - one line", file=out)
+        print("maya ds4 serve: request 926: prompt 100 tokens", file=out)
+        print("  [maya] indented is not stamped", file=out)
+        lines = buf.getvalue().splitlines()
+        stamp = r"\d\d:\d\d:\d\d "
+        self.assertRegex(lines[0], "^" + stamp + r"\[maya\] request 1 done$")
+        self.assertRegex(lines[1], "^" + stamp + r"\[maya\] in pieces - one line$")
+        self.assertEqual(lines[2:], ["maya ds4 serve: request 926: prompt 100 tokens", "  [maya] indented is not stamped"])
+        self.assertEqual(len(re.findall(stamp, buf.getvalue())), 2)
+
+
 class ThinkingBudget(unittest.TestCase):
     """Real HTTP adapters must leave room for reasoning and a final answer at small output limits."""
 
@@ -766,6 +788,31 @@ class RequestChecks(unittest.TestCase):
             svc.check_request({"logit_bias": {"65": 1}})
         svc.check_request({"logit_bias": {}})      # none asked for: fine anywhere
 
+    def test_ignore_eos(self):
+        """ignore_eos bans every token that ends an answer through the logit bias (a client's other biases kept), needs
+        max_tokens and an engine that applies biases, and takes only true or false."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        ends = sorted(svc.stop_ids | svc.eos_ids)
+        self.assertTrue(ends)
+        req = {"ignore_eos": True, "max_tokens": 64, "logit_bias": {"65": 2, str(ends[0]): 5}}
+        svc.check_request(req)
+        self.assertEqual(req["logit_bias"], {65: 2.0, **{t: -100.0 for t in ends}})
+        req = {"ignore_eos": True, "max_completion_tokens": "32"}
+        svc.check_request(req)
+        self.assertEqual(req["logit_bias"], {t: -100.0 for t in ends})
+        self.assertIn("logit_bias=" + ",".join(f"{t}:-100" for t in ends), StrataEngine.sampling_keys(req))
+        req = {"ignore_eos": False, "max_tokens": 8}
+        svc.check_request(req)
+        self.assertNotIn("logit_bias", req)
+        for bad in ({"ignore_eos": True}, {"ignore_eos": True, "max_tokens": 0}, {"ignore_eos": "yes", "max_tokens": 8}):
+            with self.assertRaises(ValueError) as cm:
+                svc.check_request(dict(bad))
+            self.assertTrue(str(cm.exception).startswith("ignore_eos:"), cm.exception)
+        svc.engine.info = {}                       # an engine that applies no biases: refused, not ignored
+        with self.assertRaises(ValueError):
+            svc.check_request({"ignore_eos": True, "max_tokens": 8})
+
 
 class PrometheusMetrics(unittest.TestCase):
     """GET /metrics/prometheus: llama-server's metric names in Prometheus' text format, behind the API key."""
@@ -922,6 +969,69 @@ class NonFiniteRetry(unittest.TestCase):
         with self.assertRaises(ValueError):
             list(svc.run(tok.encode("hi"), False, None, 20, {}, threading.Event()))
         self.assertEqual(Broken.calls, 1)
+
+
+class VocabTokenizer(ByteTokenizer):
+    """ByteTokenizer with the pack tokenizer's token_bytes (tools/strata_tokenizer.py): an id outside the vocabulary
+    is an IndexError, as in #805's traceback."""
+
+    def token_bytes(self, i):
+        if i < 0 or i >= 256 + len(self.SPECIALS):
+            raise IndexError("token id %d is outside the vocabulary (%d)" % (i, 256 + len(self.SPECIALS)))
+        return self.SPECIALS[i - 256].encode() if i >= 256 else bytes([i])
+
+
+class NoRoomOrNoToken(unittest.TestCase):
+    """#805: a 351,912-token prompt read, then "done: 0 tokens (length)" and an IndexError for token id -1 in the
+    tokenizer under the loop guard.  On the engine's own lines (StrataEngine.generate): an answer of no tokens that
+    ends "length" is an empty answer, and a T line of -1 (an engine whose sample failed) is the request's error -
+    never an id for the tokenizer."""
+
+    def answer(self, lines):
+        import io
+        import queue
+        from types import SimpleNamespace
+        eng = StrataEngine.__new__(StrataEngine)
+        eng.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)
+        eng.lines = queue.Queue()
+        eng.can_stop = True
+        eng.max_context = CTX
+        for line in lines:
+            eng.lines.put(line)
+        tok = VocabTokenizer()
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.assertTrue(svc.loop_guard)                   # (the guard's piece() decoded the -1)
+        out, done, err = "", None, None
+        try:
+            for kind, v in svc.run(tok.encode("hi"), False, None, 200, {}, threading.Event()):
+                if kind == "event":
+                    out += v.text
+                elif kind == "done":
+                    done = v
+        except ValueError as e:
+            err = str(e)
+        return out, done, err, eng, svc
+
+    def test_no_tokens_length_is_an_empty_answer(self):
+        out, done, err, _, svc = self.answer(["PP 3 3 1.0 3.0", "DONE 0 3 414000.0 0.0 length 0 0 0"])
+        self.assertEqual((out, err), ("", None))
+        self.assertEqual((done["finish"], done["completion_tokens"]), ("length", 0))
+        self.assertEqual(svc.metrics()["requests"][0]["finish"], "length")
+
+    def test_token_minus_one_is_an_error(self):
+        out, done, err, eng, svc = self.answer(["PP 3 3 1.0 3.0", "T -1", "T 104", "DONE 2 3 414000.0 1.0 cancel 0 0 0"])
+        self.assertEqual((out, done), ("", None))
+        self.assertIn("could not pick a token", err)
+        self.assertIn("STOP", eng.proc.stdin.getvalue())  # (the engine stopped, drained to its DONE)
+        self.assertTrue(eng.lines.empty())
+        self.assertEqual(svc.metrics()["requests"][0]["finish"], "error")
+
+    def test_engine_token(self):
+        from serve.server import engine_token
+        self.assertEqual(engine_token("129279"), 129279)
+        for bad in ("-1", "-2"):
+            with self.assertRaises(ValueError):
+                engine_token(bad)
 
 
 class EngineDeath(unittest.TestCase):
@@ -2625,6 +2735,56 @@ class NoDelayStreaming(unittest.TestCase):
             self.assertEqual(conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 1)
         finally:
             conn.close(), client.close(), listener.close()
+
+
+class EngineEndTests(unittest.TestCase):
+    """An engine that ends itself (maya-ds4 after a GPU's fault): the server takes it as ended from its END line, and
+    why it ended, as the server prints it for a request it took down, comes from the end of its log."""
+
+    def note(self, tail: str, returncode=3) -> str:
+        import tempfile
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "engine.log")
+            with open(log, "w", encoding="utf-8") as f:
+                f.write(tail)
+            e = StrataEngine.__new__(StrataEngine)
+            e.log_path = log
+            e.proc = SimpleNamespace(returncode=returncode)
+            return e.death_note()
+
+    def test_a_gpu_fault_the_engine_caught_is_not_read_as_ram(self):
+        n = self.note("ds4: CUDA0: an illegal memory access was encountered - the device's state is unknown\n"
+                      "maya ds4 serve: a GPU's state is unknown after this request - the engine ends (exit 3) so the "
+                      "server starts it again for the next request\n")
+        self.assertIn("a GPU took a fault inside a kernel", n)
+        self.assertIn("the engine ends (exit 3)", n)
+        self.assertNotIn("RAM", n)
+
+    def test_end_ahead_of_done_marks_the_engine_ended_before_the_request_ends(self):
+        import io
+        import queue
+        from types import SimpleNamespace
+        e = StrataEngine.__new__(StrataEngine)
+        e.proc = SimpleNamespace(stdout=io.StringIO("ERR cudaMemcpyAsync(...): an illegal memory access was encountered\n"
+                                                    "END a GPU's state is unknown after this request - the engine ends "
+                                                    "(exit 3); the next request starts a fresh one\n"
+                                                    "DONE 0 12 0.0 0.0 cancel 0 0 0 0 0\n"),
+                                 poll=lambda: None)
+        e.lines, e.multi, e.ended = queue.Queue(), 0, False
+        e._routes, e._routes_lock = {}, threading.Lock()
+        e._pump()
+        got = []
+        while (line := e.lines.get_nowait()) is not None:
+            got.append(line.split()[0])
+        self.assertEqual(got, ["ERR", "DONE"])           # END is the server's, not the request's
+        self.assertTrue(e.ended)
+        self.assertFalse(e.alive())                      # (the process may still be exiting: the next request restarts)
+
+    def test_the_watchdog_and_ram_notes_are_unchanged(self):
+        self.assertIn("a hang it caught", self.note("maya ds4 serve: no progress for 600 s during a request - stopping "
+                                                    "the engine so the server starts it again (issue #29, #539)\n"))
+        self.assertIn("running out of RAM", self.note("ds4: something else\n", returncode=-9))
 
 
 if __name__ == "__main__":

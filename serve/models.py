@@ -67,6 +67,16 @@ def flag(args: list, name: str, default=None):
     return args[args.index(name) + 1] if name in args[:-1] else default
 
 
+def _metal(cfg: dict) -> bool:
+    """A config the Metal engines run: their exe names are the setup's with -metal in them (maya-metal,
+    maya-metal-mm3), which the CUDA-era name checks do not know."""
+    return Path(str(cfg.get("exe", ""))).name.startswith("maya-metal")
+
+
+def _metal_mm3(cfg: dict) -> bool:
+    return Path(str(cfg.get("exe", ""))).name.startswith("maya-metal-mm3")
+
+
 def set_flag(args: list, name: str, value) -> list:
     """The arguments with `name value` (replaced where it was, else added at the end)."""
     out = [str(a) for a in args]
@@ -105,6 +115,8 @@ def _float(v, default=None):
 
 def family(cfg: dict) -> str:
     """"minimax", "deepseek", "qwen" or "glm" (maya_quants.family_of, as maya.py and the server read it)."""
+    if _metal_mm3(cfg):   # (family_of knows the CUDA exe name, maya-mm3; the Metal MiniMax engine's is maya-metal-mm3)
+        return "minimax"
     return maya_quants.family_of(cfg)
 
 
@@ -269,7 +281,7 @@ def settings_of(cfg: dict) -> dict:
         vision, kvs = flag(args, "--vision"), flag(args, "--kv-streaming")
         out.update(images=vision == "on" or (vision is None and mm3_pack_has(cfg, "vision.hidden_size")),
                    parallel=_int(flag(args, "--parallel"), 1),
-                   draft="dspark" if flag(args, "--dspark", "off") not in ("off", "none") else "none",
+                   draft="dspark" if flag(args, "--dspark", "on" if _metal(cfg) else "off") not in ("off", "none") else "none",
                    tp=_int(flag(args, "--tp"), 0), kv_cache=flag(args, "--kv-cache", "int8"),
                    kv_streaming=kvs == "on" or (kvs is None and _int(flag(args, "--kv-resident"), 0) > 0),
                    kv_resident=_int(flag(args, "--kv-resident")), cpu_threads=_int(flag(args, "--cpu-threads")),
@@ -599,6 +611,7 @@ def quant_label(cfg: dict, path: Path) -> str:
     names, maya_quants); else its installer key, or the config's own name for one the setup did not write."""
     fam, key = family(cfg), maya_quants.config_key(cfg)
     what = maya_quants.tier(fam, key) or maya_quants.OTHERS.get((fam, key)) or OTHER_QUANTS.get((fam, str(key).lower()))
+    what = maya_quants.exl3_bits(cfg) or what          # (an EXL3 quant set up by hand: its folder's bits, maya_quants)
     return str(what or key or path.stem.removeprefix("maya-").removesuffix("-hip"))
 
 
@@ -613,9 +626,14 @@ def missing(cfg: dict) -> str | None:
     return None
 
 
-def describe(path: Path, running: str | None) -> dict:
+def describe(path: Path, running: str | None, port: int | None = None) -> dict:
     cfg = read(path)
     pack = pack_of(cfg)
+    folder = str(pack.parent) if pack else None
+    if folder is None:   # (a Metal config names its model file with --gguf, not a pack: the file's folder is its own)
+        g = flag(cfg.get("args") or [], "--gguf")
+        folder = str(Path(g).parent) if g else None
+    is_running = running is not None and str(path.resolve()) == str(Path(running).resolve())
     why = missing(cfg)
     inst = cfg.get("installer") or {}
     script = next((s.name for s in (path.with_name(f"run-{path.stem}.sh"), path.with_name(f"run-{path.stem}.bat"))
@@ -628,9 +646,10 @@ def describe(path: Path, running: str | None) -> dict:
     setup = dict(inst.get("as_set_up") or cur)
     setup["env"] = shown_env(setup.get("env"))
     return {"file": path.name, "path": str(path), "model": cfg.get("model_name") or "", "family": family(cfg),
-            "quant": quant_label(cfg, path), "backend": cfg.get("backend") or "cuda", "written": inst.get("written"),
-            "used": used, "running": running is not None and str(path.resolve()) == str(Path(running).resolve()),
-            "port": cfg.get("port"), "script": script, "folder": str(pack.parent) if pack else None,
+            "quant": quant_label(cfg, path), "backend": cfg.get("backend") or ("metal" if _metal(cfg) else "cuda"),
+            "written": inst.get("written"),
+            "used": used, "running": is_running,
+            "port": cfg.get("port") or (port if is_running else None), "script": script, "folder": folder,
             "size": folder_size(pack), "ok": why is None, "missing": why,
             "settings": cur, "setup": setup, "choices": choices(cfg), "command": command(cfg),
             "contexts": {"deepseek": DS4_CONTEXTS, "minimax": MM3_CONTEXTS, "qwen": QWEN_CONTEXTS}.get(family(cfg),
@@ -660,8 +679,8 @@ def machine_gpus(backend: str = "cuda") -> list:
     return found
 
 
-def listing(root: Path, running: str | None) -> dict:
-    models = [describe(p, running) for p in config_paths(root)]
+def listing(root: Path, running: str | None, port: int | None = None) -> dict:
+    models = [describe(p, running, port) for p in config_paths(root)]
     backend = next((m["backend"] for m in models if m["running"]), models[0]["backend"] if models else "cuda")
     gpus = machine_gpus(backend)
     seen = {g["index"] for g in gpus}
@@ -681,23 +700,24 @@ def own_defaults(path: Path) -> bool:
     if not cfg:
         return False
     sampling, effort = maya_quants.model_defaults(cfg)
-    if cfg.get("sampling") == sampling and cfg.get("reasoning_effort") == effort:
+    budget = maya_quants.thinking_budget_for(cfg)      # (GLM's 8192 where none was set, or still the old 32768)
+    if cfg.get("sampling") == sampling and cfg.get("reasoning_effort") == effort and budget is None:
         return False
     p = Path(path)
     p.with_name(p.name + ".prev").write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     st = p.stat()
-    write(p, {**cfg, "sampling": sampling, "reasoning_effort": effort})
+    write(p, {**cfg, "sampling": sampling, "reasoning_effort": effort,
+              **({} if budget is None else {"thinking_budget": budget})})
     os.utime(p, (st.st_atime, st.st_mtime))
     return True
 
 
-def save(path: Path, settings: dict) -> dict:
-    """The settings written into the config at `path` (its settings before kept beside it, <config>.prev, and the
-    first time the page changes it, what the setup wrote: installer.as_set_up, the page's Reset)."""
-    cfg = read(path)
-    if not cfg:
-        raise ValueError(f"{Path(path).name}: not a config Maya can read")
-    new = apply(cfg, settings)
+def _commit(path: Path, cfg: dict, new: dict) -> dict:
+    """`new` written over the config at `path` (`cfg` as it was): its settings before kept beside it (<config>.prev), and
+    the first time the page changes it, what the setup wrote (installer.as_set_up).  "changed": the engine's command or
+    environment is not what it was - a restart is due (a Turbo marker alone is not one)."""
+    engine = ("args", "env", "gpu", "vision", "vision_off")
+    changed = any(new.get(k) != cfg.get(k) for k in engine)
     if new == cfg:
         return {"changed": False}
     inst = new.setdefault("installer", {})
@@ -708,14 +728,148 @@ def save(path: Path, settings: dict) -> dict:
     st = Path(path).stat()
     write(path, new)
     os.utime(path, (st.st_atime, st.st_mtime))         # (its time says when it last ran: a start picks the latest)
-    return {"changed": True, "prev": prev.name}
+    return {"changed": changed, "prev": prev.name}
+
+
+def save(path: Path, settings: dict) -> dict:
+    """The settings written into the config at `path` (its settings before kept beside it, <config>.prev, and the
+    first time the page changes it, what the setup wrote: installer.as_set_up, the page's Reset)."""
+    cfg = read(path)
+    if not cfg:
+        raise ValueError(f"{Path(path).name}: not a config Maya can read")
+    return _commit(path, cfg, apply(cfg, settings))
+
+
+# ------------------------------------------------------------------ Turbo (the page's Turbo button)
+# The fastest settings the engine has, for people who play with speed and run benchmarks.  What the engine needs a start
+# for is written into the config (the same "settings saved, Maya starts again" flow); the config keeps a "turbo" note:
+# what it was before, so that switching Turbo off puts every one of these back.  The request-level half (greedy
+# decoding, the fastest thinking level, coding prompts) lives in the page (serve/web/turbo-core.js).
+TURBO_CONTEXT = 32768                               # GLM and MiniMax: a smaller context leaves VRAM to the experts ...
+TURBO_CONTEXT_FAMILIES = ("glm", "minimax")         # ... DeepSeek's context is cheap, Qwen keeps its own
+# Turbo trades quality for speed on purpose (benchmarks, playing with the engine): it goes past the safeguards.
+# Expert skipping, where the engine has it (docs/SETTINGS.md): GLM's MISS_SKIP leaves out the light experts VRAM does not
+# hold on layers 23 and up, at the highest value the docs measured (0.16: 30.9 vs 27.4 tok/s on Maya-S24, KL 0.075;
+# _FROM stays 23 - the docs warn the early layers notice it far more); DeepSeek's RAM_SKIP the same rule for every
+# expert VRAM does not hold, at the highest value documented (Maya-XS, DSpark: 27.8 -> 39.7 tok/s at 0.14).  MiniMax and
+# Qwen have no skipping.  DeepSeek's DSPARK_CUM is lowered with the draft floor below (longer verified windows).
+# Not used: MAYA_GLM_TRUNK_KEEP(_MAP) (its layer map is per model, a uniform value hurts the early layers),
+# MAYA_*_DISK_SKIP_* (only for experts that fit neither VRAM nor RAM), MAYA_GLM_DFLASH_MIN/_CUM (meant for per-request
+# tuning, no measured fast value).  The loop guard (MAYA_LOOP_GUARD) is deliberately NOT touched: it costs no speed and
+# stops greedy runaway loops, which would ruin a benchmark.
+# Where the whole model is in VRAM those skips have nothing to leave out, so Turbo also caps the routed experts a token
+# computes, wherever they live (MAYA_*_RESIDENT_TOPK, docs/SETTINGS.md; the weight rule MAYA_*_RESIDENT_SKIP_W is not
+# used: on the AMD Strix Halo test PC 0.20 already gave garbage, the rank cap degrades more gently).  The values are the
+# fastest whose output was still sound there (a three.js page that parses with `node --check`, short factual answers):
+# DeepSeek IQ1_M keeps 3 of its 6 experts a token (40.8 -> 49.5 tok/s with Turbo's other settings), GLM Maya-M-Derisked 4
+# of its 8 (33.2 -> 38.8; 3 gave a page with a duplicate import and slower drafts).
+TURBO_ENV = {"glm": {"MAYA_GLM_MISS_SKIP_W": "0.16", "MAYA_GLM_MISS_SKIP_FROM": "23", "MAYA_GLM_RESIDENT_TOPK": "4"},
+             "deepseek": {"MAYA_DS4_RAM_SKIP_W": "0.14", "MAYA_DS4_DSPARK_CUM": "0.3", "MAYA_DS4_RESIDENT_TOPK": "3"}}
+# the drafter that goes fastest where the pack has it: DSpark (DeepSeek, MiniMax), MTP (Qwen).  GLM keeps the drafter the
+# setup measured for this PC (MTP or DFlash2: which is faster depends on the GPUs).
+TURBO_DRAFT = {"deepseek": "dspark", "minimax": "dspark", "qwen": "mtp"}
+# DSpark's draft confidence floor (default 0.7), lowered so that longer windows are verified
+TURBO_DSPARK_CONF = 0.3
+TURBO_DSPARK_FAMILIES = ("deepseek", "minimax")
+# The smallest quants (GLM and DeepSeek Maya-XS, experts at 1-2 bits) keep every expert a token routes to: on 3x V100 the
+# cap gained at most 2-6% there, and GLM Maya-XS with 4 of 8 experts invented three.js classes and rambled.
+TURBO_NO_TOPK = ("maya-xs",)
+
+
+def turbo_smallest_quant(cfg: dict) -> bool:
+    """Whether cfg runs one of TURBO_NO_TOPK's quants (the setup's record of the quant, else the pack's folder)."""
+    inst = cfg.get("installer") or {}
+    names = [str(inst.get(k) or "") for k in ("ds4_quant", "quant", "model_dir")]
+    args = cfg.get("args") or []
+    names += [str(args[i + 1]) for i, a in enumerate(args[:-1]) if a in ("--pack", "--glm-pack")]
+    return any(t in n.lower().replace("_", "-") for n in names for t in TURBO_NO_TOPK)
+
+
+def turbo_patch(cfg: dict) -> dict:
+    """The engine settings Turbo changes in `cfg` (only those that differ from what it has now), for apply()."""
+    fam, cur, can = family(cfg), settings_of(cfg), choices(cfg)
+    patch = {}
+    if fam in TURBO_CONTEXT_FAMILIES and (cur.get("context") or 0) > TURBO_CONTEXT:
+        patch["context"] = TURBO_CONTEXT
+    if (cur.get("parallel") or 1) > 1:                 # (one answer at a time is the fastest one)
+        patch["parallel"] = 1
+    want = TURBO_DRAFT.get(fam)
+    if want and want in can["draft"] and cur.get("draft") != want:
+        patch["draft"] = want
+    if fam in TURBO_DSPARK_FAMILIES and (want in can["draft"] or cur.get("draft") == "dspark")             and cur.get("dspark_conf") != TURBO_DSPARK_CONF:
+        patch["dspark_conf"] = TURBO_DSPARK_CONF
+    if fam == "deepseek" and cur.get("prompt_lookup") is False:
+        patch["prompt_lookup"] = True
+    env = TURBO_ENV.get(fam)
+    if env and turbo_smallest_quant(cfg):              # (no expert cap on the 1-2 bit quants: see TURBO_NO_TOPK)
+        env = {k: v for k, v in env.items() if not k.endswith("_RESIDENT_TOPK")}
+    if env and any(cur["env"].get(k) != v for k, v in env.items()):
+        patch["env"] = {**cur["env"], **env}
+    return patch
+
+
+def turbo_on(cfg: dict) -> bool:
+    return isinstance(cfg.get("turbo"), dict)
+
+
+def turbo_info(cfg: dict) -> dict:
+    """What the page needs: whether Turbo is on, and what switching it on would change (before -> after)."""
+    cur = settings_of(cfg)
+    if turbo_on(cfg):
+        return {"on": True, "family": family(cfg), "since": cfg["turbo"].get("since"), "plan": {}}
+    patch = turbo_patch(cfg)
+    return {"on": False, "family": family(cfg),
+            "plan": {k: {"from": cur.get(k), "to": v} for k, v in patch.items() if k != "env"},
+            "env": {k: v for k, v in (patch.get("env") or {}).items() if cur["env"].get(k) != v}}
+
+
+def turbo_enable(path: Path) -> dict:
+    """Turbo on: its settings written into the config at `path`, and the note that undoes them.  "changed": the engine
+    must start again."""
+    cfg = read(path)
+    if not cfg:
+        raise ValueError(f"{Path(path).name}: not a config Maya can read")
+    if turbo_on(cfg):
+        raise ValueError("Turbo is already on")
+    cur, patch = settings_of(cfg), turbo_patch(cfg)
+    new = apply(cfg, patch)
+    new["turbo"] = {"since": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "before": {k: cur.get(k) for k in patch},            # (the settings Turbo changed, as they were)
+                    "args": list(cfg.get("args") or []), "env": cfg.get("env"),   # (and the command and environment whole)
+                    "applied": {"args": list(new.get("args") or []), "env": new.get("env")}}
+    return _commit(path, cfg, new)
+
+
+def turbo_disable(path: Path) -> dict:
+    """Turbo off: the config as it was before.  The command and environment come back whole when nothing else changed
+    them since; if they were changed meanwhile (the context raised, a setting edited), only the settings Turbo changed go
+    back to what they were."""
+    cfg = read(path)
+    if not cfg:
+        raise ValueError(f"{Path(path).name}: not a config Maya can read")
+    note = cfg.get("turbo")
+    if not isinstance(note, dict):
+        raise ValueError("Turbo is not on")
+    applied = note.get("applied") or {}
+    if list(cfg.get("args") or []) == applied.get("args") and cfg.get("env") == applied.get("env"):
+        new = copy.deepcopy(cfg)
+        new["args"] = list(note.get("args") or [])
+        if note.get("env"):
+            new["env"] = note["env"]
+        else:
+            new.pop("env", None)
+    else:
+        new = apply(cfg, dict(note.get("before") or {}))
+    new.pop("turbo", None)
+    return _commit(path, cfg, new)
 
 
 # ------------------------------------------------------------------ deleting a model (the page's Delete)
 # Off the list: its config, its start scripts and what Maya keeps beside it.  With its files: what the setup downloaded
-# for it and the pack Maya built - never a file another model here runs from, nor one outside the models folder the
-# setup downloaded into (a GGUF of your own stays; its pack goes).  Its DFlash2 drafter goes too: another model drafting
-# with the same file drafts with MTP from then on (its --dflash taken out).
+# for it and the pack Maya built - never a file another model here runs from (hard-linked Engram tables, a vision tower
+# or drafter several configs use, a pack built in another model's folder: they stay, and the page says so), nor one
+# outside the models folders the setup downloaded into (a GGUF of your own stays, and a pack built beside it).  Its
+# DFlash2 drafter goes too when no other model drafts with it.
 GGUF_PART = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", re.I)
 
 
@@ -771,11 +925,38 @@ def pack_shards(pack: Path) -> list:
     return [pack.parent / Path(n).name for n in names]   # (by name: nothing outside the pack's folder)
 
 
+def pack_reads(pack: Path) -> list:
+    """The files a DeepSeek or MiniMax pack reads: its tensors.txt's `file <i> <path>` lines (they come first: read up to
+    the first tensor only), each relative to the model_dir its ds4.txt / mm3.txt names - the model's own shards, and
+    what it takes from other folders: the Engram tables of a GGUF set beside it, the DSpark drafter, the vision tower."""
+    model = None
+    for name in ("ds4.txt", "mm3.txt"):
+        try:
+            with open(pack / name, encoding="utf-8", errors="replace") as f:
+                model = next((ln[len("model_dir "):].strip() for ln in f if ln.startswith("model_dir ")), None)
+        except OSError:
+            continue
+        if model:
+            break
+    base = Path(model) if model and Path(model).is_dir() else pack.parent   # (a pack moved since: its own folder's)
+    out = []
+    try:
+        with open(pack / "tensors.txt", encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                w = ln.split()
+                if len(w) < 3 or w[0] != "file":
+                    break
+                out.append(base / w[2])
+    except OSError:
+        pass
+    return out
+
+
 def runs_from(cfg: dict) -> list:
-    """Every path a config runs from: its pack and the model files in it, its drafter, image encoder and tokenizer, and
-    the folder or GGUF its setup named."""
+    """Every path a config runs from: its pack and the model files in it (a DeepSeek or MiniMax pack's from other
+    folders too), its drafter, image encoder and tokenizer, and the folder or GGUF its setup named."""
     pack = pack_of(cfg)
-    found = ([pack] + pack_shards(pack)) if pack else []
+    found = ([pack] + pack_shards(pack) + pack_reads(pack)) if pack else []
     inst = cfg.get("installer") or {}
     found += [Path(inst[k]) for k in ("model_dir", "gguf", "gguf_dir") if isinstance(inst.get(k), str) and inst[k]]
     found += [Path(v) for v in (flag(cfg.get("args") or [], "--dflash"), flag(cfg.get("args") or [], "--mtp"),
@@ -798,64 +979,153 @@ def _size(p: Path) -> int:
                 st = os.lstat(os.path.join(dp, n))
             except OSError:
                 continue
-            total += st.st_size if stat.S_ISREG(st.st_mode) else 0
+            # (a hard link another model's folder also holds - the Engram tables the setup links between folders - frees
+            # nothing when this one goes: the data stays with the last link, so it is not counted)
+            total += st.st_size if stat.S_ISREG(st.st_mode) and st.st_nlink <= 1 else 0
     return total
+
+
+def _linkers(roots: list, p: Path) -> list:
+    """The names of `roots` ([(name, folder)]: other models' folders) under which a symbolic link points into `p`:
+    deleting `p` would leave it dangling (the setup links the Engram tables between model folders when it cannot hard
+    link them)."""
+    seen, out = 0, []
+    for name, r in roots:
+        if name in out or not r.is_dir():
+            continue
+        for dp, dirs, files in os.walk(r):
+            if any(os.path.islink(os.path.join(dp, n)) and _within(_res(os.path.join(dp, n)) or Path(dp, n), p)
+                   for n in dirs + files):
+                out.append(name)
+                break
+            seen += len(dirs) + len(files)
+            if seen > 20000:
+                return out
+    return out
+
+
+def _hard_links(p: Path) -> int:
+    """How many files in `p` (or `p` itself) are hard links another folder holds too: deleting them frees nothing."""
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return 0
+    if not stat.S_ISDIR(st.st_mode):
+        return int(stat.S_ISREG(st.st_mode) and st.st_nlink > 1)
+    n = 0
+    for dp, _, files in os.walk(p):
+        for f in files:
+            try:
+                s = os.lstat(os.path.join(dp, f))
+            except OSError:
+                continue
+            n += int(stat.S_ISREG(s.st_mode) and s.st_nlink > 1)
+    return n
 
 
 def delete_plan(root: Path, path: Path) -> dict:
     """What deleting the config at `path` with its files would delete: {"ok", "why" (when not ok), "items": [{"path",
-    "what" (folder, pack, gguf, vision, drafter), "bytes"}], "bytes", "folder", "gguf" (model files), "pack", "vision",
-    "drafter" (its bytes, or None), "drafter_users" (the other configs drafting with it), "kept" (what stays, said)}."""
+    "what" (folder, pack, gguf, vision, drafter), "bytes", "linked" (hard links in it: they free nothing)}], "bytes",
+    "folder", "gguf" (model files), "pack", "vision", "drafter" (its bytes, or None), "drafter_users" (the other configs
+    drafting with its drafter: it stays then), "shared" (what stays because another model uses it: [{"path", "what",
+    "users" (their configs), "files" (model files, for "gguf")}]), "linked" (hard links in all), "kept" (what else stays,
+    said)}.  Only what is inside a models folder the setup downloaded into (models_dirs: never the folder itself, a drive's
+    root, the project or the home folder), by its real path: a link out of it is never followed."""
     path = Path(path)
     cfg = read(path)
     me = _res(path)
     others = [(p, read(p)) for p in config_paths(root) if _res(p) != me]
-    refs = [r for _, c in others for r in runs_from(c)]
+    refs = [(p.name, runs_from(c)) for p, c in others]
+    # (their folders, and what they run from: a link in one of them into this model's files keeps those)
+    homes = [(p.name, h.parent) for p, h in ((p, _res(pack_of(c))) for p, c in others) if h is not None]
+    homes += [(n, r) for n, rs in refs for r in rs]
     out = {"ok": False, "why": None, "items": [], "bytes": 0, "folder": None, "gguf": 0, "pack": False,
-           "vision": False, "drafter": None, "drafter_users": [], "kept": []}
+           "vision": False, "drafter": None, "drafter_users": [], "shared": [], "linked": 0, "kept": []}
     models = _res((cfg.get("installer") or {}).get("models_dir"))
     pack = _res(pack_of(cfg))
     if models is None or pack is None:
         out["why"] = "Maya's setup did not download this model's files, so it does not know which ones are its own"
+        return out
+    # (the folders the setup downloads into: every config's --models-dir and its own Maya-data/models - never a drive's
+    # root, the home folder or one it is in)
+    home = Path.home().resolve()
+    known = [k for k in [_res((read(p).get("installer") or {}).get("models_dir")) for p in config_paths(root)] +
+             [_res(Path(root).parent / "Maya-data" / "models")]
+             if k is not None and k.is_dir() and k != Path(k.anchor) and not _within(home, k)]
+    if models not in known:
+        out["why"] = f"its models folder {models} is not one Maya downloads into, so Maya deletes nothing in it"
         return out
     folder = pack.parent
     out["folder"] = str(folder)
     project = _res(Path(root))
     items: list = []
 
-    def shared(p: Path) -> bool:                        # (another model runs from it, or from something in it)
-        return any(_within(r, p) for r in refs)
+    def inside(p: Path) -> bool:                        # (in a models folder Maya knows, not the folder itself)
+        return any(_within(p, k) and p != k for k in known) and not (project and _within(project, p))
+
+    def users(p: Path) -> list:                         # (another model runs from it, from something in it, or links to it)
+        names = [n for n, rs in refs if any(_within(r, p) for r in rs)]
+        return names + [n for n in _linkers(homes, p) if n not in names]
+
+    def keep(p: Path, what: str, names: list, files: int = 0):
+        out["shared"].append({"path": str(p), "what": what, "users": names, **({"files": files} if files else {})})
 
     def covered(p: Path) -> bool:
         return any(_within(p, it) for it, _ in items)
 
     def add(p: Path, what: str):
-        if not covered(p) and (p.exists() or p.is_symlink()):
+        if covered(p) or not (p.exists() or p.is_symlink()):
+            return
+        if inside(p):
             items.append((p, what))
+        elif what == "pack":
+            out["kept"].append(f"The pack Maya built in {p} stays: it is outside Maya's models folders, so Maya does "
+                               "not delete it. Delete it by hand if you no longer want it.")
 
     downloaded = _within(folder, models)
-    if (downloaded and folder != models and not shared(folder) and not _within(project, folder)
+    in_folder = users(folder) if downloaded else []
+    if (downloaded and folder != models and not in_folder and not _within(project, folder)
             and not _within(Path.home().resolve(), folder)):
         add(folder, "folder")                           # (its own folder: the files, the pack, the image encoder)
     else:                                               # (a folder other models' files are in too, or your own)
-        if not shared(pack):
+        if in_folder and folder != models:
+            keep(folder, "folder", in_folder)
+        u = users(pack)
+        if u:
+            keep(pack, "pack", u)
+        else:
             add(pack, "pack")
         if downloaded:
+            held: dict = {}
             for f in pack_shards(pack):
-                if not shared(f):
+                u = users(f)
+                if u:
+                    held.setdefault(tuple(u), []).append(f)
+                else:
                     add(f, "gguf")
+            for u, fs in held.items():
+                keep(folder, "gguf", list(u), len(fs))
         else:
-            out["kept"].append(f"Your own model files in {folder} stay; only the pack Maya built from them goes.")
+            out["kept"].insert(0, f"Your own model files in {folder} stay" + ("; only the pack Maya built from them goes."
+                                   if any(it == pack for it, _ in items) else "."))
     for v in map(_res, vision_files(cfg)):
-        if v is not None and _within(v, models) and not shared(v):
-            add(v, "vision")
+        if v is not None and _within(v, models) and not covered(v):
+            u = users(v)
+            if u:
+                keep(v, "vision", u)
+            else:
+                add(v, "vision")
     d = _res(drafter_of(cfg))
     if d is not None and d.is_file() and _within(d, models):
-        out["drafter_users"] = [p.name for p, c in others if _res(flag(c.get("args") or [], "--dflash")) == d]
-        add(d, "drafter")
+        out["drafter_users"] = [n for n in users(d)]
+        if out["drafter_users"]:                        # (another model drafts with it: it stays theirs)
+            keep(d, "drafter", out["drafter_users"])
+        else:
+            add(d, "drafter")
     for p, what in items:
         n = _size(p)
-        out["items"].append({"path": str(p), "what": what, "bytes": n})
+        out["items"].append({"path": str(p), "what": what, "bytes": n, "linked": _hard_links(p)})
+        out["linked"] += out["items"][-1]["linked"]
         out["bytes"] += n
         if what == "drafter":
             out["drafter"] = n
@@ -880,7 +1150,8 @@ def delete_plan(root: Path, path: Path) -> dict:
 def delete(root: Path, path: Path, files: bool = False) -> dict:
     """The config at `path` off the list: it, its start scripts, the settings kept beside it (.prev,
     .shared-settings.json); with `files`, delete_plan's files first (a file that cannot be deleted keeps the config,
-    and says which).  {"deleted", "freed" (bytes), "drafter_users" (now drafting with MTP)}."""
+    and says which).  {"deleted", "freed" (bytes), "drafter_users" (always [] now: a drafter another model drafts with
+    stays)}."""
     path = Path(path)
     freed, users, errors = 0, [], []
     if files:
@@ -900,21 +1171,11 @@ def delete(root: Path, path: Path, files: bool = False) -> dict:
             except OSError as e:
                 errors.append(f"{p} ({e.strerror or e})")
                 continue
-            if it["what"] == "drafter":
+            if it["what"] == "drafter":                 # (only a drafter no other model drafts with: delete_plan)
                 try:
                     p.parent.rmdir()                    # (its folder, when nothing else is in it)
                 except OSError:
                     pass
-                for name in plan["drafter_users"]:      # (another model drafting with it: with MTP from now on)
-                    other = Path(root) / name
-                    cfg = read(other)
-                    if not cfg:
-                        continue
-                    other.with_name(other.name + ".prev").write_text(json.dumps(cfg, indent=1), encoding="utf-8")
-                    st = other.stat()
-                    write(other, {**cfg, "args": drop_flag(cfg.get("args") or [], "--dflash")})
-                    os.utime(other, (st.st_atime, st.st_mtime))
-                    users.append(name)
         if errors:
             raise OSError("could not delete " + "; ".join(errors) + " - the model stays on the list")
     for p in (path, path.with_name(f"run-{path.stem}.sh"), path.with_name(f"run-{path.stem}.bat"),
@@ -931,8 +1192,9 @@ def delete(root: Path, path: Path, files: bool = False) -> dict:
 # version, a quant set up again into another folder.  Only what is in a folder the setup downloaded into: at its top a
 # folder or a file of 100 MB or more (a download's log is not listed), and one level down in a folder another model
 # runs from only a folder with a pack of its own (GLM's quants side by side in GLM-5.3-Flash/: DeepSeek's dspark/ and
-# vision/ beside its GGUF folder are read through the pack, so a folder without one is never taken for unused).  Never
-# a hidden one, the project or the home folder.  Maya may not have downloaded it: the page says what is in it, and
+# vision/ beside its GGUF folder are read through the pack, so a folder without one is never taken for unused).  A
+# folder a pack reads from is used too (pack_reads: a DeepSeek EXL3 quant's Engram tables in the GGUF set's folder,
+# its vision tower in another's).  Never a hidden one, the project or the home folder.  Maya may not have downloaded it: the page says what is in it, and
 # deletes one at a time.
 LEFTOVER_MIN = 10 ** 8
 PACK_MARKS = ("sources.json", "tensors.txt", "mm3.txt", "ds4.txt", "native_experts.txt", "index.txt")

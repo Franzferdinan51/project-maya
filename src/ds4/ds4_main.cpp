@@ -537,6 +537,9 @@ struct Req {
     // logprobs=<k> (0 .. 20; the server's OpenAI logprobs / top_logprobs): after each T line an LP line - the token's
     // logprob and its row's k most likely (ds4_logprobs.hpp); -1: none, the request exactly as without
     int logprobs = -1;
+    // logit_bias=<id>:<bias>,... (OpenAI's logit_bias; the server's ignore_eos bans the end tokens with -100): added to
+    // the logits of every pick of the answer (Model::set_logit_bias); none: the picks exactly as without
+    std::vector<std::pair<int, float>> bias;
 };
 
 // A prompt's picture: where its span starts, its pixels (the server's resize: RGB rows, both sides multiples of the
@@ -669,6 +672,15 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "logprobs") {
             const int n = std::atoi(v.c_str());
             r.logprobs = n < 0 ? -1 : std::min(n, strata::ds4::kTopLogprobs);
+        } else if (k == "logit_bias") {   // <id>:<bias>,... (the server checked them: ids in the vocabulary, -100..100)
+            size_t at = 0;
+            while (at < v.size()) {
+                const size_t end = std::min(v.find(',', at), v.size()), colon = v.find(':', at);
+                if (colon != std::string::npos && colon < end)
+                    r.bias.emplace_back(std::atoi(v.substr(at, colon - at).c_str()),
+                                        std::strtof(v.substr(colon + 1, end - colon - 1).c_str(), nullptr));
+                at = end + 1;
+            }
         }
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
@@ -725,6 +737,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     std::vector<int> eos = parse_ids(eos_list);
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
     std::printf("INFO logprobs=%d\n", strata::ds4::kTopLogprobs);   // (GEN logprobs=<k>: LP lines, k at most this)
+    std::printf("INFO logit_bias=1\n");   // (GEN logit_bias=<id>:<bias>,...: added to the logits of every pick)
     if (m.seq_count() > 1)   // (--parallel: n conversations at once, GEN rid=<id>)
         std::printf("READY %lld stop multi=%d\n", (long long) m.max_context(), m.seq_count());
     else
@@ -738,6 +751,26 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     unsigned long long counter = 0;
     long long log_req = 0;   // (DS4_ROUND_LOG's tags)
     std::vector<Pic> held;   // the pictures the state holds (start, hash, span)
+    // a request that leaves a GPU's state unknown - a layer GPU's context took a fault inside a kernel (an illegal
+    // address, ...), or the prompt path's room was not handed back (Model::broken): its last lines say so, END ahead of
+    // its DONE (the server then takes this engine as ended, and the next request, even one already waiting, starts a
+    // fresh one), and once that DONE is out the engine ends (exit 3, as its watchdog does).  Staying up, it refused
+    // every later request until a restart by hand
+    bool ending = false;
+    const auto end_note = [&m, &ending] {   // (before a request's DONE)
+        if (ending || !m.broken()) return;
+        ending = true;
+        std::printf("END a GPU's state is unknown after this request - the engine ends (exit 3); the next request "
+                    "starts a fresh one\n");
+        std::fprintf(stderr, "maya ds4 serve: a GPU's state is unknown after this request - the engine ends (exit 3) "
+                             "so the server starts it again for the next request\n");
+    };
+    const auto end_if_broken = [&ending] {   // (after it)
+        if (!ending) return;
+        std::fflush(stdout);
+        std::fflush(stderr);
+        std::_Exit(3);   // (not abort(): a core dump of the pinned expert tiers takes minutes)
+    };
     // (DS4_SERVE_DUMP=<prefix>, tests: request i's logits - the prompt's last row, then every decode step's rows - into
     //  <prefix>.<i>.f32, to compare a request's logits byte for byte across processes and histories)
     const char* dump_prefix = std::getenv("DS4_SERVE_DUMP");
@@ -1420,6 +1453,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         e = "a picture's span does not start at an image token of the prompt";
             if (!e.empty()) {
                 std::printf("ERR%s %s\n", tag.c_str(), e.c_str());
+                end_note();
                 std::printf("DONE%s 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", tag.c_str(), r.ids.size());
                 std::fflush(stdout);
                 return false;
@@ -1521,6 +1555,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (!ok) {
             std::fprintf(stderr, "ds4: %s\n", err.c_str());
             std::printf("ERR%s %s\n", tag.c_str(), err.c_str());
+            end_note();
             std::printf("DONE%s 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", tag.c_str(), r.ids.size());
             std::fflush(stdout);
             m.set_images({});
@@ -1705,6 +1740,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             std::fprintf(stderr, "maya ds4 serve: stopped while reading the prompt of %zu tokens, after %.0f ms%s\n",
                          total, now_ms() - t0, back ? "; the conversation before it is kept" : "");
+            end_note();
             std::printf("DONE%s 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", tag.c_str(), total, now_ms() - t0, back ? from : (size_t) 0);
             std::fflush(stdout);
             return false;
@@ -1713,6 +1749,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             m.set_images({});
             std::fprintf(stderr, "ds4: %s\n", err.c_str());
             std::printf("ERR%s %s\n", tag.c_str(), err.c_str());
+            end_note();
             std::printf("DONE%s 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", tag.c_str(), total);
             std::fflush(stdout);
             m.reset();
@@ -1749,8 +1786,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     };
     const bool multi = m.seq_count() > 1;
     while (!multi) {   // one conversation: a request at a time
+        end_if_broken();   // (the last request's DONE is out, on every path that ended it)
         g_busy.store(false);   // (waiting for a request: no watchdog)
         if (!in.next(line) || line == "QUIT") break;
+        static const bool turn_trace = std::getenv("DS4_TURN_TRACE") != nullptr;   // (one line a request: this clock's times)
+        const double tr_got = now_ms();
+        double tr_first = 0;
         beat();
         g_busy.store(true);
         const bool geni = line.rfind("GENI ", 0) == 0;
@@ -1766,6 +1807,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::fflush(stdout);
             continue;
         }
+        const double tr_parsed = now_ms();
         m.begin_request();   // (DISK_SKIP_AUTO: between requests only)
         if (round_log().f != nullptr) round_log().tag = "r" + std::to_string(++log_req);   // (DS4_ROUND_LOG)
         // a request's own seed: its draws from the start of its stream, so the same seed gives the same answer (the
@@ -1794,6 +1836,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         m.set_penalties(r.pen_n < 0 ? INT_MAX : r.pen_n,
                         std::isfinite(r.pen_repeat) && r.pen_repeat > 0.0f ? r.pen_repeat : 1.0f,
                         std::isfinite(r.pen_freq) ? r.pen_freq : 0.0f, std::isfinite(r.pen_present) ? r.pen_present : 0.0f);
+        m.set_logit_bias(r.bias);
         m.set_logprobs(r.logprobs);   // (logprobs=<k>: each token's row, kept as its token is: tok_lp, got_lp)
         int tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
         std::vector<int> got;
@@ -1824,6 +1867,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 break;
             }
             std::printf("T %d\n", tok);
+            if (tr_first == 0) tr_first = now_ms();
             if (r.logprobs >= 0) lp_out(-1, tok, tok_lp);
             beat();
             ++produced;
@@ -1877,7 +1921,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         //  the checkpoint at this prompt's end)
         stat_line();
         const double t2 = now_ms();
+        if (turn_trace)
+            std::fprintf(stderr, "maya ds4 serve: trace got=%.1f parsed=%.1f read_start=%.1f read_end=%.1f first_t=%.1f end=%.1f\n",
+                         tr_got, tr_parsed, t0, t1, tr_first, t2);
         const strata::ds4::Stats& se = m.stats();   // (hits / lookups: the decode's routed experts in VRAM / all)
+        end_note();
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu %lld %lld\n", produced, r.ids.size(), t1 - t0, t2 - t1,
                     finish, d_acc, d_off, from, (long long) ((se.experts - sd.experts) - (se.cpu_experts - sd.cpu_experts)),
                     (long long) (se.experts - sd.experts));
@@ -1960,16 +2008,22 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::vector<std::unique_ptr<Act>> acts;
         std::deque<std::string> waiting;   // GEN lines no conversation is free for yet
         std::deque<Act*> read_line;        // the prompts being read, in turn: a piece each, then to the back
-        const bool read_pieces = [] {
-            const char* v = std::getenv("MAYA_DS4_READ_ORDER");
+        // serve's maya_names.env_in keeps the STRATA_ alias of a config's MAYA_ setting. Accept that alias here too;
+        // reading MAYA_ alone silently restored piece reads for a config that asked for arrival order.
+        const auto read_env = [](const char* name) {
+            if (const char* v = std::getenv(name)) return v;
+            return ds4_env(name + 5);   // (these names all start MAYA_; ds4_env tries STRATA_, then the bare name)
+        };
+        const bool read_pieces = [&] {
+            const char* v = read_env("MAYA_DS4_READ_ORDER");
             return v == nullptr || std::string(v) != "arrival";
         }();
         // MAYA_DS4_READ_PIECE=<chunks>: a piece is that many chunks a pipeline stage (1); MAYA_DS4_READ_ROUNDS=<n>: the
         // running answers write n tokens each (n rounds) between two pieces (1); MAYA_DS4_READ_SHARE=<percent>: instead,
         // they write for that share of the time, their rounds' against the last piece's (a round at least; 0: off)
         constexpr int kReadPieceChunks = 1, kReadRounds = 1, kReadShareMax = 90;
-        const auto env_count = [](const char* name, int dflt) {
-            const char* v = std::getenv(name);
+        const auto env_count = [&](const char* name, int dflt) {
+            const char* v = read_env(name);
             const int x = v != nullptr ? std::atoi(v) : 0;
             return x > 0 ? x : dflt;
         };
@@ -1997,11 +2051,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             held = std::move(held_of[(size_t) s]);
             held_of[(size_t) s].clear();
         };
-        const auto penalties = [&](const Req& r) {
+        const auto penalties = [&](const Req& r) {   // (and its logit_bias: the request's picks, set before each)
             m.set_penalties(r.pen_n < 0 ? INT_MAX : r.pen_n,
                             std::isfinite(r.pen_repeat) && r.pen_repeat > 0.0f ? r.pen_repeat : 1.0f,
                             std::isfinite(r.pen_freq) ? r.pen_freq : 0.0f,
                             std::isfinite(r.pen_present) ? r.pen_present : 0.0f);
+            m.set_logit_bias(r.bias);
         };
         // a request's next token: the thinking budget closes its reasoning (as one conversation's round at the budget)
         const auto close_think = [](const Act& a) {
@@ -2025,6 +2080,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         const auto finish_act = [&](Act& a) {
             const double t2 = now_ms();
             const strata::ds4::Stats& se = m.stats();   // (the engine's over the request's decode, the others' too)
+            end_note();
             std::printf("DONE %lld %lld %zu %.1f %.1f %s %lld %lld %zu %lld %lld\n", a.r.rid, a.produced, a.r.ids.size(),
                         a.t1 - a.P.t0, t2 - a.t1, a.finish, a.d_acc, a.d_off, a.P.from,
                         (long long) ((se.experts - a.sd.experts) - (se.cpu_experts - a.sd.cpu_experts)),
@@ -2126,6 +2182,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             const long long rid = r.rid;
             if (!prompt_begin(r, geni, " " + std::to_string(rid), a->P)) {
                 in.forget(rid);
+                end_if_broken();
                 return;
             }
             a->seq = best;
@@ -2137,6 +2194,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 read_turn(*a, r.ids.size(), false);
                 if (a->ended) {
                     in.forget(rid);
+                    end_if_broken();
                     return;
                 }
             }
@@ -2504,6 +2562,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 else finish_act(*a);
                 freed = true;
             }
+            if (freed) end_if_broken();   // (the other conversations' state is the same GPUs': lost with it)
             if (freed) admit_waiting();
             if (!acts.empty()) {
                 queue_turn();
@@ -2552,11 +2611,18 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         });
         eng.run();
         reader.join();
+        // Each idle sequence still owns its conversation when the parallel scheduler exits.
+        if (slot_max > 0) {
+            for (int s = 0; s < nseq; ++s) {
+                bind(s);
+                slot_put(" as the parallel engine ended");
+            }
+        }
     }
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
     // RAM is written to the folder, so the next run reads on from them
     if (slot_max > 0) {
-        slot_put(" as the engine ended");
+        if (!multi) slot_put(" as the engine ended");
         size_t written = 0;
         while (true) {   // (a write can take the folder's least recently used conversation away: the list is asked again)
             size_t i = SIZE_MAX;
@@ -3689,6 +3755,10 @@ int main(int argc, char** argv) {
     if (parts_check) return check_parts(m, parse_ids(ids_s), std::max(2, n));
     if (marks_check) return check_marks(m, parse_ids(ids_s), std::max(2, n));
     if (!ppl.empty()) {   // --ppl FILE: a line a sequence of ids (BOS + text), each in one forward, tokens 2.. scored
+        // DS4_PPL_STEP=1 (MAYA_DS4_PPL_STEP; tests): each sequence through the decode path instead - a token a step
+        // (Model::step, a one-token forward, as a decoded token's), so a change to decode alone is scored too (decode's
+        // expert placement, DS4_RECENT_FIT); slow (a decoded token's time a token)
+        const bool ppl_step = ds4_env("DS4_PPL_STEP") != nullptr && std::atoi(ds4_env("DS4_PPL_STEP")) != 0;
         std::ifstream in(ppl);
         std::string line;
         double nll = 0.0;
@@ -3700,8 +3770,18 @@ int main(int argc, char** argv) {
             const std::vector<int> seq = parse_ids(line);
             if (seq.size() < 2) continue;
             m.reset();
-            if (!m.feed(seq.data(), (int) seq.size(), (int) seq.size(), err) || !m.logits(lg) ||
-                lg.size() < (seq.size() - 1) * (size_t) V) {
+            bool fed = true;
+            if (ppl_step) {   // (the first token as a one-token read, then a step a token, each row's logits kept)
+                std::vector<float> row;
+                lg.assign((seq.size() - 1) * (size_t) V, 0.0f);
+                for (size_t i = 0; fed && i + 1 < seq.size(); ++i) {
+                    fed = (i == 0 ? m.feed(seq.data(), 1, 1, err) : m.step(seq[i], true, err)) && m.logits(row) &&
+                          row.size() >= (size_t) V;
+                    if (fed) std::copy(row.begin(), row.begin() + V, lg.begin() + (std::ptrdiff_t) (i * (size_t) V));
+                }
+            } else
+                fed = m.feed(seq.data(), (int) seq.size(), (int) seq.size(), err) && m.logits(lg);
+            if (!fed || lg.size() < (seq.size() - 1) * (size_t) V) {
                 std::fprintf(stderr, "maya-ds4: sequence %d: %s\n", k, err.empty() ? "no logits" : err.c_str());
                 return 1;
             }

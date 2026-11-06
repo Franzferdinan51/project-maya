@@ -9,6 +9,7 @@ from pathlib import Path
 import hashlib
 import json
 import re
+import shutil
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -121,7 +122,7 @@ class Quant35(unittest.TestCase):
 
     def test_offered_only_where_exl3_runs(self):
         """--ds4-quant exl3-3.5, or the menu's row - on NVIDIA compute capability 7.0+ (not a PC whose GPUs are all
-        older) and on AMD, marked experimental there (as GLM's EXL3 quants)."""
+        older) and on AMD, unmarked there (as GLM's EXL3 quants; v1.1.53)."""
         self.assertIn("exl3-3.5", maya.DS4_QUANTS)
         def offered(gpus, backend="cuda", tags=None):
             rows = []
@@ -140,15 +141,15 @@ class Quant35(unittest.TestCase):
         self.assertEqual(offered([{"arch": 61}, {"arch": 61}]), [])            # (Pascal: the GGUFs only)
         nv, amd = [], []
         offered([{"arch": 89}], tags=nv)
-        self.assertEqual(len(offered([], backend="hip", tags=amd)), 2)          # (AMD: experimental, v1.1.30)
-        self.assertEqual(amd, ["experimental on AMD"] * 2)
-        self.assertNotIn("experimental on AMD", nv)
+        self.assertEqual(len(offered([], backend="hip", tags=amd)), 2)          # (AMD: since v1.1.30)
+        self.assertEqual(amd, [None] * 2)                                       # (no longer marked: v1.1.53)
+        self.assertEqual(nv, [None] * 2)
         self.assertRegex(offered([{"arch": 89}])[1], r"^DeepSeek V4\.1 · EXL3 3\.5 bpw \(461 GB\)$")
         self.assertEqual(maya.choose_ds4_quant(args(ds4_quant="exl3-3.5"), {}), "exl3-3.5")
 
-    def test_exl3_on_amd_experimental(self):
-        """AMD: the EXL3 quants go on to the AMD PC check with an experimental warning (as GLM's and MiniMax's EXL3
-        there), the GGUFs without one; neither is refused."""
+    def test_exl3_on_amd(self):
+        """AMD: the EXL3 quants and the GGUFs go on to the AMD PC check without a warning (as GLM's and MiniMax's
+        EXL3 there; v1.1.53); neither is refused."""
         def fail(*a, **kw):
             raise AssertionError(f"refused: {a}")
         for gguf in (False, True):
@@ -158,10 +159,7 @@ class Quant35(unittest.TestCase):
                     patch.object(maya, "check_hip_pc", lambda a, **kw: hip.append(kw) or {"backend": "hip"}):
                 self.assertEqual(maya.check_pc(args(backend="hip"), "deepseek", gguf=gguf), {"backend": "hip"})
             self.assertEqual(len(hip), 1)
-            self.assertEqual(len(said), 0 if gguf else 1)
-            if not gguf:
-                self.assertIn("experimental", said[0])
-                self.assertIn("deepseek-maya-s", said[0])
+            self.assertEqual(said, [])
 
     def test_own_folder_and_config(self):
         models = Path("/models")
@@ -637,6 +635,32 @@ class Gguf(unittest.TestCase):
             for n in pair:                                                              # (Maya's own pair is there)
                 man["maya"]["quants"]["Maya-S"]["files"][n] = mk(d / Path(n).name, b"mine" + n.encode())
             self.assertIsNone(maya.ds4_shared_tables("maya-s", d, models, maya.ds4_gguf_model("maya-s")))
+
+    def test_shared_tables_maya_s_after_maya_xs(self):
+        """#776: Maya-S set up where Maya-XS's Q6_K pair is whole (or in Engram-Q6_K) does not download its own pair: it is
+        left out and the XS pair is read, linked; a damaged XS pair shares nothing."""
+        models, man, xs, _, mk = self._tables()
+        spair = man["abliterated"]["engram"]["from"]["Maya-S"]
+        src = models / "DeepSeek-V4.1-Flash-1017-Maya-GGUF" / "Maya-XS"
+        for n in xs:
+            man["maya"]["quants"]["Maya-XS"]["tables"][n] = mk(src / Path(n).name, Path(n).name.encode() * 3)
+        d = models / "DeepSeek-V4.1-Flash-1017-Maya-GGUF" / "Maya-S"
+        d.mkdir(parents=True)
+        real = maya.read_json
+        full = maya.ds4_gguf_model("maya-s")
+        with patch.object(maya, "read_json", lambda p: man if Path(p) == maya.DS4_GGUF_MANIFEST else real(p)), \
+                patch.object(maya, "say", lambda *a: None), patch.object(maya, "ok", lambda *a: None):
+            plan = maya.ds4_shared_tables("maya-s", d, models, full)
+            self.assertEqual(plan["without"], [Path(n).name for n in spair])
+            self.assertEqual(len(plan["model"]["files"]), len(full["files"]) - 2)
+            e = maya.ds4_share_step(plan)
+            self.assertEqual(e, d.parent / "Engram-Q6_K")
+            for n in xs:
+                self.assertEqual((e / Path(n).name).stat().st_ino, (src / Path(n).name).stat().st_ino)
+            shutil.rmtree(src.parent / "Maya-XS")             # (only the shared copy is left: still found)
+            self.assertIsNotNone(maya.ds4_shared_tables("maya-s", d, models, full))
+            (e / Path(xs[0]).name).write_bytes(b"damaged")
+            self.assertIsNone(maya.ds4_shared_tables("maya-s", d, models, full))
 
     def test_every_quant_takes_maya_tables(self):
         """Every unsloth GGUF names its table-only shard (left out: Maya's Q6_K tables are read), Maya-XS's tables are the

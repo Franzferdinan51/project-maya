@@ -8,6 +8,11 @@
 // Between two graphs the host reads the router's top-k, ExpertPool::ensure() maps experts to slots (reading the
 // misses from the SSD), and the slot ids are the next graph's input.  Everything a graph hands to the next one
 // lives in the carry tensors (glm_metal_impl.hpp); everything a token hands to the next lives in LayerState.
+//
+// The cut is only for a pool that can miss.  A pool born holding every expert gives each one a fixed slot
+// (slot_ids), and a pool that grows until it holds every expert can never miss again, so its slot map is
+// latched onto the GPU (arm_slot_tab / table_ids): both run the whole slice as one graph, ids looked up on
+// the GPU, the same ops on the same values as the cut path computes across its two graphs.
 #include "glm_metal_impl.hpp"
 
 #include "ggml-alloc.h"
@@ -37,6 +42,8 @@ constexpr size_t kSparseScoreBytes = (size_t) 256 << 20;   // ggml_sparse_mla ga
 struct Upload {
     ggml_tensor* t;
     std::vector<uint8_t> data;
+    // plan graphs only: re-derives `data` for the position the Impl's pc_* fields describe on a later hit
+    std::function<void(std::vector<uint8_t>&)> regen;
 };
 
 // One graph under construction.
@@ -51,12 +58,27 @@ struct Builder {
     const float* emb = nullptr;   // the slice's token embeddings [n_embd, T] (the MTP cache fill pairs them with rows)
     std::vector<Upload> uploads;
     std::vector<std::pair<std::string, ggml_tensor*>> dumps;
+    bool plan_mode = false;   // build as a decode plan: position-indexed cache writes, regen uploads
 
     ggml_tensor* input(ggml_type type, int64_t ne0, int64_t ne1, const void* data, size_t bytes,
                        int64_t ne2 = 1, int64_t ne3 = 1) {
         ggml_tensor* t = ggml_new_tensor_4d(ctx, type, ne0, ne1, ne2, ne3);
         ggml_set_input(t);
         uploads.push_back({t, std::vector<uint8_t>((const uint8_t*) data, (const uint8_t*) data + bytes)});
+        return t;
+    }
+
+    // an input whose bytes a decode plan re-derives on every hit: regen fills the upload from the Impl's
+    // pc_* fields (the running position and rows); at build time it produces this call's bytes the same way
+    ggml_tensor* input_fn(ggml_type type, int64_t ne0, int64_t ne1,
+                          std::function<void(std::vector<uint8_t>&)> regen, int64_t ne2 = 1, int64_t ne3 = 1) {
+        ggml_tensor* t = ggml_new_tensor_4d(ctx, type, ne0, ne1, ne2, ne3);
+        ggml_set_input(t);
+        Upload u;
+        u.t = t;
+        u.regen = std::move(regen);
+        u.regen(u.data);
+        uploads.push_back(std::move(u));
         return t;
     }
 
@@ -237,15 +259,33 @@ struct Builder {
         const int kv = g.kv_lora, kd = g.idx_key, kp = g.idx_kpool;
         ggml_tensor* kvc = rms(mm(m.wl(il, "attn_kv_a_mqa.weight"), x), m.wl(il, "attn_kv_a_norm.weight"));
         cb(kvc, "kv_cmpr", il);
-        expand(ggml_cpy(ctx, kvc, ggml_view_2d(ctx, s.lat, kv, n, s.lat->nb[1], (size_t) pst * s.lat->nb[1])));
+        // a plan graph writes by row index instead of by a position-baked view, so the one graph stays
+        // exact at every position: the indices are an upload, re-derived from the running position per hit
+        ggml_tensor* rows_idx = nullptr;
+        if (plan_mode) {
+            const int64_t dpst = pst - p0;
+            rows_idx = input_fn(GGML_TYPE_I64, n, 1, [&im = m, dpst, n](std::vector<uint8_t>& d) {
+                d.resize((size_t) n * 8);
+                int64_t* v = (int64_t*) d.data();
+                for (int64_t i = 0; i < n; ++i) v[i] = im.pc_p0 + dpst + i;
+            });
+            ggml_tensor* src = kvc->type == s.lat->type ? kvc : ggml_cast(ctx, kvc, s.lat->type);
+            expand(ggml_set_rows(ctx, (ggml_tensor*) s.lat, src, rows_idx));
+        } else {
+            expand(ggml_cpy(ctx, kvc, ggml_view_2d(ctx, s.lat, kv, n, s.lat->nb[1], (size_t) pst * s.lat->nb[1])));
+        }
         ggml_tensor* ik = ggml_norm(ctx, mm(m.wl(il, "indexer.attn_k.weight"), x), g.norm_eps);
         ik = ggml_add(ctx, ggml_mul(ctx, ik, m.wl(il, "indexer.k_norm.weight")), m.wl(il, "indexer.k_norm.bias"));
         ggml_tensor* ig = mm(m.wl(il, "indexer_compressor_gate.weight"), x);
         cb(ik, "indexer_k", il);
         cb(ig, "indexer_gate", il);
         const size_t cell = s.ikg->nb[1];
-        expand(ggml_cpy(ctx, ik, ggml_view_2d(ctx, s.ikg, kd, n, cell, (size_t) pst * cell)));
-        expand(ggml_cpy(ctx, ig, ggml_view_2d(ctx, s.ikg, kd, n, cell, (size_t) pst * cell + ggml_row_size(GGML_TYPE_F32, kd))));
+        if (plan_mode) {
+            expand(ggml_set_rows(ctx, (ggml_tensor*) s.ikg, ggml_concat(ctx, ik, ig, 0), rows_idx));
+        } else {
+            expand(ggml_cpy(ctx, ik, ggml_view_2d(ctx, s.ikg, kd, n, cell, (size_t) pst * cell)));
+            expand(ggml_cpy(ctx, ig, ggml_view_2d(ctx, s.ikg, kd, n, cell, (size_t) pst * cell + ggml_row_size(GGML_TYPE_F32, kd))));
+        }
         const int64_t pa = pst / kp, pb = (pst + n) / kp;   // pools completed by these positions
         if (pb > pa) {
             const int64_t nn = pb - pa;
@@ -255,8 +295,20 @@ struct Builder {
             ggml_tensor* lg = ggml_cont(ctx, ggml_permute(ctx, ggml_add(ctx, pg, m.wl(il, "indexer_compressor_ape.weight")), 1, 0, 2, 3));
             ggml_tensor* pr = ggml_reshape_3d(ctx, ggml_soft_max(ctx, ggml_reshape_2d(ctx, lg, kp, kd * nn)), kp, kd, nn);
             ggml_tensor* pooled = ggml_sum_rows(ctx, ggml_mul(ctx, pr, ggml_cont(ctx, ggml_permute(ctx, pk, 1, 0, 2, 3))));
-            expand(ggml_cpy(ctx, ggml_reshape_2d(ctx, pooled, kd, nn),
-                            ggml_view_2d(ctx, s.pooled, kd, nn, s.pooled->nb[1], (size_t) pa * s.pooled->nb[1])));
+            if (plan_mode) {
+                // the plan's signature fixes this position outright (a pool-completing write pins p0), so
+                // only the write's own index is re-derived; the rows it reads are this position's by then
+                const int64_t dpst = pst - p0;
+                ggml_tensor* pidx = input_fn(GGML_TYPE_I64, nn, 1, [&im = m, dpst, kp, nn](std::vector<uint8_t>& d) {
+                    d.resize((size_t) nn * 8);
+                    int64_t* v = (int64_t*) d.data();
+                    for (int64_t i = 0; i < nn; ++i) v[i] = (im.pc_p0 + dpst) / kp + i;
+                });
+                expand(ggml_set_rows(ctx, (ggml_tensor*) s.pooled, ggml_cont(ctx, ggml_reshape_2d(ctx, pooled, kd, nn)), pidx));
+            } else {
+                expand(ggml_cpy(ctx, ggml_reshape_2d(ctx, pooled, kd, nn),
+                                ggml_view_2d(ctx, s.pooled, kd, nn, s.pooled->nb[1], (size_t) pa * s.pooled->nb[1])));
+            }
         }
     }
 
@@ -320,9 +372,44 @@ struct Builder {
         for (int c0 = 0; c0 < T; c0 += chunk) {
             const int tc = std::min(chunk, T - c0);
             // host-known parts of the selection: the tail cells, the null cell, the live/dead mask
+            std::vector<float> pmask;   // only when some token of the chunk cannot see every pool yet
+            ggml_tensor *tail_t, *mask_t;
+            if (plan_mode) {
+                // one token, so the tail and the mask are pure functions of the position: re-derive per hit
+                // (a chunk of a T=1 graph never straddles a pool boundary short of its own token, so no pmask)
+                auto fill = [&im = m, n_fill, n_sel, n_top, n_tail, kp](std::vector<int32_t>& tl,
+                                                                        std::vector<float>& mk) {
+                    const int64_t p = im.pc_p0;
+                    const int64_t nv = (p + 1) / kp;                 // pools whose last member is <= p
+                    const int64_t live_pools = std::min(nv, n_top);
+                    const int64_t null_cell = im.n_ctx;
+                    mk.assign((size_t) n_sel, -INFINITY);
+                    for (int64_t i = 0; i < live_pools * kp; ++i) mk[(size_t) i] = 0.0f;
+                    const int64_t tail_n = n_tail > 0 ? (p + 1) - nv * kp : 0;
+                    tl.assign((size_t) n_fill, (int32_t) null_cell);
+                    for (int64_t i = 0; i < n_tail; ++i) {
+                        tl[(size_t) i] = (int32_t) (i < tail_n ? nv * kp + i : null_cell);
+                        if (i < tail_n) mk[(size_t) (kp * n_top + i)] = 0.0f;
+                    }
+                    if (live_pools == 0 && tail_n == 0) mk[(size_t) (kp * n_top + n_tail)] = 0.0f;
+                };
+                tail_t = input_fn(GGML_TYPE_I32, n_fill, 1, [fill](std::vector<uint8_t>& d) {
+                    std::vector<int32_t> tl;
+                    std::vector<float> mk;
+                    fill(tl, mk);
+                    d.resize(tl.size() * 4);
+                    std::memcpy(d.data(), tl.data(), d.size());
+                });
+                mask_t = input_fn(GGML_TYPE_F32, n_sel, 1, [fill](std::vector<uint8_t>& d) {
+                    std::vector<int32_t> tl;
+                    std::vector<float> mk;
+                    fill(tl, mk);
+                    d.resize(mk.size() * 4);
+                    std::memcpy(d.data(), mk.data(), d.size());
+                }, 1, 1);
+            } else {
             std::vector<int32_t> tail((size_t) n_fill * tc);
             std::vector<float> mask((size_t) n_sel * tc, -INFINITY);
-            std::vector<float> pmask;   // only when some token of the chunk cannot see every pool yet
             if (n_pool > 0 && (p0 + c0 + 1) / kp < n_pool) pmask.assign((size_t) n_pool * tc, 0.0f);
             const int64_t null_cell = m.n_ctx;
             for (int t = 0; t < tc; ++t) {
@@ -342,8 +429,9 @@ struct Builder {
                 if (!pmask.empty())
                     for (int64_t q2 = nv; q2 < n_pool; ++q2) pmask[(size_t) n_pool * t + (size_t) q2] = -INFINITY;
             }
-            ggml_tensor* tail_t = input(GGML_TYPE_I32, n_fill, tc, tail.data(), tail.size() * 4);
-            ggml_tensor* mask_t = input(GGML_TYPE_F32, n_sel, 1, mask.data(), mask.size() * 4, 1, tc);
+            tail_t = input(GGML_TYPE_I32, n_fill, tc, tail.data(), tail.size() * 4);
+            mask_t = input(GGML_TYPE_F32, n_sel, 1, mask.data(), mask.size() * 4, 1, tc);
+            }
 
             ggml_tensor* idx = tail_t;
             if (n_top > 0) {
@@ -449,8 +537,13 @@ struct Builder {
         }
         ggml_tensor *top, *wts, *sh;
         route(il, x, &top, &wts, &sh);
-        if (m.pool.all_resident()) {   // every expert has its fixed slot: the lookup is on the GPU, no cut
-            ggml_tensor* out = experts_out(il, slot_ids(il, top), x, wts, sh);
+        // every expert resident - born that way (fixed slots) or grown there (the slot map latched on the
+        // GPU): either way the lookup is on the GPU and the layer finishes here, no cut
+        ggml_tensor* ids = m.pool.all_resident() ? slot_ids(il, top)
+                           : m.slot_tab_live   ? table_ids(il, top)
+                                               : nullptr;
+        if (ids) {
+            ggml_tensor* out = experts_out(il, ids, x, wts, sh);
             R = hc_post(out, R, post, comb);
             cb(R, "l_out", il);
             return R;
@@ -497,6 +590,14 @@ struct Builder {
     ggml_tensor* slot_ids(int il, ggml_tensor* top) {
         ggml_tensor* f = ggml_scale_bias(ctx, ggml_cast(ctx, top, GGML_TYPE_F32), 1.0f, (float) m.pool.slot_base(il));
         return ggml_cast(ctx, f, GGML_TYPE_I32);
+    }
+
+    // a pool that grew to hold every expert: expert e's slot is slot_tab[e, il], latched on the GPU by
+    // arm_slot_tab() (the map cannot move again - a miss is impossible), gathered here on the GPU
+    ggml_tensor* table_ids(int il, ggml_tensor* top) {
+        ggml_tensor* tab = ggml_view_1d(ctx, m.slot_tab, g.n_expert, (size_t) il * m.slot_tab->nb[1]);
+        ggml_tensor* ids = ggml_get_rows(ctx, tab, ggml_reshape_1d(ctx, top, (int64_t) g.n_expert_used * T));
+        return ggml_reshape_2d(ctx, ids, g.n_expert_used, T);
     }
 
     // the routed experts (ids: their slots) weighted by w, plus the shared expert's sh
@@ -555,11 +656,23 @@ struct Builder {
             const bool prev = p0 > 0 && m.hx_pos == p0 - 1;
             const int64_t nf = T - 1 + (prev ? 1 : 0);
             if (nf > 0) {
-                ggml_tensor* e = input(GGML_TYPE_F32, g.n_embd, T, emb, sizeof(float) * (size_t) g.n_embd * T);
+                ggml_tensor* e = plan_mode
+                    ? input_fn(GGML_TYPE_F32, g.n_embd, T, [&im = m, TT = T, NE = g.n_embd](std::vector<uint8_t>& d) {
+                          d.resize(sizeof(float) * (size_t) NE * TT);
+                          std::memcpy(d.data(), im.pc_emb, d.size());
+                      })
+                    : input(GGML_TYPE_F32, g.n_embd, T, emb, sizeof(float) * (size_t) g.n_embd * T);
                 ggml_tensor* hs = T > 1 ? ggml_view_2d(ctx, h, g.n_embd, T - 1, h->nb[1], 0) : nullptr;
                 if (prev) {
-                    ggml_tensor* hp = input(GGML_TYPE_F32, g.n_embd, 1, m.hid_host.data() + (size_t) m.hx_col * g.n_embd,
-                                            sizeof(float) * (size_t) g.n_embd);
+                    ggml_tensor* hp = plan_mode
+                        ? input_fn(GGML_TYPE_F32, g.n_embd, 1, [&im = m](std::vector<uint8_t>& d) {
+                              d.resize(sizeof(float) * (size_t) im.g.n_embd);
+                              const size_t off = (size_t) im.hx_col * im.g.n_embd;
+                              if (off + im.g.n_embd <= im.hid_host.size())
+                                  std::memcpy(d.data(), im.hid_host.data() + off, d.size());
+                          })
+                        : input(GGML_TYPE_F32, g.n_embd, 1, m.hid_host.data() + (size_t) m.hx_col * g.n_embd,
+                                sizeof(float) * (size_t) g.n_embd);
                     hs = hs ? ggml_concat(ctx, hp, hs, 1) : hp;
                 } else {
                     e = ggml_view_2d(ctx, e, g.n_embd, T - 1, e->nb[1], e->nb[1]);
@@ -591,23 +704,138 @@ size_t GlmMetal::Impl::graph_size(int T) const {
            moe * (((size_t) T + kFloatGroup - 1) / kFloatGroup) * kGroupTensors;
 }
 
+bool GlmMetal::Impl::arm_slot_tab() {
+    if (slot_tab_live) return true;
+    if (!pool.fully_resident()) {
+        if (std::getenv("MAYA_METAL_POOL_DEBUG"))
+            std::fprintf(stderr, "slot_tab: the pool holds %d of %d experts, the map is not final yet\n",
+                         pool.resident_pairs(), pool.pairs());
+        return false;
+    }
+    const int held = (int) ls.size();
+    std::vector<int32_t> tab((size_t) g.n_expert * (size_t) held, 0);
+    for (int l = 0; l < held; ++l) {
+        const std::vector<int>& map = pool.slot_map(l);
+        if (map.size() != (size_t) g.n_expert) continue;   // no routed experts: this row is never gathered
+        for (int e = 0; e < g.n_expert; ++e) tab[(size_t) l * (size_t) g.n_expert + (size_t) e] = map[(size_t) e];
+    }
+    ggml_backend_tensor_set(slot_tab, tab.data(), 0, tab.size() * sizeof(int32_t));
+    slot_tab_live = true;
+    plans_invalidate();   // the table path has a different graph than the id path: no plan survives the latch
+    if (std::getenv("MAYA_METAL_POOL_DEBUG"))
+        std::fprintf(stderr, "slot_tab: the pool holds every expert, the slot map is latched on the GPU\n");
+    return true;
+}
+
+ggml_backend_sched_t GlmMetal::Impl::make_sched() {
+    std::vector<ggml_backend_t> be;
+    if (gpu) be.push_back(gpu);
+    be.push_back(cpu);
+    return ggml_backend_sched_new(be.data(), nullptr, (int) be.size(),
+                                  graph_size(std::max(o.n_ubatch, o.max_window)), false, false);
+}
+
+void GlmMetal::Impl::plan_free(DecodePlan& p) {
+    if (p.ctx) ggml_free(p.ctx);
+    if (p.sched) ggml_backend_sched_free(p.sched);
+    p = DecodePlan{};
+}
+
+void GlmMetal::Impl::plans_invalidate() {
+    plan_free(trunk_plan);
+    plan_free(mtp_plan);
+}
+
+// everything structural about the trunk slice at `at`: the pool branch, the pool count its DSA layers see,
+// whether its own write completes a pool, and the NextN fill the head performs off the row before
+GlmMetal::Impl::PlanSig GlmMetal::Impl::trunk_sig(int branch, int64_t at) const {
+    PlanSig s;
+    s.branch = branch;
+    const int64_t kp = g.idx_kpool;
+    s.n_pool = (at + 1) / kp;
+    s.pool_write = (at + 1) % kp == 0;
+    if (g.mtp && at > 0 && hx_pos == at - 1) {
+        s.fill = 1;
+        s.fill_pool_write = at % kp == 0;
+    }
+    return s;
+}
+
+// a kept plan serves the slice: re-derive the uploads for this position, compute, read back as run_slice does
+bool GlmMetal::Impl::plan_hit_trunk(std::vector<float>& logits, std::string& err) {
+    DecodePlan& p = trunk_plan;
+    const auto th = std::chrono::steady_clock::now();
+    for (auto& u : p.uploads) {
+        u.regen(u.data);
+        ggml_backend_tensor_set(u.t, u.data.data(), 0, u.data.size());
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    st.host_seconds += std::chrono::duration<double>(t0 - th).count();
+    ++st.graphs;
+    if (ggml_backend_sched_graph_compute(p.sched, p.gf) != GGML_STATUS_SUCCESS) {
+        plans_invalidate();
+        err = "the compute graph failed";
+        return false;
+    }
+    st.gpu_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    hid_rows = p.hid_rows;
+    hid_host.resize((size_t) g.n_embd * hid_rows);
+    ggml_backend_tensor_get(hid, hid_host.data(), 0, hid_host.size() * sizeof(float));
+    hx_pos = pos;
+    hx_col = hid_rows - 1;
+    logits.resize((size_t) g.n_vocab);
+    ggml_backend_tensor_get(p.out, logits.data(), 0, logits.size() * 4);
+    return !df || dflash_inject(pos, 1, err);
+}
+
 bool GlmMetal::Impl::run_slice(const int32_t* tok, int T, std::vector<float>& logits, std::string& err, bool window) {
+    arm_slot_tab();
     std::vector<float> emb;
     if (!embed(tok, T, emb, err)) return false;
+    pc_p0 = pos;
+    pc_emb = emb.data();
+    // the decode plan: a resident T=1 slice is one graph whose uploads are functions of the position alone
+    const int branch = pool.all_resident() ? 1 : (slot_tab_live ? 2 : 0);
+    PlanSig sig;
+    bool plan_try = false;
+    if (plan_cache_on && !window && T == 1 && branch != 0 && o.dump_dir.empty()) {
+        sig = trunk_sig(branch, pos);
+        if (trunk_plan.valid && trunk_plan.sig == sig) return plan_hit_trunk(logits, err);
+        plan_try = true;
+    }
     const size_t nodes = graph_size(T);
     const size_t mem = ggml_tensor_overhead() * nodes + ggml_graph_overhead_custom(nodes, false);
     if (arena.size() < mem) arena.resize(mem);
     std::vector<int32_t> slots;
+    ggml_context* plan_ctx = nullptr;         // the plan candidate's keep-alive pieces, adopted on success
+    ggml_backend_sched_t plan_sched = nullptr;
+    std::vector<uint8_t> plan_arena;
     int moe = -1;   // the MoE layer whose experts open the next graph
     for (;;) {
         const auto th = std::chrono::steady_clock::now();
-        ggml_init_params ip{mem, arena.data(), true};
-        ggml_context* ctx = ggml_init(ip);
+        const bool plan_built = plan_try && moe < 0;
+        ggml_context* ctx;
+        if (plan_built) {
+            if (plan_arena.size() < mem) plan_arena.resize(mem);
+            ggml_init_params pip{mem, plan_arena.data(), true};
+            ctx = ggml_init(pip);
+            plan_ctx = ctx;
+            if (!plan_sched) plan_sched = make_sched();
+        } else {
+            ggml_init_params ip{mem, arena.data(), true};
+            ctx = ggml_init(ip);
+        }
         Builder b{*this, g, ctx, ggml_new_graph_custom(ctx, nodes, false), T, pos, window, emb.data(), {}, {}};
+        b.plan_mode = plan_built;
         ggml_tensor* R;
         int il;
         if (moe < 0) {
-            ggml_tensor* x = b.input(GGML_TYPE_F32, g.n_embd, T, emb.data(), emb.size() * 4);
+            ggml_tensor* x = plan_built
+                ? b.input_fn(GGML_TYPE_F32, g.n_embd, 1, [&im = *this](std::vector<uint8_t>& d) {
+                      d.resize((size_t) im.g.n_embd * 4);
+                      std::memcpy(d.data(), im.pc_emb, d.size());
+                  })
+                : b.input(GGML_TYPE_F32, g.n_embd, T, emb.data(), emb.size() * 4);
             R = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, x, g.n_embd, 1, T), g.n_embd, g.hc, T, 1);
             b.cb(R, "hc_init", -1);
             il = 0;
@@ -623,17 +851,22 @@ bool GlmMetal::Impl::run_slice(const int32_t* tok, int T, std::vector<float>& lo
         }
         ggml_tensor* out = sel ? nullptr : b.head(R);
 
-        ggml_backend_sched_reset(sched);
-        if (!ggml_backend_sched_alloc_graph(sched, b.gf)) {
+        ggml_backend_sched_t sc = plan_built ? plan_sched : sched;
+        ggml_backend_sched_reset(sc);
+        if (!ggml_backend_sched_alloc_graph(sc, b.gf)) {
+            if (plan_built) {
+                ggml_backend_sched_free(plan_sched);
+                plan_sched = nullptr;
+            }
             ggml_free(ctx);
             err = "cannot allocate the compute graph";
             return false;
         }
         if (gpu && std::getenv("MAYA_METAL_SPLITS")) {   // which nodes did not land on the GPU (debug)
-            std::fprintf(stderr, "graph: %d nodes, %d splits\n", ggml_graph_n_nodes(b.gf), ggml_backend_sched_get_n_splits(sched));
+            std::fprintf(stderr, "graph: %d nodes, %d splits\n", ggml_graph_n_nodes(b.gf), ggml_backend_sched_get_n_splits(sc));
             for (int i = 0; i < ggml_graph_n_nodes(b.gf); ++i) {
                 ggml_tensor* t = ggml_graph_node(b.gf, i);
-                if (ggml_backend_sched_get_tensor_backend(sched, t) != gpu)
+                if (ggml_backend_sched_get_tensor_backend(sc, t) != gpu)
                     std::fprintf(stderr, "  cpu: %s %s %s [%lld %lld %lld %lld]\n", ggml_op_desc(t), ggml_type_name(t->type),
                                  t->src[0] ? ggml_type_name(t->src[0]->type) : "-", (long long) t->ne[0], (long long) t->ne[1],
                                  (long long) t->ne[2], (long long) t->ne[3]);
@@ -643,7 +876,11 @@ bool GlmMetal::Impl::run_slice(const int32_t* tok, int T, std::vector<float>& lo
         const auto t0 = std::chrono::steady_clock::now();
         st.host_seconds += std::chrono::duration<double>(t0 - th).count();
         ++st.graphs;
-            if (ggml_backend_sched_graph_compute(sched, b.gf) != GGML_STATUS_SUCCESS) {
+            if (ggml_backend_sched_graph_compute(sc, b.gf) != GGML_STATUS_SUCCESS) {
+            if (plan_built) {
+                ggml_backend_sched_free(plan_sched);
+                plan_sched = nullptr;
+            }
             ggml_free(ctx);
             err = "the compute graph failed";
             return false;
@@ -672,12 +909,45 @@ bool GlmMetal::Impl::run_slice(const int32_t* tok, int T, std::vector<float>& lo
             hx_col = hid_rows - 1;
             logits.resize((size_t) g.n_vocab * (window ? T : 1));
             ggml_backend_tensor_get(out, logits.data(), 0, logits.size() * 4);
-            ggml_free(ctx);
+            if (plan_built) {
+                // adopt the candidate as the trunk plan - unless an upload cannot be re-derived (a plain
+                // input() slipped into a plan graph), in which case it serves this call and dies with it
+                bool ok = true;
+                for (const Upload& u : b.uploads)
+                    if (!u.regen) {
+                        ok = false;
+                        break;
+                    }
+                if (ok) {
+                    plan_free(trunk_plan);
+                    trunk_plan.ctx = plan_ctx;
+                    trunk_plan.gf = b.gf;
+                    trunk_plan.sched = plan_sched;
+                    trunk_plan.arena = std::move(plan_arena);
+                    for (Upload& u : b.uploads)
+                        trunk_plan.uploads.push_back({u.t, std::move(u.data), std::move(u.regen)});
+                    trunk_plan.out = out;
+                    trunk_plan.hid_rows = hid_rows;
+                    trunk_plan.sig = sig;
+                    trunk_plan.valid = true;
+                    plan_ctx = nullptr;
+                    plan_sched = nullptr;
+                } else {
+                    ggml_backend_sched_free(plan_sched);
+                    plan_sched = nullptr;
+                }
+            }
+            if (!plan_built || plan_ctx) ggml_free(ctx);
             // (after the reads: the drafter's graph takes the compute buffer the logits sit in)
             return !df || dflash_inject(pos, T, err);
         }
         std::vector<int32_t> experts((size_t) g.n_expert_used * T);
         ggml_backend_tensor_get(sel, experts.data(), 0, experts.size() * 4);
+        if (plan_built) {   // a resident pool never cuts; if one did, the candidate dies with the graph
+            ggml_backend_sched_free(plan_sched);
+            plan_sched = nullptr;
+            plan_try = false;
+        }
         ggml_free(ctx);
         moe = il;
         slots.resize(experts.size());
@@ -688,7 +958,9 @@ bool GlmMetal::Impl::run_slice(const int32_t* tok, int T, std::vector<float>& lo
 // ---------------------------------------------------------------- public API
 
 GlmMetal::GlmMetal() : p_(new Impl) {}
-GlmMetal::~GlmMetal() = default;
+GlmMetal::~GlmMetal() {
+    if (p_) p_->plans_invalidate();   // the plans' contexts and schedulers die before the Impl does
+}
 
 void GlmMetal::set_options(const GlmOptions& o) { p_->o = o; }
 
@@ -699,6 +971,7 @@ bool GlmMetal::load(const std::string& path, int64_t max_ctx, std::string& err) 
         return false;
     }
     m.n_ctx = max_ctx;
+    if (const char* pc = std::getenv("MAYA_GLM_PLAN_CACHE")) m.plan_cache_on = std::strcmp(pc, "0") != 0;
     if (!m.open_files(path, err) || !m.read_geometry(err) || !m.init_backends(err) || !m.load_weights(err) ||
         !m.init_state(err) || (!m.o.dflash.empty() && !m.load_dflash(err)) || !m.init_experts(err))
         return false;
@@ -808,28 +1081,85 @@ bool GlmMetal::mtp_step(int32_t token, int64_t pos, bool from_trunk, int32_t& dr
         err = "no MTP input for position " + std::to_string(pos);
         return false;
     }
+    m.arm_slot_tab();
     std::vector<float> e;
     if (!m.embed_raw(&token, 1, e, err)) return false;
     const std::vector<float> h = from_trunk ? std::vector<float>(m.hid_host.begin() + (long) m.hx_col * g.n_embd,
                                                                  m.hid_host.begin() + (long) (m.hx_col + 1) * g.n_embd)
                                             : m.mtp_hx;
+    m.pc_p0 = pos;
+    m.pc_e = e.data();
+    m.pc_h = h.data();
+    // the MTP plan: part 0 over a resident pool is the same position-shaped graph every step
+    Impl::PlanSig msig;
+    bool mtp_try = false;
+    {
+        const int branch = m.pool.all_resident() ? 1 : (m.slot_tab_live ? 2 : 0);
+        if (m.plan_cache_on && branch != 0 && m.o.dump_dir.empty()) {
+            msig.branch = branch;
+            msig.n_pool = (pos + 1) / g.idx_kpool;
+            msig.pool_write = (pos + 1) % g.idx_kpool == 0;
+            if (m.mtp_plan.valid && m.mtp_plan.sig == msig) {
+                Impl::DecodePlan& p = m.mtp_plan;
+                for (auto& u : p.uploads) {
+                    u.regen(u.data);
+                    ggml_backend_tensor_set(u.t, u.data.data(), 0, u.data.size());
+                }
+                if (ggml_backend_sched_graph_compute(p.sched, p.gf) != GGML_STATUS_SUCCESS) {
+                    m.plans_invalidate();
+                    err = "the compute graph failed";
+                    return false;
+                }
+                m.mtp_hx.resize((size_t) g.n_embd);
+                ggml_backend_tensor_get(p.aux, m.mtp_hx.data(), 0, m.mtp_hx.size() * sizeof(float));
+                ggml_backend_tensor_get(p.out, &draft, 0, sizeof(int32_t));
+                return true;
+            }
+            mtp_try = true;
+        }
+    }
     const size_t mem = ggml_tensor_overhead() * kGraphNodes + ggml_graph_overhead_custom(kGraphNodes, false);
     if (m.arena.size() < mem) m.arena.resize(mem);
     std::vector<int32_t> slots;
+    ggml_context* cand_ctx = nullptr;         // the part-0 plan candidate's keep-alive pieces
+    ggml_backend_sched_t cand_sched = nullptr;
+    std::vector<uint8_t> cand_arena;
     for (int part = 0; part < 2; ++part) {
-        ggml_init_params ip{mem, m.arena.data(), true};
-        ggml_context* ctx = ggml_init(ip);
+        const bool cand = mtp_try && part == 0;
+        ggml_context* ctx;
+        if (cand) {
+            if (cand_arena.size() < mem) cand_arena.resize(mem);
+            ggml_init_params cip{mem, cand_arena.data(), true};
+            ctx = ggml_init(cip);
+            cand_ctx = ctx;
+            cand_sched = m.make_sched();
+        } else {
+            ggml_init_params ip{mem, m.arena.data(), true};
+            ctx = ggml_init(ip);
+        }
         Builder b{m, g, ctx, ggml_new_graph_custom(ctx, kGraphNodes, false), 1, pos, false, e.data(), {}, {}};
+        b.plan_mode = cand;
         ggml_tensor *x, *out = nullptr, *top = nullptr;
         if (part == 0) {   // the attention half, the router
-            x = b.mtp_in(b.input(GGML_TYPE_F32, g.n_embd, 1, e.data(), e.size() * 4),
-                         b.input(GGML_TYPE_F32, g.n_embd, 1, h.data(), h.size() * 4));
+            x = cand ? b.mtp_in(b.input_fn(GGML_TYPE_F32, g.n_embd, 1, [&im = m](std::vector<uint8_t>& d) {
+                                    d.resize((size_t) im.g.n_embd * 4);
+                                    std::memcpy(d.data(), im.pc_e, d.size());
+                                }),
+                                b.input_fn(GGML_TYPE_F32, g.n_embd, 1, [&im = m](std::vector<uint8_t>& d) {
+                                    d.resize((size_t) im.g.n_embd * 4);
+                                    std::memcpy(d.data(), im.pc_h, d.size());
+                                }))
+                     : b.mtp_in(b.input(GGML_TYPE_F32, g.n_embd, 1, e.data(), e.size() * 4),
+                                b.input(GGML_TYPE_F32, g.n_embd, 1, h.data(), h.size() * 4));
             x = ggml_add(ctx, x, b.dsa(il, b.rms(x, m.wl(il, "attn_norm.weight"))));
             ggml_tensor* f = b.rms(x, m.wl(il, "ffn_norm.weight"));
             ggml_tensor *wts, *sh;
             b.route(il, f, &top, &wts, &sh);
-            if (m.pool.all_resident()) {
-                out = ggml_add(ctx, x, b.experts_out(il, b.slot_ids(il, top), f, wts, sh));
+            ggml_tensor* ids = m.pool.all_resident() ? b.slot_ids(il, top)
+                               : m.slot_tab_live   ? b.table_ids(il, top)
+                                                   : nullptr;
+            if (ids) {
+                out = ggml_add(ctx, x, b.experts_out(il, ids, f, wts, sh));
             } else {
                 b.expand(ggml_cpy(ctx, f, b.cols(m.c_x, 1)));
                 b.expand(ggml_cpy(ctx, wts, b.cols3(m.c_w, 1)));
@@ -854,7 +1184,21 @@ bool GlmMetal::mtp_step(int32_t token, int64_t pos, bool from_trunk, int32_t& dr
         }
         std::vector<std::pair<ggml_tensor*, std::vector<uint8_t>>> up;
         for (Upload& u : b.uploads) up.push_back({u.t, std::move(u.data)});
-        if (!m.compute(b.gf, up, err)) {
+        if (cand) {   // the candidate computes on its own scheduler, the one it will keep
+            ggml_backend_sched_reset(cand_sched);
+            bool okc = ggml_backend_sched_alloc_graph(cand_sched, b.gf);
+            if (okc) {
+                for (const auto& [t, data] : up) ggml_backend_tensor_set(t, data.data(), 0, data.size());
+                okc = ggml_backend_sched_graph_compute(cand_sched, b.gf) == GGML_STATUS_SUCCESS;
+            }
+            if (!okc) {
+                ggml_backend_sched_free(cand_sched);
+                cand_sched = nullptr;
+                ggml_free(ctx);
+                err = "the compute graph failed";
+                return false;
+            }
+        } else if (!m.compute(b.gf, up, err)) {
             ggml_free(ctx);
             return false;
         }
@@ -862,11 +1206,41 @@ bool GlmMetal::mtp_step(int32_t token, int64_t pos, bool from_trunk, int32_t& dr
             m.mtp_hx.resize((size_t) g.n_embd);
             ggml_backend_tensor_get(hx, m.mtp_hx.data(), 0, m.mtp_hx.size() * sizeof(float));
             ggml_backend_tensor_get(arg, &draft, 0, sizeof(int32_t));
-            ggml_free(ctx);
+            bool keep = false;
+            if (cand) {   // adopt the candidate as the MTP plan, unless an upload cannot be re-derived
+                bool ok = true;
+                for (const Upload& u : b.uploads)
+                    if (!u.regen) {
+                        ok = false;
+                        break;
+                    }
+                if (ok) {
+                    m.plan_free(m.mtp_plan);
+                    m.mtp_plan.ctx = cand_ctx;
+                    m.mtp_plan.gf = b.gf;
+                    m.mtp_plan.sched = cand_sched;
+                    m.mtp_plan.arena = std::move(cand_arena);
+                    for (Upload& u : b.uploads) m.mtp_plan.uploads.push_back({u.t, {}, std::move(u.regen)});
+                    m.mtp_plan.out = arg;
+                    m.mtp_plan.aux = hx;
+                    m.mtp_plan.sig = msig;
+                    m.mtp_plan.valid = true;
+                    cand_sched = nullptr;
+                    keep = true;
+                } else {
+                    ggml_backend_sched_free(cand_sched);
+                    cand_sched = nullptr;
+                }
+            }
+            if (!keep) ggml_free(ctx);
             return true;
         }
         std::vector<int32_t> ex((size_t) g.n_expert_used);
         ggml_backend_tensor_get(top, ex.data(), 0, ex.size() * sizeof(int32_t));
+        if (cand) {   // a resident pool never cuts; if one did, the candidate dies with the graph
+            ggml_backend_sched_free(cand_sched);
+            cand_sched = nullptr;
+        }
         ggml_free(ctx);
         slots.resize(ex.size());
         if (!m.pool.ensure(il, ex.data(), ex.size(), slots.data(), err)) return false;
@@ -904,8 +1278,10 @@ void GlmMetal::set_image_rows(std::vector<int64_t> pos, std::vector<float> rows)
 
 void GlmMetal::reset() {
     Impl& m = *p_;
+    m.plans_invalidate();
     m.pos = 0;
     m.snap_pos = -1;
+    m.snap_slots.clear();
     m.win_T = 0;
     m.hx_pos = -1;
     m.dflash_forget(0);
@@ -935,6 +1311,7 @@ void GlmMetal::snapshot_save() {
 bool GlmMetal::snapshot_restore() {
     Impl& m = *p_;
     if (m.snap_pos < 0) return false;
+    m.plans_invalidate();
     for (const LayerState& s : m.ls)
         if (s.conv) {
             ggml_backend_tensor_copy(s.conv_snap, s.conv);
@@ -950,6 +1327,78 @@ bool GlmMetal::snapshot_restore() {
 }
 
 int64_t GlmMetal::snapshot_position() const { return p_->snap_pos; }
+
+// Restore points: the recurrent state is the only state a position does not imply (the MLA latent and
+// indexer caches are indexed by position), so a slot is that state copied to the host - conv then ssm of
+// every KDA layer, in layer order - plus the position and the hidden row snapshot_save() keeps.
+namespace {
+constexpr int kMaxSnapSlots = 64;
+}
+
+bool GlmMetal::snapshot_save_slot(int slot) {
+    Impl& m = *p_;
+    if (slot < 0 || slot >= kMaxSnapSlots) return false;
+    if ((int) m.snap_slots.size() <= slot) m.snap_slots.resize((size_t) slot + 1);
+    Impl::SnapSlot& s = m.snap_slots[(size_t) slot];
+    size_t bytes = 0;
+    for (const LayerState& l : m.ls)
+        if (l.conv) bytes += ggml_nbytes(l.conv) + ggml_nbytes(l.ssm);
+    s.state.resize(bytes);
+    size_t at = 0;
+    for (const LayerState& l : m.ls)
+        if (l.conv) {
+            ggml_backend_tensor_get(l.conv, s.state.data() + at, 0, ggml_nbytes(l.conv));
+            at += ggml_nbytes(l.conv);
+            ggml_backend_tensor_get(l.ssm, s.state.data() + at, 0, ggml_nbytes(l.ssm));
+            at += ggml_nbytes(l.ssm);
+        }
+    s.pos = m.pos;
+    s.hx_pos = m.hx_pos;
+    s.hid.clear();
+    if (m.hx_pos >= 0)
+        s.hid.assign(m.hid_host.begin() + (long) m.hx_col * m.g.n_embd,
+                     m.hid_host.begin() + (long) (m.hx_col + 1) * m.g.n_embd);
+    return true;
+}
+
+bool GlmMetal::snapshot_restore_slot(int slot) {
+    Impl& m = *p_;
+    if (slot < 0 || slot >= (int) m.snap_slots.size()) return false;
+    m.plans_invalidate();
+    const Impl::SnapSlot& s = m.snap_slots[(size_t) slot];
+    if (s.pos < 0) return false;
+    size_t bytes = 0;
+    for (const LayerState& l : m.ls)
+        if (l.conv) bytes += ggml_nbytes(l.conv) + ggml_nbytes(l.ssm);
+    if (s.state.size() != bytes) return false;   // the geometry changed under the slot: not this model's state
+    size_t at = 0;
+    for (const LayerState& l : m.ls)
+        if (l.conv) {
+            ggml_backend_tensor_set(l.conv, s.state.data() + at, 0, ggml_nbytes(l.conv));
+            at += ggml_nbytes(l.conv);
+            ggml_backend_tensor_set(l.ssm, s.state.data() + at, 0, ggml_nbytes(l.ssm));
+            at += ggml_nbytes(l.ssm);
+        }
+    m.pos = s.pos;
+    m.hx_pos = s.hx_pos;
+    m.hx_col = 0;
+    m.dflash_forget(m.pos);
+    m.hid_host = s.hid;
+    m.win_T = 0;
+    return true;
+}
+
+int64_t GlmMetal::snapshot_position_slot(int slot) const {
+    const Impl& m = *p_;
+    if (slot < 0 || slot >= (int) m.snap_slots.size()) return -1;
+    return m.snap_slots[(size_t) slot].pos;
+}
+
+void GlmMetal::snapshot_drop_slot(int slot) {
+    Impl& m = *p_;
+    if (slot < 0 || slot >= (int) m.snap_slots.size()) return;
+    m.snap_slots[(size_t) slot] = Impl::SnapSlot{};
+}
 
 size_t GlmMetal::grow_pool() {
     Impl& m = *p_;

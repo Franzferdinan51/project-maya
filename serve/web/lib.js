@@ -2,6 +2,8 @@
 // settings, IndexedDB for the chats), the server's address and key, the clipboard and file downloads.
 
 export const SPRITE = "web/sprite.svg";
+// where Maya can be supported (GitHub Sponsors): a heart by the model's name, beside an update, and on About - never a popup
+export const SUPPORT_URL = "https://github.com/sponsors/mw00";
 
 export const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 export const fmt = (n, d = 0) => (n == null || Number.isNaN(n) ? "–"
@@ -79,7 +81,7 @@ export async function api(path, {method = "GET", body, signal} = {}) {
                                body: body === undefined ? undefined : JSON.stringify(body)});
   if (!r.ok) {
     let msg = `HTTP ${r.status}`;
-    try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
+    try { const e = (await r.json()).error; msg = (e && e.message) || (typeof e === "string" && e) || msg; } catch (e) { /* not json */ }
     if (r.status === 401) msg = "This server needs its API key: add it in Settings › Connect your tools.";
     const err = new Error(msg);
     err.status = r.status;
