@@ -268,6 +268,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(ds4_ablate_test tests/ds4_ablate_test.cpp)
   target_link_libraries(ds4_ablate_test PRIVATE strata_artifact)
   add_test(NAME ds4_ablate_test COMMAND ds4_ablate_test)
+  # ... and maya-mm3's, which takes a control vector only
+  add_executable(mm3_ablate_test tests/mm3_ablate_test.cpp)
+  target_link_libraries(mm3_ablate_test PRIVATE strata_artifact)
+  add_test(NAME mm3_ablate_test COMMAND mm3_ablate_test)
   # maya-ds4's trunk expert placement (src/ds4/ds4_place.hpp): the shipped profile on the 2.25bpw EXL3 pack's experts
   # gives the slots and statics a real load printed, the functions match the engine's own code, and DS4_RECENT_FIT=1 /
   # 2 keep a recent slot in every layer of 3 or more slots within the budget (host code only, no model, no GPU)
@@ -776,7 +780,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(ds4_multi_attn_test PRIVATE ${_strata_gpu_include_directories} include)
     target_link_libraries(ds4_multi_attn_test PRIVATE ${_strata_gpu_runtime_target})
     # DS4_INDEX_TC: the indexer's scores on the tensor cores (RDNA 3: WMMAs) against the CUDA cores' kernel, and their
-    # times (needs a GPU, no model; built by name, run with DS4_INDEX_TC=1)
+    # times (needs a GPU, no model; built by name, run with DS4_INDEX_TC=1 - on CUDA it is opt-in, on RDNA 3 the default)
     add_executable(ds4_index_score_tc EXCLUDE_FROM_ALL tests/ds4_index_score_tc.cu src/ds4/ds4_kernels.cu
                                       src/ds4/ds4_host_ar.cpp)
     target_include_directories(ds4_index_score_tc PRIVATE ${_strata_gpu_include_directories} include src/ds4)
@@ -1558,7 +1562,7 @@ if(STRATA_NATIVE_EXPERTS)
     if(_strata_mmq_glu)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_GLU=1)
     endif()
-    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k)   # q8_0: the drafter's matrices (E-9); iq1_s, k-quants: GLM experts (docs/QUANT-PLAN.md)
+    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k q5_0)   # q8_0: the drafter's matrices (E-9); iq1_s, k-quants: GLM experts (docs/QUANT-PLAN.md)
       target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
     endforeach()
     target_include_directories(strata_mmq PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq}
@@ -1600,7 +1604,7 @@ if(STRATA_NATIVE_EXPERTS)
       "${_strata_mmq}/quantize.cu"
       "${_strata_mmq}/convert.cu")
     target_compile_definitions(strata_engine PRIVATE STRATA_HIP_PREFILL_FUSED=1)
-    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k)
+    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k q5_0)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
     endforeach()
     set_source_files_properties(${_strata_mmq_sources} PROPERTIES LANGUAGE HIP)

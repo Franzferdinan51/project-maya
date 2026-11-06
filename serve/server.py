@@ -2100,7 +2100,8 @@ class ByteTokenizer:
 
 # ------------------------------------------------------------------------------------------------ core
 def prompt_memo_on() -> bool:
-    return os.environ.get("MAYA_PROMPT_MEMO", "") not in ("", "0")
+    """On unless MAYA_PROMPT_MEMO=0 (v1.1.55: the same token ids, a long agent turn prepared faster)."""
+    return os.environ.get("MAYA_PROMPT_MEMO", "1") != "0"
 
 
 TURN_TRACE = os.environ.get("MAYA_TURN_TRACE", "") not in ("", "0")
@@ -3516,7 +3517,7 @@ class Service:
             keep = self._keep_suffix(tools, kwargs)
             if keep is not None:                     # (+ what the model said before: stops_short's `seen`)
                 given["_blocked"] = {**(given["_blocked"] or {}), "_keep": keep + (loop_guard.said_before(asked),)}
-        ids = self.render_ids(messages, tools, kwargs, prefill)
+        ids = self._as_written(self.render_ids(messages, tools, kwargs, prefill))   # (Qwen3.x: the model's own ids)
         self.embeddings.path = None
         media = media_of(messages)
         images = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
@@ -3811,6 +3812,102 @@ class Service:
                 smp["_think_soft"] = max(1, smp["_think_soft"] - len(produced))
         return smp
 
+    def _closed_as_rendered(self, ids, produced, think_end):
+        """The tokens the engine goes on from when the SERVER closes the thinking (its budget at a sentence's end):
+        `produced` (all reasoning; the prompt ends in the open <think>\\n) + think_end - written for a Qwen3.x template
+        as that template renders the turn in the next request's history, `<think>\\n` + reasoning.strip() +
+        `\\n</think>\\n\\n` + the answer.  The bare close (`...end.</think>`) read back as other text there, so the
+        next message read the whole answer again.  Only the reasoning's trailing whitespace is written anew (the
+        tokens before it stay the engine's, so it goes on from its session or a checkpoint just before); what the
+        client got is not changed (the template strips the reasoning's outer whitespace).  None: as before (another
+        template, or a prompt / reasoning this does not apply to)."""
+        if not getattr(self.template, "qwen", False) or not produced:
+            return None
+        tok = self.tok
+        nl, open_ = tok.encode("\n"), tok.encode("<think>", parse_special=True)
+        if len(nl) != 1 or len(open_) != 1 or len(ids) < 2 or list(ids[-2:]) != [open_[0], nl[0]]:
+            return None
+        if any(t in self._special_ids() for t in produced):
+            return None
+        try:
+            raw = b"".join(tok.token_bytes(t) for t in produced)
+            text = raw.decode("utf-8")
+        except (UnicodeDecodeError, AttributeError, KeyError, IndexError):
+            return None
+        body = text.strip()
+        if not body or text[0].isspace():   # (leading whitespace: the next render starts the reasoning otherwise)
+            return None
+        want = body.encode("utf-8")
+        c, have = len(produced), len(raw)
+        while c > 0 and have > len(want):     # the tokens past the reasoning's last non-blank character go ...
+            c -= 1
+            have -= len(tok.token_bytes(produced[c]))
+        while c > 0:                          # ... and one split inside a character too
+            try:
+                rest = want[have:].decode("utf-8")
+                break
+            except UnicodeDecodeError:
+                c -= 1
+                have -= len(tok.token_bytes(produced[c]))
+        else:
+            rest = body
+        return list(produced[:c]) + tok.encode(rest + "\n") + [think_end] + tok.encode("\n\n")
+
+    def _special_ids(self) -> set:
+        """The vocabulary's control / user-defined tokens (<|im_end|>, </think>, ...)."""
+        sp = getattr(self, "_special_id_set", None)
+        if sp is None:
+            types = getattr(self.tok, "token_types", None) or []
+            sp = self._special_id_set = {i for i, t in enumerate(types) if t in (3, 4)}
+        return sp
+
+    def _note_written(self, ids, produced, emb) -> None:
+        """A finished answer's tokens as the engine read and wrote them (prompt + answer up to its end-of-turn token),
+        for _as_written: Qwen3.x templates, text prompts, answers that ended at a stop token.  The last 4 kept."""
+        if not getattr(self.template, "qwen", False) or emb or not produced or produced[-1] not in self.stop_ids or \
+                not hasattr(self.tok, "token_bytes"):
+            return
+        seq = list(ids) + list(produced)
+        kept = [w for w in (getattr(self, "_written", None) or []) if w[1] != seq]
+        self._written = [(len(ids), seq)] + kept[:3]
+
+    def _as_written(self, new: list[int]) -> list[int]:
+        """THE HISTORY IN THE MODEL'S OWN TOKENS.  A model does not always write the ids its tokenizer would give its
+        text (`\\n -(` written as `\\n `+`-(`, ...), so the next request's history - the same text, tokenized again -
+        left the session at the first such spot and the engine read the rest of the answer again (an ISO-8601 parser's
+        thinking: 2,055 of 2,134 tokens).  Where the new prompt holds a remembered answer's text byte for byte (and
+        the same special tokens), the engine's ids go in its place - the text the model reads is unchanged.  Qwen3.x
+        templates only (_note_written).  Anything unexpected: the prompt as rendered (never a failed request)."""
+        try:
+            return self._as_written_ids(new)
+        except Exception as e:  # noqa: BLE001
+            print(f"[maya] the history's own ids were not used ({type(e).__name__}: {e})", flush=True)
+            return new
+
+    def _as_written_ids(self, new: list[int]) -> list[int]:
+        for plen, seq in getattr(self, "_written", None) or []:
+            m = min(len(new), len(seq))
+            k = 0
+            while k < m and new[k] == seq[k]:
+                k += 1
+            if k == len(seq):
+                return new                    # (it goes on from all of it already)
+            if k < plen:
+                continue                      # (it left that conversation before the answer: not this one)
+            tb = self.tok.token_bytes
+            want = b"".join(tb(t) for t in seq[k:])
+            got, j = 0, k
+            while j < len(new) and got < len(want):
+                got += len(tb(new[j]))
+                j += 1
+            if got != len(want) or b"".join(tb(t) for t in new[k:j]) != want:
+                continue
+            sp = self._special_ids()
+            if [t for t in seq[k:] if t in sp] != [t for t in new[k:j] if t in sp]:
+                continue
+            return seq + new[j:]
+        return new
+
     def _loop_guard_on(self, sampling) -> bool:
         """The loop guard for this request: its own "loop_guard" when it sends one, else the server's."""
         own = (sampling or {}).get("loop_guard")
@@ -3959,6 +4056,8 @@ class Service:
             act, got, closed = None, 0, False           # the loop guard's action; this call's tokens; a soft close
             try:
                 for t in gen:
+                    if t is not None and t in self.stop_ids:   # (the caller may stop reading right at it)
+                        self._note_written(ids, produced + [t], emb)   # (Qwen3.x: the next history in these ids)
                     if guard is None:
                         yield t
                     elif t is None:
@@ -4004,14 +4103,19 @@ class Service:
                 if fresh is not None and fresh is not last0:
                     segments.append(fresh)
             if closed:                                  # the budget, at a sentence's or line's end: the thinking ends
-                produced.append(think_end)
+                later = len(produced) - soft
+                canon = self._closed_as_rendered(ids, produced, think_end)
+                if canon is not None:                   # (the engine goes on from a checkpoint inside the answer)
+                    produced[:] = canon
+                else:
+                    produced.append(think_end)
                 sent = len(produced)
                 soft_text = None
                 yield think_end
                 if guard is not None:
                     guard.thinking_closed(produced)
                 print(f"[maya] thinking reached its budget ({soft} tokens): closed at the end of a sentence or line, "
-                      f"{len(produced) - 1 - soft} tokens later; answering", flush=True)
+                      f"{later} tokens later; answering", flush=True)
                 if cancel.is_set() or self.stopping:
                     break
                 cur, left = list(ids) + produced, max_new - len(produced)
@@ -4859,39 +4963,36 @@ class StreamJob:
     """A web-app answer that outlives its connection (the request's `strata_resume`): a thread runs its chunks into
     `items` and any reader streams them from an index (GET /v1/strata/stream?id=&from=), so a phone whose screen
     sleeps mid-answer reconnects and carries on instead of losing it.  Only POST /v1/strata/cancel (the app's Stop)
-    cancels it - a dropped connection does not."""
-
-    ORPHAN_S = 300   # a running answer nobody has read for this long (the page was closed) is cancelled
+    cancels it - a dropped connection, or nobody reading it for hours, does not: it runs to its end, and the page
+    takes the whole of it up whenever it comes back (JOBS keeps it for a day after it ends)."""
 
     def __init__(self, jid: str, chunks, cancel: threading.Event):
         self.id, self.cancel = jid, cancel
         self.items: list = []
         self.done, self.ended = False, None
-        self.readers, self.unread_since = 0, time.time()
+        self.readers = 0
         self.cv = threading.Condition()
+        self.log, self.flushed = job_file(jid), time.time()   # its chunks on disk too: a restart keeps the answer
         threading.Thread(target=self._run, args=(chunks,), daemon=True, name="strata-job").start()
-        threading.Thread(target=self._watch, daemon=True, name="strata-job-watch").start()
+
+    @classmethod
+    def restored(cls, jid: str, items: list, ended: float) -> "StreamJob":
+        """An answer read back from its file after a restart: complete, nothing runs."""
+        job = cls.__new__(cls)
+        job.id, job.cancel, job.items = jid, threading.Event(), items
+        job.done, job.ended, job.readers, job.cv = True, ended, 0, threading.Condition()
+        job.log = None
+        return job
 
     def reader(self, on: bool):
         with self.cv:
             self.readers += 1 if on else -1
-            if self.readers == 0:
-                self.unread_since = time.time()
-
-    def _watch(self):
-        while not self.done:
-            time.sleep(5)
-            with self.cv:
-                orphan = not self.done and self.readers == 0 and time.time() - self.unread_since > self.ORPHAN_S
-            if orphan:
-                print(f"[maya] nobody read answer {self.id} for {self.ORPHAN_S} s: stopped", flush=True)
-                self.cancel.set()
-                return
 
     def _add(self, c):
         with self.cv:
             self.items.append(c)
             self.cv.notify_all()
+        self._log(c)
 
     def _run(self, chunks):
         try:
@@ -4906,6 +5007,24 @@ class StreamJob:
             with self.cv:
                 self.done, self.ended = True, time.time()
                 self.cv.notify_all()
+            self._log({"_done": self.ended}, close=True)
+
+    def _log(self, c, close: bool = False):
+        """One chunk to the answer's file (flushed every 2 s and at the end); a disk that fails only stops the file."""
+        if self.log is None:
+            return
+        try:
+            self.log.write(json.dumps(c, ensure_ascii=False) + "\n")
+            if close or time.time() - self.flushed > 2:
+                self.log.flush()
+                self.flushed = time.time()
+            if close:
+                self.log.close()
+                self.log = None
+        except (OSError, ValueError, TypeError):
+            with contextlib.suppress(OSError, ValueError):
+                self.log.close()
+            self.log = None
 
     def wait(self, n: int, timeout: float):
         """The items from index n (waiting up to `timeout` for one) and whether the answer is complete."""
@@ -4919,18 +5038,81 @@ JOBS: dict[str, StreamJob] = {}
 JOBS_LOCK = threading.Lock()
 
 
+JOB_KEEP_S = 86400   # a finished web-app answer stays this long for a page that comes back to it (a phone, next day)
+JOB_KEEP_N = 32      # and at most this many finished ones (the oldest go first; a running one is never dropped)
+
+
+JOBS_DIR: Path | None = None   # the answers' files (answers/ beside the config); None: in RAM only
+JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,80}")
+RESTARTED = "Maya restarted before this answer ended; this is what it had written."
+
+
+def job_file(jid: str):
+    """A new answer's file, open for appending (None without a folder, or if it cannot be opened)."""
+    if JOBS_DIR is None or not JOB_ID.fullmatch(jid):
+        return None
+    try:
+        return open(JOBS_DIR / f"{jid}.jsonl", "w", encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _jobs_forget(jid: str) -> None:
+    JOBS.pop(jid, None)
+    if JOBS_DIR is not None and JOB_ID.fullmatch(jid):
+        with contextlib.suppress(OSError):
+            (JOBS_DIR / f"{jid}.jsonl").unlink()
+
+
+def jobs_load(folder: Path) -> int:
+    """The answers of the last day back from their files after a (re)start, so a page that comes back to one still
+    gets it; one that was running when the server stopped ends with a note saying so.  Older files are deleted."""
+    global JOBS_DIR
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return 0
+    JOBS_DIR, now, found = folder, time.time(), []
+    for f in folder.glob("*.jsonl"):
+        try:
+            mtime = f.stat().st_mtime
+            if now - mtime > JOB_KEEP_S or not JOB_ID.fullmatch(f.stem):
+                f.unlink()
+                continue
+            items, ended = [], None
+            for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    c = json.loads(line)
+                except ValueError:
+                    break                                  # (a line cut by the stop)
+                if isinstance(c, dict) and "_done" in c:
+                    ended = c["_done"]
+                    break
+                items.append(c)
+            if ended is None:
+                items.append({"error": {"type": "server_error", "message": RESTARTED}})
+                ended = mtime
+            found.append(StreamJob.restored(f.stem, items, float(ended)))
+        except (OSError, ValueError, TypeError):
+            continue
+    with JOBS_LOCK:
+        for job in sorted(found, key=lambda j: j.ended)[-JOB_KEEP_N:]:
+            JOBS[job.id] = job
+        for job in sorted(found, key=lambda j: j.ended)[:-JOB_KEEP_N]:
+            _jobs_forget(job.id)
+    return min(len(found), JOB_KEEP_N)
+
+
 def jobs_put(job: StreamJob) -> None:
-    """Keeps the live answers and the finished ones of the last 15 minutes (at most 8)."""
+    """Keeps the running answers and the finished ones of the last day (at most JOB_KEEP_N).  A running answer is
+    never cancelled here: only the page's Stop ends one early."""
     with JOBS_LOCK:
         now = time.time()
-        for j in JOBS.values():                    # a new answer: one still running with nobody reading it goes
-            if not j.done and j.readers == 0:
-                j.cancel.set()
-        for k in [k for k, j in JOBS.items() if j.done and now - (j.ended or now) > 900]:
-            del JOBS[k]
-        while len(JOBS) >= 8:
-            old = min(JOBS.values(), key=lambda j: (not j.done, j.ended or now))
-            del JOBS[old.id]
+        for k in [k for k, j in JOBS.items() if j.done and now - (j.ended or now) > JOB_KEEP_S]:
+            _jobs_forget(k)
+        done = sorted((j for j in JOBS.values() if j.done), key=lambda j: j.ended or now)
+        while done and len(done) >= JOB_KEEP_N:
+            _jobs_forget(done.pop(0).id)
         JOBS[job.id] = job
 
 
@@ -5762,7 +5944,10 @@ def make_handler(svc: Service):
                                  "max_text_file": text_file_limit(svc.engine.max_context),
                                  "model_label": svc.model_label,   # (the model first: "GLM-5.3 · Maya-S24")
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key), "defaults": rec,
-                                 "version": MAYA_VERSION, "mcp_tools": bool(svc.mcp), "unloaded": svc.unloaded})
+                                 "version": MAYA_VERSION, "mcp_tools": bool(svc.mcp), "unloaded": svc.unloaded,
+                                 # the web chat sends past answers' thinking back (a Qwen3.x template keeps it): the
+                                 # history then reads as the model wrote it, and the next turn goes on from there
+                                 "history_thinking": bool(getattr(svc.template, "keeps_thinking", False))})
             elif path == "/api/context":
                 # the dashboard's Context size: the range, the measured cost of the current size, a reload's state
                 if self._authorized():
@@ -6320,7 +6505,8 @@ def make_handler(svc: Service):
             q = parse_qs(urlsplit(self.path).query)
             job = JOBS.get(q.get("id", [""])[0])
             if job is None:
-                self._json(404, {"error": {"message": "no such answer (finished more than 15 minutes ago?)"}})
+                self._json(404, {"error": {"message": "no such answer (finished more than a day ago, or the server "
+                                                      "restarted since)"}})
                 return
             try:
                 start = max(0, int(q.get("from", ["0"])[0]))
@@ -6955,12 +7141,18 @@ def main() -> int:
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     svc.backend = cfg.get("backend")                    # the Monitor's GPU reader: sysfs on AMD/HIP, NVML otherwise
+    if cfg.get("backend") == "hip":                      # (Windows: the Monitor finds the engine's cards with its hipInfo)
+        from serve import telemetry
+        telemetry.HIP_BIN_DIRS = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     svc.model_label = maya_quants.config_label(cfg)     # (configs of every release: by their installer record)
     if a.config:
         svc.config_path = str(Path(a.config).resolve())  # a context change from the dashboard is saved there
         p = Path(svc.config_path)                        # the tokens it serves, and what its API would have charged
         svc.savings = savings.Ledger(savings.ledger_path(p), p.name, svc.model, models.quant_label(cfg, p))
         threading.Thread(target=svc.finish_delete, daemon=True).start()   # (the model before, if the page deleted it)
+        kept = jobs_load(p.parent / "answers")          # the web chat's answers of the last day survive a restart
+        if kept:
+            print(f"[maya] {kept} web-chat answer(s) of the last day kept for the page (answers/)", flush=True)
     args = [str(x) for x in cfg.get("args") or []]
     flag = next((f for f in ("--glm-pack", "--gguf") if f in args[:-1]), None)   # (Metal: the first GGUF file, no pack)
     if flag:                                            # the model's folder: the parent of the pack or GGUF file

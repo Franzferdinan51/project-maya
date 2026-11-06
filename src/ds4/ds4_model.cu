@@ -724,6 +724,7 @@ struct Chunk {
     int ring_n = 0;
     cudaStream_t cs = nullptr;
     cudaEvent_t filled[kParts] = {}, freed[kParts] = {};
+    bool spec_said = false;   // (the log's line once: the ring's first batches before a layer's routing, run_dev_chunks)
     // in place (file_experts): each streamed expert's file region read into pinned staging (ring_n slots of
     // stage_stride bytes, a part's slots free again once its `filled` copies are done) by the readers, in parallel,
     // and DMA'd from there - a copy from the files' pages goes through the driver's staging, one thread at ~1.3 GB/s
@@ -5212,8 +5213,8 @@ struct Model::Impl {
         const size_t qb = (slab_mb != nullptr ? (size_t) std::max(1, std::atoi(slab_mb)) : auto_mb) << 20;
         c.A = std::max(64, (int) (qb / (size_t) HQ) / 64 * 64);
         c.AI = std::max(32, std::min(128, (int) (((size_t) 64 << 20) / (((size_t) o.max_context + 64) * 4)) / 32 * 32));
-        // (DS4_AI_RUN=1: room for a run's own rows; unset or 0: the context's rows, the same buffers and expert placement as before)
-        static const bool ai_run = std::getenv("DS4_AI_RUN") != nullptr && std::atoi(std::getenv("DS4_AI_RUN")) != 0;
+        // (DS4_AI_RUN, on unless 0 since v1.1.55: room for a run's own rows; 0: the context's rows, the buffers and expert placement of before)
+        static const bool ai_run = [] { const char* e = std::getenv("DS4_AI_RUN"); return e == nullptr || *e == 0 || std::atoi(e) != 0; }();
         c.AIM = ai_run ? std::max(c.AI, 128) : c.AI;
         c.w16_elems = (w16_mb != nullptr ? (size_t) std::max(1, std::atoi(w16_mb)) : 2 * auto_mb) << 19;
     }
@@ -5409,7 +5410,12 @@ struct Model::Impl {
                 c.ring_stride = stride;
                 if (rm == nullptr || rm[0] == '\0') {
                     const double link = link_h2d(d);
-                    c.ring_n = ring_slots(link, stride, room, Chunk::kParts);
+                    // (the one-a-batch rule only under 8 GB/s; MAYA_DS4_RING_FAST_LINK=0: on any link, as before)
+                    static const bool fast_link = [] {
+                        const char* v = ds4_env("DS4_RING_FAST_LINK");
+                        return v == nullptr || std::atoi(v) != 0;
+                    }();
+                    c.ring_n = ring_slots(link, stride, room, Chunk::kParts, fast_link ? kRingSlowBps : 1e300);
                     std::fprintf(stderr, "ds4: CUDA%d prompt ring: %d slots of %.1f MB, %d a batch (%.0f MB) for its "
                                          "%.1f GB/s link (DS4_RING_MB sets it)\n",
                                  d.id, c.ring_n, stride / 1048576.0, c.ring_n / Chunk::kParts,
@@ -5740,6 +5746,10 @@ struct Model::Impl {
         int routed_layer = -1, routed_chunk = -1;
         std::vector<char> skip_k;   // chunk k's streams only its picks (skip_unpicked_rows)
         bool skips(int k) const { return k >= 0 && (size_t) k < skip_k.size() && skip_k[(size_t) k]; }
+        // chunk k skips only because the ring is shallow (its rows are more than skip_unpicked_rows): a layer's first
+        // batches are copied whole before its routing is known, as far as the ring reaches (copy_ahead)
+        std::vector<char> spec_k;
+        bool spec(int k) const { return k >= 0 && (size_t) k < spec_k.size() && spec_k[(size_t) k]; }
         std::vector<int> routed_bounds;
         size_t skipped = 0, copied = 0;
     };
@@ -5842,13 +5852,19 @@ struct Model::Impl {
     // much ahead: run_dev_chunks).  An RTX 3090 + eight RTX 5060 Ti, EXL3 3.5
     // bpw, two thirds of the experts on the CPU lane, one chunk of 530 tokens: 4.6-4.9 s -> 3.7-3.8 s, 1,040: about
     // the same, 2,050: 6.0-6.3 -> 6.7 s.  CUDA: chunks up to DS4_SKIP_UNPICKED_ROWS (1536); DS4_SKIP_UNPICKED=1 every
-    // chunk, 0 none (HIP: none unless DS4_SKIP_UNPICKED=1, as before)
+    // chunk, 0 none.  HIP: every chunk where the CPU lane's experts are read in place from the model's files (their
+    // reads, not the wait for a layer's routing, set the pace there: a Radeon 8065S, EXL3 2.9 bpw with 3,942 of 15,744
+    // experts read from the SSD, chunks of 8192 - a chunk streamed all 51 GB of them, picking ~1,100: 5-7 GB now, a 2K
+    // prompt 53.8 -> 210.0 tok/s, 8K 171.7 -> 330.1), else none, as before (kSkipFiles: run_dev_chunks decides).
+    // DS4_SKIP_UNPICKED=alt (tests, one GPU): off and on by turns, a run each - the same logits both ways
+    static constexpr int kSkipFiles = -1;
     static int skip_unpicked_rows() {
         static const int n = [] {
             const char* v = std::getenv("DS4_SKIP_UNPICKED");
+            if (v != nullptr && std::strcmp(v, "alt") == 0) return INT_MIN;
             if (v != nullptr) return std::atoi(v) != 0 ? INT_MAX : 0;
 #if defined(STRATA_USE_HIP)
-            return 0;
+            return kSkipFiles;
 #else
             const char* r = std::getenv("DS4_SKIP_UNPICKED_ROWS");
             return r != nullptr ? std::max(0, std::atoi(r)) : 1536;
@@ -5862,8 +5878,12 @@ struct Model::Impl {
             const Batch& bt = S.b[S.cp];
             // Wait for this layer's routing rather than staging every expert
             // speculatively. Copies still overlap compute within the layer.
+            // (a chunk that skips only for the shallow ring, S.spec: the batches the ring has room for go out whole
+            //  before the routing - the link busy through the layer's attention and routing instead of idle; once the
+            //  routing is known the rest skip their unpicked experts. The same slots, batches and sums: an expert no
+            //  row picked adds nothing, copied or not)
             const bool skip_unpicked = S.skips(bt.k);
-            if (skip_unpicked && (bt.il != S.routed_layer || bt.k != S.routed_chunk)) break;
+            if (skip_unpicked && (bt.il != S.routed_layer || bt.k != S.routed_chunk) && !S.spec(bt.k)) break;
             const int half = (int) (S.cp % P);
             const Layer& l0 = L[(size_t) bt.il];
             // Preserve the original virtual slots, batches and accumulation order.
@@ -6911,11 +6931,46 @@ struct Model::Impl {
         return true;
     }
 
+    // DS4_DRAFT_DEV unset: the DSpark blocks of a tensor-parallel drafter group spread over its members (as evenly as
+    // the blocks go, the lead the fewest) where the GPUs cannot hold every expert - on the lead alone they took its
+    // room, and since a group's members hold the same trunk experts the other members' room went unused (3x V100,
+    // EXL3 2.9 bpw, tensor parallel 2 + one GPU, 3 blocks: 7.3 GB idle on member 1; 0,1,1 read 2K / 8K / 32K prompts
+    // +4 / +2 / +3% faster, decode the same).  It moves which experts are in VRAM, and an EXL3 pack's sums follow that:
+    // the answers can move slightly, the quality vs the full-precision model the same (KLD within noise).  Where every
+    // expert fits, or MAYA_DS4_DRAFT_SPREAD=0: on the lead, as before
+    bool draft_spread() {
+        if (g.n_mtp < 2 || ds4_env("DS4_DRAFT_GPU") != nullptr) return true;
+        if (const char* s = ds4_env("DS4_DRAFT_SPREAD"); s != nullptr && std::atoi(s) == 0) return true;
+        const Group& G = groups[(size_t) L[(size_t) g.nl].grp];
+        const int nm = (int) G.mem.size();
+        if (nm < 2) return true;
+        double exp_b = 0, all_b = 0, room = 0;
+        for (const auto& kt : pk.t) {
+            const std::string& n = kt.first;
+            if (n.find(".engram.embed.") != std::string::npos || n.rfind("vision.", 0) == 0 || n == "embed.weight")
+                continue;
+            all_b += (double) kt.second.bytes;
+            if (n.find(".ffn.experts.") != std::string::npos) exp_b += (double) kt.second.bytes;
+        }
+        for (const Dev& d : devs)
+            room += std::max(0.0, (double) d.free0 - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
+        if (exp_b <= 0 || all_b <= room) return true;   // (every expert fits: the lead keeps them, no hand-offs)
+        const int n = g.n_mtp, base = n / nm, extra = n % nm;
+        for (int m = 0; m < nm; ++m)
+            for (int k = 0; k < base + (m >= nm - extra ? 1 : 0); ++k) draft_dev.push_back(m);
+        std::string where;
+        for (int i = 0; i < n; ++i)
+            where += std::string(i ? ", " : "") + std::to_string(i) + " on CUDA" +
+                     std::to_string(devs[(size_t) G.mem[(size_t) draft_dev[(size_t) i]]].id);
+        std::fprintf(stderr, "ds4: DSpark blocks spread over the drafter's group (the experts do not all fit the GPUs): "
+                             "block %s (MAYA_DS4_DRAFT_SPREAD=0: all on the lead)\n", where.c_str());
+        return true;
+    }
     bool draft_devs(std::string& err) {
         draft_dev.clear();
         const char* v = std::getenv("STRATA_DS4_DRAFT_DEV");
         if (v == nullptr) v = std::getenv("DS4_DRAFT_DEV");
-        if (v == nullptr) return true;
+        if (v == nullptr) return draft_spread();
         if (g.n_mtp == 0) {
             err = std::string("DS4_DRAFT_DEV=") + v + ": no DSpark blocks loaded (--dspark none)";
             return false;
@@ -8864,10 +8919,10 @@ struct Model::Impl {
                 return la.region_file[(size_t) a.e] < lb.region_file[(size_t) b.e];
             return la.region_off[(size_t) a.e] < lb.region_off[(size_t) b.e];
         });
-        // STRATA_DS4_LOAD_INTERLEAVE (0): 1 = the files round-robin - the first expert of each file, then the second,
-        // ... - so the threads read several files at once (a pack split over two drives streams both).  0: file by
-        // file, as before.
-        if (const char* iv = std::getenv("STRATA_DS4_LOAD_INTERLEAVE"); iv != nullptr && std::atoi(iv) != 0) {
+        // STRATA_DS4_LOAD_INTERLEAVE (on unless 0, since v1.1.55: the same bytes, a load 109 -> 75 s on a Gorgon Halo,
+        // the same on 3x V100): the files round-robin - the first expert of each file, then the second, ... - so the
+        // threads read several files at once (a pack split over two drives streams both).  0: file by file, as before.
+        if (const char* iv = std::getenv("STRATA_DS4_LOAD_INTERLEAVE"); iv == nullptr || *iv == 0 || std::atoi(iv) != 0) {
             std::vector<int> rank(jobs.size());
             int cur = -1, r = 0;
             for (size_t i = 0; i < jobs.size(); ++i) {
@@ -17200,11 +17255,17 @@ struct Model::Impl {
     // DS4_AR2=1 / 2 (0 / unset: off): a group of two's chunk all-reduces - the attention output's and the MoE's - in
     // ar2_kernel: the put and the sums pipelined in pieces, the other member's rows read 16 bytes a lane.  1:
     // ar_sum_kernel's sums bit for bit; 2: FP16 on the wire (both partials rounded, summed in F32 in member order).
-    // Decode's all-reduces (G.ar) never take it.  Another value: the load refuses (-1)
+    // Decode's all-reduces (G.ar) never take it.  Another value: the load refuses (-1).  Unset: 1 on NVIDIA (the same
+    // sums, prompt +1.5% at 8K and +3% at 32K on 3x V100 --tp 2, v1.1.55), 0 on AMD (its peer path's calibration
+    // decides there, below)
     static int ar2() {
         static const int v = [] {
             const char* e = ds4_env("DS4_AR2");
+#if defined(STRATA_USE_HIP)
             if (e == nullptr || *e == 0) return 0;
+#else
+            if (e == nullptr || *e == 0) return 1;
+#endif
             const int x = std::atoi(e);
             return (x >= 0 && x <= 2 && std::strspn(e, "0123456789") == std::strlen(e)) ? x : -1;
         }();
@@ -17574,8 +17635,8 @@ struct Model::Impl {
                         return false;
                     // the slab's rows as wide as this run's keys, not the context's: a prompt shorter than the
                     // context gets the rows a context of its length would (128 below ~64K keys) - the same GEMM
-                    // shapes, fewer slabs (DS4_AI_RUN=1; unset or 0: the context's AI rows, as before)
-                    static const bool ai_run = std::getenv("DS4_AI_RUN") != nullptr && std::atoi(std::getenv("DS4_AI_RUN")) != 0;
+                    // shapes, fewer slabs (DS4_AI_RUN, on unless 0; 0: the context's AI rows, as before v1.1.55)
+                    static const bool ai_run = [] { const char* e = std::getenv("DS4_AI_RUN"); return e == nullptr || *e == 0 || std::atoi(e) != 0; }();
                     long long ssr = ss;
                     int air = c.AI;
                     if (ai_run) {
@@ -18311,9 +18372,36 @@ struct Model::Impl {
         for (const Layer& l0 : L)
             for (int m = 0; m < l0.nm && !l0.mtp; ++m)
                 if (member(l0, m).dev == di) cold += l0.host_list.size(), ++n_l;
-        const bool shallow = skip_unpicked_rows() > 0 && n_l > 0 && (size_t) c.ring_n * 2 * n_l < cold;
+        int sur = skip_unpicked_rows();
+        if (sur == kSkipFiles) sur = file_experts ? INT_MAX : 0;   // (HIP: by where the CPU lane's experts are read)
+        if (sur == INT_MIN) {   // (DS4_SKIP_UNPICKED=alt: a run without, the next with)
+            static std::atomic<unsigned> runs{0};
+            sur = runs.fetch_add(1) % 2 == 1 ? INT_MAX : 0;
+            std::fprintf(stderr, "ds4: this run's chunks stream %s (DS4_SKIP_UNPICKED=alt)\n",
+                         sur > 0 ? "only the experts their rows picked" : "every CPU-lane expert");
+        }
+        const bool shallow = sur > 0 && n_l > 0 && (size_t) c.ring_n * 2 * n_l < cold;
         S.skip_k.assign((size_t) nk, 0);
-        for (int k = 0; k < nk && !c.flow; ++k) S.skip_k[(size_t) k] = shallow || run.T[(size_t) k] <= skip_unpicked_rows();
+        S.spec_k.assign((size_t) nk, 0);
+        // (MAYA_DS4_SPEC_HEAD=0: a shallow ring's chunks wait for each layer's routing before any of its copies, as
+        //  before - 3x V100, EXL3 2.9 bpw, the pair's link was idle through every layer's attention.  Only where the
+        //  copies come straight from pinned RAM: with staging (experts read from the files) copy_ahead's reads and
+        //  waits run on this thread, which would hold back the layer's own work)
+        static const bool spec_head = [] {
+            const char* v = ds4_env("DS4_SPEC_HEAD");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        for (int k = 0; k < nk && !c.flow; ++k) {
+            const bool few = run.T[(size_t) k] <= sur;
+            S.skip_k[(size_t) k] = shallow || few;
+            S.spec_k[(size_t) k] = spec_head && shallow && !few && c.stage == nullptr;
+            if (S.spec_k[(size_t) k] && !c.spec_said) {
+                c.spec_said = true;
+                std::fprintf(stderr, "ds4: CUDA%d prompt copies: a layer's first %d experts go out before its routing "
+                                     "(its ring holds %d of them; MAYA_DS4_SPEC_HEAD=0: after it)\n",
+                             d.id, c.ring_n, c.ring_n);
+            }
+        }
         for (int k = 0; k < nk && !c.flow; ++k)
             for (int il = 0; il < g.nl; ++il) {
                 if (!run.runs(k, il) || run.kv_only(k, il)) continue;   // (a long prompt's skip: no experts there)

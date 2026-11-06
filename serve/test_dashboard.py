@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -68,6 +69,14 @@ class Dashboard(unittest.TestCase):
     def test_health_has_the_version(self):
         s, _, b = self.req("GET", "/health")
         self.assertEqual(json.loads(b)["version"], MAYA_VERSION)
+
+    def test_health_history_thinking(self):
+        """A Qwen3.x template keeps past thinking: the web chat is told to send it back (the GLM-5 one: not)."""
+        s, _, b = self.req("GET", "/health")
+        self.assertIs(json.loads(b)["history_thinking"], True)
+        self.svc.template = ChatTemplate(ROOT / "serve/glm5_chat_template.jinja")
+        s, _, b = self.req("GET", "/health")
+        self.assertIs(json.loads(b)["history_thinking"], False)
 
     def test_context_range(self):
         s, _, b = self.req("GET", "/api/context")
@@ -809,6 +818,51 @@ console.log(JSON.stringify({glm: sv.tierShares(n, {experts: 2000}), none: sv.tie
         self.assertEqual((got["ds4"]["total"], got["ds4"]["disk"], got["ds4"]["diskGb"]), (440, 300, 75.5))
         self.assertIsNone(got["none"]["diskGb"])                                   # (an engine that reports no bytes: the count alone)
         self.assertEqual((got["full"]["disk"], got["full"]["diskGb"]), (0, 0))
+
+    def test_qwen_file_reads_are_named_for_what_they_count_and_the_ssd_tip_needs_ssd_only_experts(self):
+        # Mercury's Monitor, Qwen3.8 UD-IQ2_XS on 1x V100: 13,199 experts in VRAM, 11,377 in pinned RAM, none on the SSD
+        # alone - but 8.23 experts a token read from the model file; the card said "From SSD" and advised more RAM
+        got = self.node("""
+const m = await import(web + "/monitor.js");
+const q = {engine_kind: "qwen", experts: 24576}, n = {vram_used: 13199, ram_used: 11377, disk: 8.23, vram_hit: 0.93};
+const g = {experts: 2000}, gn = {vram_used: 300, ram_used: 500, disk: 4, vram_hit: 0.9};
+console.log(JSON.stringify({set: m.tierSet(q).find((x) => x.key === "disk"), glmSet: m.tierSet(g).find((x) => x.key === "disk"),
+  homes: m.tierTip(n, q, {disk: sv.tierShares(n, q).disk}),
+  ssdOnly: m.tierTip({...n, ram_used: 9000}, q, {disk: sv.tierShares({...n, ram_used: 9000}, q).disk}),
+  glm: m.tierTip(gn, g, {disk: sv.tierShares(gn, g).disk}), stale: m.tierTip(gn, g, {disk: 1200, stale: true}),
+  cfCpu: m.tierTip({vram_used: 100, ram_used: 24476, disk: 0, vram_hit: 0.3}, q, {disk: 0})}));""")
+        self.assertEqual(got["set"]["label"], "From the model file")
+        self.assertIn("page cache or SSD", got["set"]["sub"])
+        self.assertEqual(got["glmSet"]["label"], "From SSD")                    # (GLM's own reads: unchanged)
+        self.assertEqual(got["homes"], "")                                      # every expert has a home: no "more RAM"
+        self.assertTrue(got["ssdOnly"].startswith("Many experts are read from the SSD"))   # 2,377 on the SSD alone
+        self.assertTrue(got["glm"].startswith("Many experts are read from the SSD"))
+        self.assertEqual(got["stale"], "")
+        self.assertTrue(got["cfCpu"].startswith("Most experts run on the CPU"))
+
+    def test_about_has_the_support_line_always_and_the_update_card_none(self):
+        # owner 2026-11-05: one line on About (always, also while an update shows), its link on "supporting me" in bold
+        # violet; no row under an update's button; the sidebar's heart stays
+        web = ROOT / "serve" / "web"
+        js = (web / "settings.js").read_text(encoding="utf-8")
+        line = js[js.index("const SupportLine"):js.index("function UpdateCard")]
+        body = line.split("<span>", 1)[1].split("</span></p>", 1)[0].replace('${" "}', " ")
+        text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", body))
+        self.assertEqual(text, "I build Maya because I believe everyone should have access to great local AI. If you enjoy "
+                               "what I'm building, consider supporting me. Every little bit helps keep the project alive "
+                               "and growing. ❤️")
+        self.assertRegex(line, r'<a class="support-link" href=\$\{SUPPORT_URL\} target="_blank" rel="noopener"\s+'
+                               r'title="[^"]*">supporting me</a>')
+        self.assertNotIn('name="heart"', line)                               # (no second heart before the text)
+        card = js[js.index("function UpdateCard"):js.index("\n}\n", js.index("function UpdateCard"))]
+        self.assertNotIn("SupportLine", card)
+        self.assertIn("<${UpdateCard}/>\n    <${SupportLine}/>", js)               # (About: always, under the update)
+        css = (web / "settings.css").read_text(encoding="utf-8")
+        rule = re.search(r"\.set-support \.support-link \{([^}]*)\}", css).group(1)
+        self.assertIn("font-weight: 700", rule)
+        self.assertIn("color: var(--st-accent-text)", rule)
+        self.assertEqual(len(re.findall(r"--st-accent-text:\s*#", (web / "tokens.css").read_text(encoding="utf-8"))), 2)
+        self.assertIn("heart-link", (web / "sidebar.js").read_text(encoding="utf-8"))   # (the sidebar's heart stays)
 
     def test_context_slider_reaches_each_models_own_top(self):
         # the Models page's Context size: Settings > Model's stops over each model's range (its trained context, up to
