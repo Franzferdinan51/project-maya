@@ -62,6 +62,9 @@ class Mm3Metal {
     // current position), so a snapshot is just a position: restoring rewinds to it
     void snapshot_save();
     bool snapshot_restore();
+    // rewinds the position to an arbitrary depth (the caches are positional: rows past it are
+    // never read) - the restore-point engine half of the P5 serve protocol
+    void rewind_to(int64_t pos);
     int64_t snapshot_position() const;
     int ubatch() const;
     // appends ids at the current position; logits (n_vocab) of the last token

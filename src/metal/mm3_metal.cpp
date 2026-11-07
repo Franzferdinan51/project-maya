@@ -399,6 +399,13 @@ bool Mm3Metal::snapshot_restore() {
 }
 
 int64_t Mm3Metal::snapshot_position() const { return p_->snap_pos; }
+
+void Mm3Metal::rewind_to(int64_t pos) {
+    if (pos < 0) pos = 0;
+    if (pos > p_->n_ctx) pos = p_->n_ctx;
+    p_->pos = pos;
+}
+
 int Mm3Metal::ubatch() const { return p_->o.n_ubatch; }
 
 bool Mm3Metal::forward(const std::vector<int32_t>& tokens, std::vector<float>& logits, std::string& err) {
