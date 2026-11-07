@@ -187,6 +187,10 @@ if(MAYA_METAL_TESTS)
              COMMAND ${MAYA_MM3_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_mm3_serve.py $<TARGET_FILE:maya-metal-mm3>
                      ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf)
     set_tests_properties(metal_mm3_serve_test PROPERTIES FIXTURES_REQUIRED metal_mm3_gguf)
+    add_test(NAME metal_mm3_serve_restore_test
+             COMMAND ${MAYA_MM3_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_mm3_serve_restore.py $<TARGET_FILE:maya-metal-mm3>
+                     ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf)
+    set_tests_properties(metal_mm3_serve_restore_test PROPERTIES FIXTURES_REQUIRED metal_mm3_gguf)
   endif()
   # the same gates on ggml-cpu (the oracle backend), and with the expert pool at its floor and small slices
   add_test(NAME metal_model_test_cpu COMMAND metal_model_test small)
