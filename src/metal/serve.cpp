@@ -561,13 +561,13 @@ struct Server {
         if (std::strcmp(finish, "cancel") != 0) {
             // one token: the plain pick of these logits (a forced token wins), the counter one draw on
             bool bad = false;
+            PickScratch pick_scratch;   // the pick's working buffers, reused for the whole request
             auto pick_one = [&](const float* l) -> int32_t {
-                for (size_t v = 0; v < (size_t) n_vocab; ++v)
-                    if (!std::isfinite(l[v])) {
-                        bad = true;
-                        return 0;
-                    }
-                int32_t t = pick(std::vector<float>(l, l + n_vocab), sp, pen_hist);
+                int32_t t = pick(l, (size_t) n_vocab, sp, pen_hist, pick_scratch);
+                if (t < 0) {   // a non-finite logit: fatal, as the old pre-scan made it
+                    bad = true;
+                    return 0;
+                }
                 if (forced >= 0) {
                     t = forced;
                     forced = -1;

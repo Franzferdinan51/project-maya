@@ -32,9 +32,12 @@ float philox_uniform(uint64_t seed, uint64_t counter) {
     return (float) (c0 >> 8) * (1.0f / 16777216.0f);
 }
 
-int32_t pick(const std::vector<float>& logits, const Sampling& p, const std::vector<int32_t>& hist) {
-    const int nv = (int) logits.size();
-    std::vector<float> s(logits);
+namespace {
+
+// The pick itself, in place on the working copy s (nv logits; bias and penalties are
+// applied to it here).  ids is caller-kept scratch for the top-k index list.
+int32_t pick_from(float* s, const int nv, const Sampling& p, const std::vector<int32_t>& hist,
+                  std::vector<int32_t>& ids) {
     for (const auto& [id, b] : p.bias) s[(size_t) id] += b;
     if (p.pen_n > 0 && !hist.empty()) {   // llama.cpp's penalties on the window's counts
         const size_t h = std::min<size_t>((size_t) std::min(p.pen_n, kPenCap), hist.size());
@@ -62,7 +65,7 @@ int32_t pick(const std::vector<float>& logits, const Sampling& p, const std::vec
         return best;
     }
     const int k = std::min(nv, (p.top_k > 0 && p.top_k < kTopKMax) ? p.top_k : kTopKMax);
-    std::vector<int32_t> ids((size_t) nv);
+    ids.resize((size_t) nv);
     for (int v = 0; v < nv; ++v) ids[(size_t) v] = v;
     std::partial_sort(ids.begin(), ids.begin() + k, ids.end(), [&](int32_t a, int32_t b) {
         return s[(size_t) a] > s[(size_t) b] || (s[(size_t) a] == s[(size_t) b] && a < b);
@@ -105,6 +108,27 @@ int32_t pick(const std::vector<float>& logits, const Sampling& p, const std::vec
         if ((double) u < cum) return ids[(size_t) i];
     }
     return ids[(size_t) (n_keep - 1)];
+}
+
+}  // namespace
+
+int32_t pick(const std::vector<float>& logits, const Sampling& p, const std::vector<int32_t>& hist) {
+    PickScratch sc;
+    sc.s = logits;
+    return pick_from(sc.s.data(), (int) logits.size(), p, hist, sc.ids);
+}
+
+int32_t pick(const float* logits, size_t n, const Sampling& p, const std::vector<int32_t>& hist,
+             PickScratch& sc) {
+    sc.s.resize(n);
+    bool finite = true;
+    for (size_t v = 0; v < n; ++v) {
+        const float x = logits[v];
+        if (!std::isfinite(x)) finite = false;
+        sc.s[v] = x;
+    }
+    if (!finite) return -1;
+    return pick_from(sc.s.data(), (int) n, p, hist, sc.ids);
 }
 
 

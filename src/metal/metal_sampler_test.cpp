@@ -120,6 +120,7 @@ int sampled_reference(const std::vector<float>& l, const std::vector<int>& hist,
 int main() {
     std::mt19937_64 rng(1234);
     int bad = 0, n = 0;
+    maya::metal::PickScratch sc;   // one scratch reused across every case below, as the serve loop does
     for (int it = 0; it < 4000; ++it) {
         const int nv = 50 + (int) (rng() % 400);
         std::vector<float> l((size_t) nv);
@@ -155,6 +156,11 @@ int main() {
         if (want != got && ++bad <= 5)
             std::fprintf(stderr, "case %d: reference %d, maya-metal %d (top_k %d top_p %.2f min_p %.2f T %.2f)\n", it, want,
                          got, r.top_k, r.top_p, r.min_p, r.temperature);
+        const int got_sc = maya::metal::pick(l.data(), l.size(), s, h32, sc);   // the serve loops' scratch pick
+        ++n;
+        if (want != got_sc && ++bad <= 5)
+            std::fprintf(stderr, "case %d: reference %d, scratch pick %d (top_k %d top_p %.2f min_p %.2f T %.2f)\n", it,
+                         want, got_sc, r.top_k, r.top_p, r.min_p, r.temperature);
     }
     // greedy: the argmax, ties to the lower id; logit bias -100 bans
     {
@@ -164,6 +170,20 @@ int main() {
         s.bias = {{1, -INFINITY}};
         if (maya::metal::pick(l, s, {}) != 2) ++bad, std::fprintf(stderr, "greedy bias\n");
         n += 2;
+    }
+    // the scratch pick: greedy agrees, and a non-finite raw logit is a -1, not a token -
+    // with the scratch still good for the next pick after one
+    {
+        std::vector<float> l = {0.5f, 2.0f, 2.0f, -1.0f};
+        maya::metal::Sampling s;
+        if (maya::metal::pick(l.data(), l.size(), s, {}, sc) != 1) ++bad, std::fprintf(stderr, "scratch greedy tie\n");
+        l[2] = NAN;
+        if (maya::metal::pick(l.data(), l.size(), s, {}, sc) != -1) ++bad, std::fprintf(stderr, "scratch NaN\n");
+        l[2] = INFINITY;
+        if (maya::metal::pick(l.data(), l.size(), s, {}, sc) != -1) ++bad, std::fprintf(stderr, "scratch Inf\n");
+        l[2] = 2.0f;
+        if (maya::metal::pick(l.data(), l.size(), s, {}, sc) != 1) ++bad, std::fprintf(stderr, "scratch reuse after -1\n");
+        n += 4;
     }
     if (bad) {
         std::fprintf(stderr, "metal_sampler_test: %d of %d picks differ from the CUDA engine's reference\n", bad, n);
