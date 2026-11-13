@@ -110,7 +110,7 @@ struct Server {
     bool spec_on = true;        // DSpark drafting when a draft is loaded (a GEN's spec= overrides)
     float conf_floor = 0.7f;    // a round verifies the drafts before the first below this confidence
     float draft_cost = 0.0f;    // > 0: ... and before the first whose confidences' product is below it
-    bool backoff_on = true;     // adaptive draft backoff (spec_backoff.hpp; a GEN's spec_backoff= overrides)
+    bool backoff_on = false;     // adaptive draft backoff (spec_backoff.hpp; a GEN's spec_backoff= overrides)
 
     void err(const std::string& m) {
         std::printf("ERR %s\n", m.c_str());
