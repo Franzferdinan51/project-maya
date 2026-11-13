@@ -117,6 +117,30 @@ class Settings(unittest.TestCase):
         self.assertEqual(M.flag(new["args"], "--dflash"), str(f))
         self.assertEqual(M.settings_of(M.apply(new, {"draft": "mtp"}))["draft"], "mtp")
 
+    def test_glm_dflash2_beside_a_metal_config_without_an_installer(self):
+        # (a hand-kept Metal config records no installer models folder; a drafter in a
+        # GLM-5.3-Flash-DFlash2 folder beside the model's own folder is found, and only once it is there)
+        models = self.d / "models"
+        shard = models / "Maya-S24" / "GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00001-of-00003.gguf"
+        shard.parent.mkdir(parents=True)
+        shard.write_bytes(b"x")
+        p = self.d / "maya-glm.json"
+        p.write_text(json.dumps({"exe": "/b/maya-metal", "backend": "metal",
+                                 "args": ["--gguf", str(shard), "--serve", "--max-context", "98304"],
+                                 "model_name": "glm-5.3-flash"}))
+        cfg = M.read(p)
+        self.assertEqual(M.choices(cfg)["draft"], ["mtp"])
+        with self.assertRaisesRegex(ValueError, "DFlash2"):
+            M.apply(cfg, {"draft": "dflash2", "gpus": [0]})   # (a page save carries the GPU pick too)
+        f = models / "GLM-5.3-Flash-DFlash2" / "GLM-5.3-Flash-DFlash2-Q8_0.gguf"
+        f.parent.mkdir()
+        f.write_bytes(b"x")
+        self.assertEqual(M.dflash_file(cfg), f)
+        new = M.apply(cfg, {"draft": "dflash2", "gpus": [0]})
+        self.assertEqual(M.flag(new["args"], "--dflash"), str(f))
+        self.assertEqual(M.settings_of(new)["draft"], "dflash2")
+        self.assertEqual(M.settings_of(M.apply(new, {"draft": "mtp", "gpus": [0]}))["draft"], "mtp")
+
     def test_checked_before_anything_changes(self):
         cfg = M.read(glm_cfg(self.d))
         for bad in ({"context": "lots"}, {"parallel": 9}, {"gpus": []}, {"gpus": ["0"]}, {"reserve_mib": -1},
