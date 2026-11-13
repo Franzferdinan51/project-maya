@@ -151,6 +151,8 @@ if(MAYA_METAL_TESTS)
   # the CUDA engine's GLM gates (src/core/glm_model_test.cpp, glm_model_big_test.cpp) on maya-metal
   add_executable(metal_model_test src/metal/metal_model_test.cpp)
   target_link_libraries(metal_model_test PRIVATE maya_metal)
+  add_executable(metal_glm_backoff_test src/metal/metal_glm_backoff_test.cpp)
+  target_link_libraries(metal_glm_backoff_test PRIVATE maya_metal)
   add_executable(metal_sampler_test src/metal/metal_sampler_test.cpp)
   target_link_libraries(metal_sampler_test PRIVATE maya_metal)
   add_test(NAME metal_sampler_test COMMAND metal_sampler_test)
@@ -188,6 +190,14 @@ if(MAYA_METAL_TESTS)
              COMMAND ${MAYA_MM3_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_mm3_serve.py $<TARGET_FILE:maya-metal-mm3>
                      ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf)
     set_tests_properties(metal_mm3_serve_test PROPERTIES FIXTURES_REQUIRED metal_mm3_gguf)
+    # adaptive draft backoff (src/metal/spec_backoff.hpp): the policy and a serve-loop replica
+    # on the synth fixture; the replica fabricates its drafts, so it needs no DSpark fixture
+    # and registers here, outside the torch-conditional DSpark block below
+    add_executable(metal_mm3_backoff_test src/metal/metal_mm3_backoff_test.cpp)
+    target_link_libraries(metal_mm3_backoff_test PRIVATE maya_metal)
+    add_test(NAME metal_mm3_backoff_test
+             COMMAND metal_mm3_backoff_test ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf)
+    set_tests_properties(metal_mm3_backoff_test PROPERTIES FIXTURES_REQUIRED metal_mm3_gguf)
     # DSpark (src/metal/mm3_dspark.cpp): the fixture generator is a torch reference
     # (tools/mm3/dspark_ref.py), so its tests register only when a python with torch is found
     add_executable(metal_mm3_dspark_test src/metal/metal_mm3_dspark_test.cpp)
@@ -224,12 +234,13 @@ if(MAYA_METAL_TESTS)
   set_tests_properties(metal_model_test_evict PROPERTIES
                        ENVIRONMENT "MAYA_METAL_POOL_SLOTS=1;MAYA_METAL_UBATCH=3;MAYA_METAL_ATTN_CHUNK=2")
   # verify windows (speculative decoding): partly wrong drafts must decode exactly as plain decoding does
+  add_test(NAME metal_glm_backoff_test COMMAND metal_glm_backoff_test data/glm5-synth.gguf)
   add_test(NAME metal_model_window COMMAND metal_model_test window data/glm5-synth.gguf 40)
   # a 2048-token slice gathered 4 tokens a chunk: the graph outgrows any fixed budget (--ubatch 2048 aborted)
   add_test(NAME metal_model_big_slice COMMAND metal_model_test prefill data/glm5-synth.gguf 2048)
   set_tests_properties(metal_model_big_slice PROPERTIES ENVIRONMENT "MAYA_METAL_UBATCH=2048;MAYA_METAL_ATTN_CHUNK=4")
   set_tests_properties(metal_model_test metal_model_test_cpu metal_model_test_evict metal_model_window
-                       metal_model_big_slice PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+                       metal_model_big_slice metal_glm_backoff_test PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   # the 45-layer fixture: its 1.2 GB GGUF is generated into the build tree (tools/glm_big_fixture.py needs numpy)
   find_program(MAYA_PYTHON3 python3)
   if(MAYA_PYTHON3)

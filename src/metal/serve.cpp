@@ -103,7 +103,17 @@ struct Spec {
     float p_min = 0.95f;   // one GPU's default (glm_dflash.cu)
     int n_min = 0;
     float p_cum = 0.0f;
+    int backoff = -1;      // GEN spec_backoff: -1 the engine default, 0/1 off/on
 };
+
+// the engine default for the adaptive draft backoff (spec_backoff.hpp): MAYA_GLM_SPEC_BACKOFF
+// decides instead when set.  Ships OFF, like mm3: a default-ON is earned by the live A/B, and
+// that run is still owed - at the production config the engine reserves a ~96 GB expert pool,
+// which alongside the machines normal baseline leaves no thrash margin today
+bool spec_backoff_default() {
+    const char* v = std::getenv("MAYA_GLM_SPEC_BACKOFF");
+    return v && *v ? std::atoi(v) != 0 : false;
+}
 
 // a request's restore points (GEN keys marks=/shared=, the DS4 engine's spellings): positions in the prompt
 // where prefill should record a reusable state, shared= the one another conversation may resume from
@@ -243,6 +253,7 @@ struct Server {
             else if (k == "spec_min_p") spec.p_min = (float) std::atof(v.c_str());
             else if (k == "spec_n_min") spec.n_min = std::atoi(v.c_str());
             else if (k == "spec_cum") spec.p_cum = (float) std::atof(v.c_str());
+            else if (k == "spec_backoff") spec.backoff = std::atoi(v.c_str()) != 0 ? 1 : 0;
             else if (k == "marks") {   // restore points to record during prefill: <pos>,<pos>,...
                 for (size_t at = 0; at < v.size();) {
                     const size_t end = v.find(',', at);
@@ -588,13 +599,18 @@ struct Server {
                     hk.pick = pick_one;
                     hk.emit = [&](int32_t t) { return !bad && on_token(t); };
                     hk.left = [&] { return max_new - produced; };
+                    // adaptive draft backoff (spec_backoff.hpp), one policy per generation,
+                    // shared by both drafters through decode_spec; disabled = decode_spec runs
+                    // exactly the pre-backoff rounds
+                    SpecBackoff boff(spec.backoff >= 0 ? spec.backoff != 0 : spec_backoff_default());
                     if (model.has_dflash() && spec_req != 1) {   // DFlash2 drafts, a verify window checks
                         const int n_max = std::min(15, spec_req >= 2 ? spec_req - 1 : model.dflash_block() - 1);
                         const Drafter df = [&](int32_t tok, int64_t, int n, std::vector<int32_t>& d, std::string& er) {
                             return model.dflash_draft(tok, n, spec.p_min, spec.n_min, spec.p_cum, d, er);
                         };
                         const bool ok = decode_spec(model, y, n_max, df,
-                                                    [&](int n, int acc, double) { d_off += n; d_acc += acc; }, hk, e);
+                                                    [&](int n, int acc, double) { d_off += n; d_acc += acc; }, hk, e,
+                                                    &boff);
                         if (!ok || bad) {
                             model.reset();
                             cached.clear();
@@ -602,7 +618,7 @@ struct Server {
                             return err(bad ? "non-finite logits" : e);
                         }
                     } else if (mtp && spec_req != 1) {   // the NextN block drafts, a verify window checks (same tokens)
-                        const bool ok = decode_mtp(model, y, *mtp_len, hk, e);
+                        const bool ok = decode_mtp(model, y, *mtp_len, hk, e, &boff);
                         if (!ok || bad) {
                             model.reset();
                             cached.clear();
@@ -627,6 +643,9 @@ struct Server {
                             if (!on_token(t)) break;
                         }
                     }
+                    if (boff.trips() > 0)
+                        std::fprintf(stderr, "maya-metal: spec backoff tripped %d time(s) this request\n",
+                                     boff.trips());
                 }
             } else {
                 finish = "cancel";
