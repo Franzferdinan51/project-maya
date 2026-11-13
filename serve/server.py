@@ -1306,6 +1306,9 @@ class StrataEngine:
             lt = tune.get("lookup_trust")   # ... (DeepSeek, MiniMax) its trusted rounds without a draft: off / on
             if isinstance(lt, int) and not isinstance(lt, bool) and lt in (0, 1):
                 tune_keys += f" lookup_trust={lt}"
+            sb = tune.get("spec_backoff")   # the MiniMax engine's adaptive draft backoff: off (0) / on (1)
+            if isinstance(sb, int) and not isinstance(sb, bool) and sb in (0, 1):
+                tune_keys += f" spec_backoff={sb}"
             ct = tune.get("cpu_threads")   # the GLM engine's CPU lane threads (more: MAYA_GLM_CPU_LANE_MAX)
             if isinstance(ct, int) and not isinstance(ct, bool) and ct > 0:
                 tune_keys += f" cpu_threads={ct}"

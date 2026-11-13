@@ -8,7 +8,10 @@
 // Sampling is the shared chain (sampler.cpp): same keys, same defaults, same Philox draws, so a seeded
 // request repeats.  The differences from the GLM engine's serve are the model's, not the protocol's:
 // DSpark drafting when a draft is loaded (mm3_dspark.cpp; the spec keys steer it, and a verify
-// window writes the same tokens plain decoding would), no images (GENI is refused: the vision
+// window writes the same tokens plain decoding would), with adaptive backoff on the drafting
+// (spec_backoff.hpp: proposing pauses for a cooldown when the measured draft yield says it is
+// losing money - the floor alone cannot fix prose, it is applied after the proposal is paid),
+// no images (GENI is refused: the vision
 // tower is not wired on this backend yet), no expert
 // pool (every expert is resident, so the STAT lines report a 1.0 hit rate and no pool), and the stop
 // tokens are the GGUF's own eos ids instead of a hardcoded set.  PAUSE and the prefix snapshot are
@@ -18,6 +21,7 @@
 // effect).
 #include "mm3_metal.hpp"
 #include "sampler.hpp"
+#include "spec_backoff.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -106,6 +110,7 @@ struct Server {
     bool spec_on = true;        // DSpark drafting when a draft is loaded (a GEN's spec= overrides)
     float conf_floor = 0.7f;    // a round verifies the drafts before the first below this confidence
     float draft_cost = 0.0f;    // > 0: ... and before the first whose confidences' product is below it
+    bool backoff_on = true;     // adaptive draft backoff (spec_backoff.hpp; a GEN's spec_backoff= overrides)
 
     void err(const std::string& m) {
         std::printf("ERR %s\n", m.c_str());
@@ -124,6 +129,7 @@ struct Server {
         int32_t think_end = -1;
         int spec_req = -1;      // GEN spec: -1 the engine default, 0/1 off, >= 2 on
         float conf_req = -1.0f;   // GEN dspark_conf / spec_min_p: the round's confidence floor
+        int boff_req = -1;      // GEN spec_backoff: -1 the engine default, 0/1 off/on
         int pen_n = 0;
         float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
         std::string ids_s, bias_err;
@@ -150,6 +156,7 @@ struct Server {
                 spec_req = sv == 1 ? 0 : sv >= 2 ? 1 : spec_req;
             }
             else if (k == "dspark_conf" || k == "spec_min_p") conf_req = (float) std::atof(v.c_str());
+            else if (k == "spec_backoff") boff_req = std::atoi(v.c_str()) != 0 ? 1 : 0;
             else if (k == "spec_n_min" || k == "spec_cum") {
                 // accepted, as on the GLM engine; the DSpark round's cut is the confidence floor
                 // (and the survival product, an engine flag) - these two change nothing here
@@ -217,11 +224,11 @@ struct Server {
         if (max_new <= 0)
             return err("the prompt (" + std::to_string(prompt.size()) + " tokens) fills the context (" +
                        std::to_string(model.max_context()) + ")");
-        run(prompt, max_new, sp, think_budget, think_end, spec_req, conf_req);
+        run(prompt, max_new, sp, think_budget, think_end, spec_req, conf_req, boff_req);
     }
 
     void run(const std::vector<int32_t>& prompt, int64_t max_new, Sampling sp, int64_t think_budget,
-             int32_t think_end, int spec_req, float conf_req) {
+             int32_t think_end, int spec_req, float conf_req, int boff_req) {
         const int n_vocab = model.geometry().n_vocab;
         const std::vector<int32_t>& eos = model.geometry().eos;
         std::string e;
@@ -361,6 +368,10 @@ struct Server {
             return produced < max_new;
         };
         long long d_acc = 0, d_off = 0;
+        // adaptive draft backoff (spec_backoff.hpp), one policy per generation; the GEN key
+        // overrides the engine default for this request. Disabled = every hook below is inert
+        // and the loop runs exactly the pre-backoff paths.
+        SpecBackoff boff(boff_req >= 0 ? boff_req != 0 : backoff_on);
         if (std::strcmp(finish, "cancel") != 0) {
             bool bad = false;
             auto pick_one = [&](const float* l) -> int32_t {
@@ -395,7 +406,10 @@ struct Server {
                 bool go = on_token(y);   // (on_token checked STOP: the last token written is never fed)
                 while (go) {
                     const int64_t pos = model.position();   // y sits at pos, not fed yet
-                    if (!spec) {
+                    if (!spec || !boff.drafting()) {
+                        // the plain path, verbatim - also the backoff cooldown's path: while the
+                        // policy is parked, draft_propose is never called, so a cooldown token
+                        // costs exactly what spec-off costs, and burns one cooldown token
                         if (!model.forward({y}, logits, e)) {
                             model.reset();
                             cached.clear();
@@ -407,6 +421,7 @@ struct Server {
                             cached.clear();
                             return err("non-finite logits");
                         }
+                        boff.note_plain_token();
                         go = on_token(y);
                         continue;
                     }
@@ -430,6 +445,16 @@ struct Server {
                         }
                     }
                     if (k == 0) {
+                        // a paid propose the floor cut to nothing is a zero-yield sample (an
+                        // empty propose - no room - is never sampled)
+                        if (!drafts.empty()) {
+                            if (const int cool = boff.note_floor_cut())
+                                std::fprintf(stderr,
+                                             "DSpark backoff: floor cut at yield EWMA %.2f (threshold %.2f) - "
+                                             "drafting parked for %d plain tokens\n",
+                                             (double) boff.trip_ewma(), (double) SpecBackoff::kYieldThreshold,
+                                             cool);
+                        }
                         if (!model.forward({y}, logits, e)) {
                             model.reset();
                             cached.clear();
@@ -476,6 +501,11 @@ struct Server {
                         kept = i + 1;
                     }
                     model.rewind_to(pos + 1 + kept);
+                    if (const int cool = boff.note_round(kept, k))
+                        std::fprintf(stderr,
+                                     "DSpark backoff: yield EWMA %.2f (threshold %.2f) - drafting parked "
+                                     "for %d plain tokens\n",
+                                     (double) boff.trip_ewma(), (double) SpecBackoff::kYieldThreshold, cool);
                     if (ended) break;
                     y = next;
                     go = on_token(y);
@@ -497,7 +527,11 @@ struct Server {
                     std::chrono::duration<double, std::milli>(t1 - t0).count(),
                     std::chrono::duration<double, std::milli>(t2 - t1).count(), finish, d_acc, d_off, reuse);
         std::fflush(stdout);
-        if (d_off > 0)
+        if (boff.trips() > 0)
+            std::fprintf(stderr, "maya-metal-mm3: DSpark kept %lld of %lld drafts / DSpark backoff tripped %d "
+                                 "time(s)\n",
+                         d_acc, d_off, boff.trips());
+        else if (d_off > 0)
             std::fprintf(stderr, "maya-metal-mm3: DSpark kept %lld of %lld drafts\n", d_acc, d_off);
         if (produced > 0) {
             const double s = std::chrono::duration<double>(t2 - t1).count();
@@ -518,6 +552,8 @@ int serve(Mm3Metal& model, const std::vector<std::string>& args) {
             s.conf_floor = (float) std::atof(args[++i].c_str());
         else if (args[i] == "--dspark-cost" && i + 1 < args.size())
             s.draft_cost = (float) std::atof(args[++i].c_str());
+        else if (args[i] == "--dspark-backoff" && i + 1 < args.size())
+            s.backoff_on = args[++i] != "off";
     }
     s.chunk = model.ubatch();
     if (const char* c = std::getenv("MAYA_METAL_PP_CHUNK")) s.chunk = std::max(1, std::atoi(c));
