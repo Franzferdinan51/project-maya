@@ -419,7 +419,12 @@ bool Mm3Metal::Impl::run_slice(const int32_t* tok, int T, std::vector<float>& lo
     if (arena.size() < mem) arena.resize(mem);
     const int64_t Tk = pos + T;
     std::vector<int32_t> ids(tok, tok + T);
-    std::vector<float> scores((size_t) Tk * g.ix_heads * T);
+    const bool gpu_sel = gpu_select_ok(g);
+    // the scores readback is the host path's alone (select_masks' input, in the two-graph branch
+    // below); the fused path never touches it, and on a long prompt it is pure waste - at the
+    // 65,536-token cap with a 512-token slice it zero-fills ~512 MB on every slice
+    std::vector<float> scores;
+    if (!gpu_sel) scores.resize((size_t) Tk * g.ix_heads * T);
     std::vector<std::vector<float>> masks;
     // the draft's taps: this slice's output streams at the tap layers, tap-major [NT][T][dim]
     const std::vector<int>& dtaps = has_draft ? draft.geo().taps : std::vector<int>();
@@ -456,7 +461,6 @@ bool Mm3Metal::Impl::run_slice(const int32_t* tok, int T, std::vector<float>& lo
                     dst[(size_t) t * g.n_embd + d] = h2[(size_t) d + (size_t) t * g.n_embd];
         }
     };
-    const bool gpu_sel = gpu_select_ok(g);
     for (int il = 0; il < g.n_layer; ++il) {
         const bool last = il == g.n_layer - 1;
         ggml_tensor* logits_t = nullptr;
