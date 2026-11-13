@@ -107,10 +107,12 @@ struct Spec {
 };
 
 // the engine default for the adaptive draft backoff (spec_backoff.hpp): MAYA_GLM_SPEC_BACKOFF
-// decides instead when set
+// decides instead when set.  Ships OFF, like mm3: a default-ON is earned by the live A/B, and
+// that run is still owed - at the production config the engine reserves a ~96 GB expert pool,
+// which alongside the machines normal baseline leaves no thrash margin today
 bool spec_backoff_default() {
     const char* v = std::getenv("MAYA_GLM_SPEC_BACKOFF");
-    return v && *v ? std::atoi(v) != 0 : true;
+    return v && *v ? std::atoi(v) != 0 : false;
 }
 
 // a request's restore points (GEN keys marks=/shared=, the DS4 engine's spellings): positions in the prompt
