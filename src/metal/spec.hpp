@@ -5,6 +5,7 @@
 #pragma once
 
 #include "glm_metal.hpp"
+#include "spec_backoff.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -50,11 +51,15 @@ using Drafter = std::function<bool(int32_t y, int64_t p0, int n_max, std::vector
 
 // the decode loop from `y` (the token just picked, not fed yet) until a hook ends it: each round drafts, verifies the
 // drafts in one window, keeps the rows plain decoding would have written.  `n_max` caps a round's drafts; `done`
-// hears each round (drafts offered, accepted, ms)
+// hears each round (drafts offered, accepted, ms).  `boff`, when given, is the adaptive draft backoff
+// (spec_backoff.hpp): while it parks drafting, a round is a plain step and the drafter is never consulted -
+// and no round is tallied, so the DraftLength statistics and the DONE totals see only real rounds
 bool decode_spec(GlmMetal& model, int32_t y, int n_max, const Drafter& draft,
-                 const std::function<void(int, int, double)>& done, const DecodeHooks& hooks, std::string& err);
+                 const std::function<void(int, int, double)>& done, const DecodeHooks& hooks, std::string& err,
+                 SpecBackoff* boff = nullptr);
 
 // MTP: the NextN block's chained greedy steps, the draft length chosen by `len`
-bool decode_mtp(GlmMetal& model, int32_t y, DraftLength& len, const DecodeHooks& hooks, std::string& err);
+bool decode_mtp(GlmMetal& model, int32_t y, DraftLength& len, const DecodeHooks& hooks, std::string& err,
+                SpecBackoff* boff = nullptr);
 
 }  // namespace maya::metal

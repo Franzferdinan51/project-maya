@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 
 namespace maya::metal {
@@ -99,13 +100,22 @@ void DraftLength::record(int n, int accepted, double ms) {
 }
 
 bool decode_spec(GlmMetal& model, int32_t y, int n_max, const Drafter& draft,
-                 const std::function<void(int, int, double)>& done_round, const DecodeHooks& hooks, std::string& err) {
+                 const std::function<void(int, int, double)>& done_round, const DecodeHooks& hooks, std::string& err,
+                 SpecBackoff* boff) {
     const size_t V = (size_t) model.geometry().n_vocab;
     std::vector<float> logits;
     std::vector<int32_t> drafts;
     for (;;) {
         const auto t0 = std::chrono::steady_clock::now();
         const int64_t p0 = model.position();   // y goes here
+        if (boff && !boff->drafting()) {   // backoff parked: a plain step - the drafter is never
+            if (!model.forward({y}, logits, err)) return false;   // consulted, DraftLength is not
+            const int32_t t = hooks.pick(logits.data());          // fed a phantom round, and the
+            boff->note_plain_token();                             // DONE totals see no round
+            if (!hooks.emit(t)) return true;
+            y = t;
+            continue;
+        }
         int64_t room = std::min<int64_t>(n_max, hooks.left() - 1);
         room = std::min<int64_t>(room, model.max_context() - 1 - p0);
         drafts.clear();
@@ -136,6 +146,13 @@ bool decode_spec(GlmMetal& model, int32_t y, int n_max, const Drafter& draft,
             if (t + 1 < T && tok != win[(size_t) t + 1]) break;   // the first draft the model would not write
         }
         if (!model.accept(keep, err)) return false;
+        if (boff && T > 1) {   // the round's yield: drafts kept of drafts verified
+            if (const int cool = boff->note_round(keep - 1, T - 1))
+                std::fprintf(stderr,
+                             "spec backoff: yield EWMA %.2f (threshold %.2f) - drafting parked for %d plain "
+                             "tokens\n",
+                             (double) boff->trip_ewma(), (double) SpecBackoff::kYieldThreshold, cool);
+        }
         if (done_round)
             done_round(T - 1, keep - 1,
                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
@@ -143,7 +160,8 @@ bool decode_spec(GlmMetal& model, int32_t y, int n_max, const Drafter& draft,
     }
 }
 
-bool decode_mtp(GlmMetal& model, int32_t y, DraftLength& len, const DecodeHooks& hooks, std::string& err) {
+bool decode_mtp(GlmMetal& model, int32_t y, DraftLength& len, const DecodeHooks& hooks, std::string& err,
+                SpecBackoff* boff) {
     int chosen = 0;
     const Drafter mtp = [&](int32_t tok, int64_t p0, int n_max, std::vector<int32_t>& drafts, std::string& e) {
         chosen = std::min(len.choose(), n_max);
@@ -157,7 +175,7 @@ bool decode_mtp(GlmMetal& model, int32_t y, DraftLength& len, const DecodeHooks&
     };
     return decode_spec(model, y, 15, mtp, [&](int n, int acc, double ms) { len.record(chosen, std::min(acc, n), ms);
                                                                           len.tally(n, acc); },
-                       hooks, err);
+                       hooks, err, boff);
 }
 
 }  // namespace maya::metal
