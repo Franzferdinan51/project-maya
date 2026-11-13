@@ -120,6 +120,11 @@ struct MoeArgs {
     const float* plan_w = nullptr;
     const float* cpu_part = nullptr;
     const int* cpu_flag = nullptr;
+    // (ds4 GGUF, DS4_LANE_PARITY) the CPU lane's picks, each its own part: pick i of token t (plan_ptr 0) at row
+    // t * 8 + i of cpu_picks (cpu_pick_stride floats apart) when bit i of cpu_pmask[t] is set
+    const float* cpu_picks = nullptr;
+    size_t cpu_pick_stride = 0;
+    const int* cpu_pmask = nullptr;
     ExpertLayout lay;
     MixedLayouts mix;     // (n > 0: the experts' layouts by class - lay is not used)
     int k = 8, n_embd = 4096, n_ff = 2048;
@@ -142,6 +147,9 @@ struct WinArgs {
     const float* cpu_part = nullptr;                // [T][n_embd] (rows cpu_stride apart when given)
     size_t cpu_stride = 0;
     const int* cpu_flag = nullptr;                  // [T]
+    const float* cpu_picks = nullptr;               // (ds4 GGUF, DS4_LANE_PARITY: as MoeArgs')
+    size_t cpu_pick_stride = 0;
+    const int* cpu_pmask = nullptr;
     const float* x = nullptr;
     size_t x_stride = 0;
     float* h = nullptr;
@@ -212,6 +220,22 @@ void reconstruct_inner(const Mat& m, uint16_t* dst, cudaStream_t s);
 /// out[r][c] = FP16(x[idx ? idx[r] : r][c]) for r < nrows, c < ncols (x: ldx floats a row): the prompt path's rows of
 /// one expert, gathered for its GEMMs.
 void rows_f16(const float* x, int ldx, const int* idx, int nrows, int ncols, uint16_t* out, cudaStream_t s);
+
+/// Whether the current device runs v1.1.8's decode kernels (NVIDIA before sm_80) with the weights decoded in F32
+/// instead of FP16: MAYA_GLM_EXL3_DECODE=legacy-f32 (every GPU) or MAYA_GLM_EXL3_DECODE<n>=legacy-f32 (CUDA<n>
+/// alone, over the first) on an sm_6x GPU; never by default, except where the engine asks for it (prefer_legacy_f32).
+/// For Pascal, whose FP16 runs at 1/64 of its F32 rate; the same values bit for bit.  Those kernels are built for sm_6x
+/// only: sm_70 and newer take v1.1.8's FP16 decode under that setting (false there).
+bool legacy_f32();
+/// The engine's own default for CUDA<dev> (an EXL3 expert helper on Pascal): legacy-f32 where neither
+/// MAYA_GLM_EXL3_DECODE<dev> nor MAYA_GLM_EXL3_DECODE names the device's kernels.  The choice is made once a device,
+/// at its first EXL3 call: call this before it.  Returns whether CUDA<dev> now decodes so (false on HIP and on
+/// sm_70 and newer, where legacy-f32 is not built).
+bool prefer_legacy_f32(int dev);
+/// v1.1.8's codebook decode of every state (tests): d_out[2 s], d_out[2 s + 1] (s < 65536) = the pair of states (s,
+/// s ^ 0xffff) decoded by codebook cb (0..2) with FP16 arithmetic (f32 false) or F32 (legacy-f32's; on sm_70 and newer,
+/// where it is not built, FP16's).  d_out: device, 131072 floats.  Launch failures count in launch_errors().
+void legacy_decode_table(int cb, bool f32, float* d_out, cudaStream_t s);
 
 /// Launch failures of this family since the process started (each is also printed).
 int launch_errors();

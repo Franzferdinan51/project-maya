@@ -120,6 +120,12 @@ void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float*
 void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha, float* y, cudaStream_t s);
 /// The same for T activations x[t] = x + t ldx into y + t ldy, each weight read once for all of them; each output is
 /// gemv_f16's bit for bit.
+#if defined(STRATA_USE_HIP)
+/// (DS4_PROMPT_F16) rows of n values an FP16-out GEMM left as FP16 at the start of each FP32 row (ldy floats apart), widened
+/// in place (exact); count_bad: the values that are not finite counted (widen_bad_take, the current device)
+void widen_rows_f16(float* y, int n, size_t ldy, int rows, cudaStream_t s, int count_bad = 0);
+unsigned long long widen_bad_take();
+#endif
 void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T, float alpha, float* y, size_t ldy,
                    cudaStream_t s);
 /// The router's weights on the device: F32 (f), or the pack's BF16 rows as they are (h; half the bytes to read, each
@@ -192,8 +198,8 @@ struct Rows {
 /// with candidates p = cand[t][i / blk] * blk + i % blk for i < lim.k[t] * blk; positions >= lim.n[t] (or past the
 /// query's candidates) -> -inf.  q rows heads * hd apart, w rows 64, cand rows cand_stride, out rows out_stride; the keys
 /// k rows of format kfmt (the cache's kKvFp4p, or kKvBf16).
-/// With kKvFp4p keys and DS4_INDEX_TC=1 (and tc) the tensor cores' kernel: the same products, FP32 sums in another
-/// order.
+/// With kKvFp4p keys (and tc) the tensor cores' kernel where it is on: HIP gfx11 (RDNA 3 / 3.5, its WMMAs) by default,
+/// DS4_INDEX_TC=0 off; CUDA (8.0+) with DS4_INDEX_TC=1. The same products, FP32 sums in another order.
 void index_score(const float* q, const float* w, const void* k, int heads, int hd, int T, int n, const int* cand,
                  int cand_stride, int blk, const Rows& lim, float* out, long long out_stride, cudaStream_t s,
                  int kfmt = kKvFp4p, bool tc = true);
@@ -368,6 +374,7 @@ struct Resp {
     unsigned seq;
     int pad[3];
     int cpu[kWin];   // 1: part[t] is the CPU lane's weighted sum for token t
+    int pmask[kWin];   // (DS4_LANE_PARITY) bit i: token t's pick i answered on its own in the picks buffer
     float part[kWin][kMaxDim];
 };
 /// route() for the T tokens of a window, plus: plan_ptr[t][i] = vram[idx[t][i]] (0: not on the device), each token's x
@@ -407,7 +414,7 @@ struct RoutePair {
     const float *a_logits = nullptr, *a_bias = nullptr;   // route_ahead's
     int a_n = 0, m = 0, off = 0;
     int T = 1;   // (=2: a window's rows, 1 .. kWin)
-    float rs_w = 0.0f;   // (route_pair sets these from STRATA_DS4_RESIDENT_SKIP_W / _TOPK)
+    float rs_w = 0.0f;   // (route_pair sets these from MAYA_DS4_RESIDENT_SKIP_W / _TOPK)
     int rs_k = 0;
 };
 bool route_pair(const RoutePair& a, cudaStream_t s);
@@ -427,6 +434,11 @@ void signal_seq(unsigned* flag, unsigned seq, cudaStream_t s);
 void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos,
               cudaStream_t s);
 /// acc[t] += w[t][i] * y[pos[t][i] - r0] for each pick of t (in pick order) whose sorted row is in [r0, r1).
+/// (DS4_LANE_PARITY) moe_combine's sum exact and order-free: acc64 (2^-32 units) += round(w y 2^32) for each pick;
+/// moe_x_finish: acc[i] += acc64[i] 2^-32 (one F32 rounding) after the layer's last set
+void moe_combine_x(long long* acc, const float* y, const int* pos, const float* w, int T, int k, int r0, int r1,
+                   int dim, cudaStream_t s);
+void moe_x_finish(float* acc, const long long* acc64, size_t n, cudaStream_t s);
 void moe_combine(float* acc, const float* y, const int* pos, const float* w, int T, int k, int r0, int r1, int dim,
                  cudaStream_t s);
 /// rows[t][0] = 1, the rest 0 (the first layer's pre-mix: stream 0).
@@ -504,7 +516,7 @@ constexpr int kAr2Piece = 8192;   // (float4s a piece: 128 KB of F32 rows, 64 KB
 void tab_set(const unsigned long long* pairs, int n, cudaStream_t s);
 /// A group of two with pflags (DS4_AR2): ar2_kernel, the put and the sums in one pipelined launch
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s);
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
 constexpr int kPeerArBlocks = 64, kPeerArFlagStride = 32;
 // Optional diagnostic written only by the first block to set the timeout bit.
 struct PeerArFailure {
@@ -530,6 +542,8 @@ struct PeerAr {
     uint64_t timeout_ticks = 0; // HIP wall_clock64 ticks, calibrated with hipDeviceAttributeWallClockRate.
 };
 bool allreduce_peer(float* x, int n, const PeerAr& a, int mi, unsigned seq, cudaStream_t s);
+/// load the transports' kernels on the current device before any of them spins (CUDA lazy loading; HIP: no-op)
+void peer_ar_preload();
 enum class PeerTransport { host, ar2, peer };
 struct PeerCalibration {
     PeerTransport selected = PeerTransport::host;

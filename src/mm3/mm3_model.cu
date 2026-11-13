@@ -29,6 +29,8 @@
 #include <thread>
 #include <tuple>
 
+#include "../core/ablate_capture.hpp"   // (MAYA_ABLATE_CAPTURE: the direction fitting's read-out)
+#include "mm3_ablate.hpp"
 #include "mm3_cands.hpp"
 #include "mm3_cpu.hpp"
 #include "mm3_env.hpp"
@@ -166,6 +168,7 @@ struct Dev {
     float *win_h = nullptr, *win_part = nullptr;
     float* attp = nullptr;               // a token's / a window's attention splits' partials (k::attn_part_floats)
     float* wtmp = nullptr;               // (Q8_0 indexer projections) the prompt path's F32 copy of one of them
+    float* abl_r = nullptr;              // (--ablate) the direction projected out of each residual write (null: off)
     // scratch (chunk rows)
     float *h = nullptr, *xn = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *iq = nullptr, *ik = nullptr;
     float *bs = nullptr, *att = nullptr, *ao = nullptr, *g = nullptr, *u = nullptr, *logit = nullptr, *w = nullptr;
@@ -408,6 +411,7 @@ struct Model::Impl {
     uint8_t* pool = nullptr;         // the pinned pool
     std::unique_ptr<CpuLane> lane;
     std::unique_ptr<Draft> draftm;   // the DSpark draft (on the head's GPU)
+    double draft_plan = 0.0;         // plan_memory's room for it (bytes: the draft, its taps, a margin)
     int last_done = 0;               // the last forward's tokens in the cache
     int chunk_run = 0;               // (the prefill calibration: a forward's chunk, at most o.chunk - 0: o.chunk)
     int run_chunk() const { return chunk_run > 0 ? std::min(chunk_run, o.chunk) : o.chunk; }
@@ -416,6 +420,40 @@ struct Model::Impl {
     std::vector<Model::Image> imgs;  // the pictures the image tokens of the next forwards take their rows from
     float* taps = nullptr;           // its context's input: [taps][chunk][dim] F32 (the head's GPU)
     std::vector<int> tap_of;         // layer -> its tap (-1: none)
+    // --ablate (mm3_ablate.hpp): the unit direction (empty: off; a copy on every GPU, Dev::abl_r) and its scale
+    std::vector<float> abl_dir;
+    float abl_scale = 0.0f;
+    // ... per sequence whether its forwards project it out (set_ablate; empty: no direction)
+    std::vector<uint8_t> abl_on;
+    bool abl_row(int s) const { return s >= 0 && s < (int) abl_on.size() && abl_on[(size_t) s] != 0; }
+    // whether any row of this forward (T rows: forward_rows' rseq, else the bound sequence's) projects it out - the
+    // prompt path's split products (gemm_acc, the MoE's write into out) only then, else its fused adds as without
+    bool abl_any(const Dev& d, int T) const {
+        if (d.abl_r == nullptr || abl_on.empty()) return false;
+        if (rseq.empty() || (int) rseq.size() != T) return abl_row(bound);
+        for (int s : rseq)
+            if (abl_row(s)) return true;
+        return false;
+    }
+    // a residual write y [T][dim] (the attention's or the FFN's, before h += y) loses its component along it - the rows
+    // whose sequence asks, a run of rows of one setting at a time (the kernel is a block a row: a row comes out the same
+    // whatever else the launch holds; a row left out is not touched)
+    void ablate(const Dev& d, float* y, int T) const {
+        if (d.abl_r == nullptr || abl_on.empty()) return;
+        if (rseq.empty() || (int) rseq.size() != T) {
+            if (!abl_row(bound)) return;
+            if (strata::ablcap::on()) return strata::ablcap::put(y, T, g.dim, d.s);   // (a fitting run: read out)
+            k::project_out(y, d.abl_r, abl_scale, T, g.dim, d.s);
+            return;
+        }
+        for (int t = 0; t < T;) {
+            const bool on = abl_row(rseq[(size_t) t]);
+            int u = t + 1;
+            while (u < T && abl_row(rseq[(size_t) u]) == on) ++u;
+            if (on) k::project_out(y + (size_t) t * g.dim, d.abl_r, abl_scale, u - t, g.dim, d.s);
+            t = u;
+        }
+    }
 
     // ---- MAYA_MM3_PROF=1 (one GPU): each forward's GPU time by part, from events on the stream - the time between two
     // marks goes to the second's part (a host wait before it included); printed at the end by kind of forward
@@ -903,6 +941,15 @@ struct Model::Impl {
         size_t blob_max = 0;
         for (int li = 0; li < g.n_layers; ++li)
             if (g.moe[(size_t) li]) blob_max = std::max(blob_max, blob_estimate(li));
+        // the DSpark draft's room on the head's GPU: what its load will hold (Draft::plan_bytes, its MXFP8 matrices as
+        // stored), its taps buffer and 0.1 GB beside (was a flat 3 GB: MiniMax-M3.1-Flash's draft holds 2.5 GB, its taps
+        // 0.13 GB at --chunk 1024, 0.5 GB at 4096); a draft geometry the pack does not give: 3 GB
+        draft_plan = 0.0;
+        if (o.dspark) {
+            const size_t db = Draft::plan_bytes(pk, o.chunk);
+            const size_t taps = pk.ints("dspark.dspark_target_layer_ids").size() * (size_t) o.chunk * (size_t) g.dim * 4;
+            draft_plan = db > 0 ? (double) (db + taps) + 0.1 * GB : 3.0 * GB;
+        }
         auto fixed_of = [&](size_t di, int slots) {
             double b = 0;
             for (int li : D[di].layers) b += (double) dense_bytes(li);
@@ -913,7 +960,7 @@ struct Model::Impl {
             if (di + 1 == D.size()) {                                               // (the output head, its logits)
                 const Tensor* h = pk.get(gguf ? "language_model.lm_head.weight" : "language_model.lm_head.trellis");
                 b += (h ? (double) h->bytes : 0.0) + 32.0 * g.vocab * 4;
-                if (o.dspark) b += 3.0 * GB;
+                b += draft_plan;
             }
             // (the vision tower: no room - it stays in host memory, a picture's room lent by the staging slots)
             if (gguf) b += (double) gg::scratch_bytes();   // (the GGUF kernels' activations, FP16 bands, cuBLAS)
@@ -1005,6 +1052,13 @@ struct Model::Impl {
             }
         }
         if (!pk.load(o.pack, err) || !g.read(pk, err)) return false;
+        if (!o.ablate.empty()) {   // (--ablate: the direction read once, a copy on every GPU with the scratch)
+            abl_scale = o.ablate_scale;
+            std::string what;
+            if (!::mm3::ablate::load(o.ablate,o.ablate_layer, g.dim, abl_scale, abl_dir, what, err)) return false;
+            info.push_back(what);
+            abl_on.assign((size_t) std::max(1, o.seqs), o.ablate_default ? 1 : 0);
+        }
         gguf = pk.str("format") == "gguf";
         if (gguf) {   // (the prompt GEMMs' backend; hipBLASLt's measured kernels kept beside the pack)
             const char* ls = ::mm3::env("MM3_LT_STORE");
@@ -1144,6 +1198,10 @@ struct Model::Impl {
                 !A(inv_dev[di], inv_freq.size()))
                 return false;
             CK(cudaMemcpy(inv_dev[di], inv_freq.data(), inv_freq.size() * 4, cudaMemcpyHostToDevice));
+            if (!abl_dir.empty()) {
+                if (!A(d.abl_r, abl_dir.size())) return false;
+                CK(cudaMemcpy(d.abl_r, abl_dir.data(), abl_dir.size() * 4, cudaMemcpyHostToDevice));
+            }
             // before sm_80 (V100, T4, RTX 20): the prompt path's busy matrices as cuBLAS FP16 GEMMs over their decoded
             // weights - a handle and 160 MB of scratch for this GPU's stream (none: the tensor-core tiles take them)
             if (gguf) {   // (a GGUF's kernels: their activations' rows, FP16 weight bands and cuBLAS, before the weights)
@@ -1328,6 +1386,10 @@ struct Model::Impl {
             info.push_back("DSpark draft: " + std::to_string(draftm->bytes() >> 20) + " MB on CUDA" +
                            std::to_string(hd.id) + ", block " + std::to_string(draftm->geo().block) + ", taps " +
                            std::to_string(tl.size()));
+            const double held = (double) draftm->bytes() + (double) (tl.size() * (size_t) o.chunk * g.dim * 4);
+            if (held > draft_plan)   // (Draft::plan_bytes no longer what load() holds: the placement left too little)
+                info.push_back("DSpark draft: " + std::to_string((long long) held >> 20) + " MB with its taps, over the " +
+                               std::to_string((long long) draft_plan >> 20) + " MB the placement planned");
         }
         // the vision tower, also before the experts take the memory (on by default: a pack without one runs text only)
         if (o.vision && o.vision_auto && !Vision::in_pack(pk)) {
@@ -1664,7 +1726,8 @@ struct Model::Impl {
             }
             graph_on = (gv == nullptr || std::atoi(gv) != 0) && D.size() == 1 && nhf > 0 && nhf == nmoe &&
                        !o.verbose &&
-                       ::mm3::env("MM3_DUMP_HS") == nullptr;
+                       ::mm3::env("MM3_DUMP_HS") == nullptr &&
+                       !strata::ablcap::on();   // (a fitting run's read-out waits on the host: not in a capture)
             if (graph_on) info.push_back("decode: a token's and a verify window's forward replayed as a graph");
         }
         for (Dev& d : D) {
@@ -1874,6 +1937,7 @@ struct Model::Impl {
             err = "mv o (window)";
             return false;
         }
+        ablate(d, d.ao, T);
         k::add(d.h, d.ao, (size_t) T * g.dim, d.s);
         k::rms(d.h, l.post1, T, g.dim, g.eps, d.xn, nullptr, d.s);
         pmark(d, kPOut);
@@ -1889,6 +1953,7 @@ struct Model::Impl {
                 err = "mv dense down (window)";
                 return false;
             }
+            ablate(d, d.ao, T);
             k::add(d.h, d.ao, (size_t) T * g.dim, d.s);
             pmark(d, kPDense);
             return true;
@@ -1967,6 +2032,7 @@ struct Model::Impl {
                 err = "win_experts";
                 return false;
             }
+            ablate(d, d.out, T);
             k::add(d.h, d.out, (size_t) T * g.dim, d.s);
             pmark(d, kPExperts);
             return true;
@@ -2075,6 +2141,7 @@ struct Model::Impl {
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile unsigned*) wait_word = d.win_wait;
         }
+        ablate(d, d.out, T);
         k::add(d.h, d.out, (size_t) T * g.dim, d.s);
         pmark(d, kPExperts);
         return true;
@@ -2289,6 +2356,7 @@ struct Model::Impl {
             err = "mv o";
             return false;
         }
+        ablate(d, d.ao, 1);
         k::add(d.h, d.ao, (size_t) g.dim, d.s);
         k::rms(d.h, l.post1, 1, g.dim, g.eps, d.xn, nullptr, d.s);
         pmark(d, kPOut);
@@ -2304,6 +2372,7 @@ struct Model::Impl {
                 err = "mv dense down";
                 return false;
             }
+            ablate(d, d.ao, 1);
             k::add(d.h, d.ao, (size_t) g.dim, d.s);
             pmark(d, kPDense);
             return true;
@@ -2347,6 +2416,7 @@ struct Model::Impl {
             a.limit = g.limit;
             x3::moe_gate_up(a, d.xn, nullptr, d.s);
             x3::moe_down(a, nullptr, d.sh, d.out, d.s);
+            ablate(d, d.out, 1);
             k::add(d.h, d.out, (size_t) g.dim, d.s);
             pmark(d, kPExperts);
             return true;
@@ -2419,6 +2489,7 @@ struct Model::Impl {
             a.cpu_flag = (const int*) (d.cpu_d + g.dim);
         }
         x3::moe_down(a, nullptr, d.sh, d.out, d.s);
+        ablate(d, d.out, 1);
         k::add(d.h, d.out, (size_t) g.dim, d.s);
         pmark(d, kPExperts);
         // (the plan's pinned copy is rewritten by the next MoE layer of this GPU after its routing sync, which
@@ -2541,11 +2612,12 @@ struct Model::Impl {
         const int di = l.dev;
         if (T == 1 && o.fast_decode && rseq.empty()) return layer_token(l, d, di, err);   // (rows: the window's)
         if (T <= kWin && o.fast_decode) return layer_window(l, d, di, T, err);
-        // h += x W: the BLAS's beta 1; with hipBLASLt (beta 0 products only) the product into ao, then the add - the
-        // same sum of the product and h
+        // h += x W: the BLAS's beta 1; with hipBLASLt (beta 0 products only) or --ablate the product into ao, then the
+        // add - the same sum of the product and h (projected first: ablate)
         const auto gemm_acc = [&](const x3::Mat& m, const uint16_t* x16, int ldx) {
-            if (gguf && gg::gemm_backend() == 1) {
+            if ((gguf && gg::gemm_backend() == 1) || abl_any(d, T)) {
                 x3::gemm_rows(m, x16, ldx, T, d.ao, g.dim, 0.0f, d.s);
+                ablate(d, d.ao, T);
                 k::add(d.h, d.ao, (size_t) T * g.dim, d.s);
             } else {
                 x3::gemm_rows(m, x16, ldx, T, d.h, g.dim, 1.0f, d.s);
@@ -2622,8 +2694,14 @@ struct Model::Impl {
         st.profiled += (long) top.size();
         pmark(d, kPSync);
         if (!experts(l, d, T, top, err)) return false;
-        k::moe_combine(d.h, d.y, d.invrow, d.w, d.sh, T, g.k_exp, g.dim, g.scale, d.out, d.s);
-        std::swap(d.h, d.out);
+        if (abl_any(d, T)) {   // (--ablate: the MoE's write alone into out, projected, then added to h)
+            k::moe_combine(nullptr, d.y, d.invrow, d.w, d.sh, T, g.k_exp, g.dim, g.scale, d.out, d.s);
+            ablate(d, d.out, T);
+            k::add(d.h, d.out, (size_t) T * g.dim, d.s);
+        } else {
+            k::moe_combine(d.h, d.y, d.invrow, d.w, d.sh, T, g.k_exp, g.dim, g.scale, d.out, d.s);
+            std::swap(d.h, d.out);
+        }
         pmark(d, kPExperts);
         return true;
     }
@@ -3122,12 +3200,17 @@ bool Model::load(const Options& o_in, std::string& err) {
     p->tkey = tune_key_of(o.gpus);
     p->tfile = o.prefill_tune.empty() ? o.pack + "/prefill-tune.txt" : o.prefill_tune;
     std::string tuned;
+    bool other_calibration = false;   // (a line of another key on file: another GPU list, runtime or driver)
     if (o.tune && o.tp <= 0) {
         std::ifstream f(p->tfile);
         for (std::string line; std::getline(f, line);) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
             const size_t tab = line.find('\t');
-            if (tab == std::string::npos || line.compare(0, tab, p->tkey) != 0) continue;
+            if (tab == std::string::npos) continue;
+            if (line.compare(0, tab, p->tkey) != 0) {
+                if (line.compare(0, 14, "mm3-prefill-1|") == 0) other_calibration = true;
+                continue;
+            }
             std::istringstream is(line.substr(tab + 1));
             for (std::string kv; is >> kv;) {
                 const size_t eq = kv.find('=');
@@ -3164,6 +3247,24 @@ bool Model::load(const Options& o_in, std::string& err) {
                                             "split instead");
             return ok;
         }
+    }
+    if (o.tp > 0 && !o.ablate.empty() && !o.ablate_default) {
+        // (--ablate-default off - the server's per-request switch: the tensor-parallel path the user picked stays, the
+        //  direction is not loaded - no INFO ablate, so the page says the switch is not there with --tp)
+        Options o2 = o;
+        o2.ablate.clear();
+        const bool ok = load(o2, err);
+        p->info.insert(p->info.begin(), "NOTE: --tp " + std::to_string(o.tp) + ": no --ablate (the tensor-parallel "
+                                        "path does not project; the layer split does)");
+        return ok;
+    }
+    if (o.tp > 0 && !o.ablate.empty()) {   // (--ablate: the layer split's residual writes - not the host's sums)
+        Options o2 = o;
+        o2.tp = 0;
+        const bool ok = load(o2, err);   // (as --parallel's: the layer split's prefill calibration read)
+        p->info.insert(p->info.begin(), "NOTE: --tp " + std::to_string(o.tp) + " with --ablate: the layer split "
+                                        "instead (the tensor-parallel path does not project)");
+        return ok;
     }
 #if defined(_WIN32)
     // Windows: the tensor-parallel path's host waits on the GPUs' counters depend on its launches being submitted as
@@ -3202,7 +3303,10 @@ bool Model::load(const Options& o_in, std::string& err) {
                           (p->gguf ? std::string(", ") + (gg::gemm_backend() == 1 ? "hipBLASLt" : "BLAS") + " GEMMs" : ""));
     else if (o.tune && o.tp <= 0)
         p->info.push_back("NOTE: prefill not calibrated on this PC (./maya.sh --calibrate measures it): chunk " +
-                          std::to_string(p->o.chunk));
+                          std::to_string(p->o.chunk) +
+                          (other_calibration ? std::string("; ") + p->tfile + " holds a calibration of other GPUs, "
+                                               "another GPU list or another runtime / driver: run it again for this setup"
+                                             : std::string()));
     return true;
 }
 int Model::chunk() const { return tpe ? 0 : p->run_chunk(); }
@@ -3369,6 +3473,11 @@ int Model::seqs() const { return tpe || p->L.empty() ? 1 : (int) std::max<size_t
 void Model::bind(int s) {
     if (!tpe) p->bind(s);
 }
+bool Model::ablate_loaded() const { return !tpe && !p->abl_on.empty(); }
+void Model::set_ablate(bool on) {
+    if (ablate_loaded() && p->bound >= 0 && p->bound < (int) p->abl_on.size()) p->abl_on[(size_t) p->bound] = on ? 1 : 0;
+}
+bool Model::ablating() const { return ablate_loaded() && p->abl_row(p->bound); }
 
 bool Model::forward_rows(const int* ids, const int* seq, const int* pos, int R, float* logits_out, std::string& err) {
     if (R <= 0) return true;

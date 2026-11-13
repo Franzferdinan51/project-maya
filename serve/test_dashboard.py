@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -26,14 +27,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class Dashboard(unittest.TestCase):
     def setUp(self):
-        os.environ["STRATA_MOCK_RELOAD_S"] = "0.3"
+        os.environ["MAYA_MOCK_RELOAD_S"] = "0.3"
         tok = ByteTokenizer()
         self.engine = MockEngine(tok, "</think>\n\nhello", max_context=32768)
         self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         self.tmp = tempfile.TemporaryDirectory()
         self.cfg = Path(self.tmp.name) / "maya-test.json"
         self.cfg.write_text(json.dumps({"exe": "strata", "args": ["--glm-pack", "/x/pack", "--max-context", "32768"],
-                                        "env": {"STRATA_GLM_RAM_GB": "20", "MY_API_KEY": "secret"}}, indent=1))
+                                        "env": {"MAYA_GLM_RAM_GB": "20", "MY_API_KEY": "secret"}}, indent=1))
         self.svc.config_path = str(self.cfg)
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
@@ -68,6 +69,14 @@ class Dashboard(unittest.TestCase):
     def test_health_has_the_version(self):
         s, _, b = self.req("GET", "/health")
         self.assertEqual(json.loads(b)["version"], MAYA_VERSION)
+
+    def test_health_history_thinking(self):
+        """A Qwen3.x template keeps past thinking: the web chat is told to send it back (the GLM-5 one: not)."""
+        s, _, b = self.req("GET", "/health")
+        self.assertIs(json.loads(b)["history_thinking"], True)
+        self.svc.template = ChatTemplate(ROOT / "serve/glm5_chat_template.jinja")
+        s, _, b = self.req("GET", "/health")
+        self.assertIs(json.loads(b)["history_thinking"], False)
 
     def test_context_range(self):
         s, _, b = self.req("GET", "/api/context")
@@ -105,7 +114,7 @@ class Dashboard(unittest.TestCase):
         self.assertEqual((j["reload"]["state"], j["context"]), ("done", 65536))
         args = json.loads(self.cfg.read_text())["args"]
         self.assertEqual(args[args.index("--max-context") + 1], "65536")
-        self.assertEqual(json.loads(self.cfg.read_text())["env"]["STRATA_GLM_RAM_GB"], "20")   # the rest kept
+        self.assertEqual(json.loads(self.cfg.read_text())["env"]["MAYA_GLM_RAM_GB"], "20")   # the rest kept
         self.assertGreaterEqual(j["load_s"], 0.3)       # (how long that load took: the page's estimate of the next)
         # the setup's own size is kept for the Models page's "Reset to the setup's values", through later reloads
         self.assertEqual(json.loads(self.cfg.read_text())["installer"]["as_set_up"]["context"], 32768)
@@ -174,7 +183,7 @@ class Dashboard(unittest.TestCase):
         self.assertFalse(row["spec_off"])
 
     def test_chat_gets_503_while_reloading(self):
-        os.environ["STRATA_MOCK_RELOAD_S"] = "1.5"
+        os.environ["MAYA_MOCK_RELOAD_S"] = "1.5"
         self.req("POST", "/api/context", {"max_context": 16384})
         s, h, b = self.req("POST", "/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual(s, 503)
@@ -517,6 +526,21 @@ class GpuMap(unittest.TestCase):
         (h,) = self.gm.view([self.r], [], engine_pid=100)
         self.assertEqual((h["parts"]["prompt"], h["parts"]["tp"], h["tp_n"]), (0, 0, 0))
 
+    def test_tensor_parallel_room_is_the_groups_least_free(self):
+        # (a --tp 2 pair holds the same expert slots: the 8 GB GPU 1 has beyond GPU 0's 1 GB give no expert more)
+        def line(dev, free, layers):
+            return self.gm.parse(f"VRAM dev={dev} pci=0000:0{dev + 1}:00.0 total={24 * GB} free={free} weights={GB} "
+                                 f"kv=0 kv_ram=0 act=0 drafter=0 window=0 pool={10 * GB} tail=0 borrow=0 vision=0 "
+                                 f"vision_own=0 prompt=0 tp=0 tp_n=2 slots=2000 ctx=65536 layers={layers}")
+        a, b, c, d = self.gm.view([line(0, GB, "0-20"), line(1, 9 * GB, "0-20"), line(2, 5 * GB, "21-42"),
+                                   line(3, 3 * GB, "21-42")], [], engine_pid=100)
+        self.assertEqual((a["tp_group"], b["tp_group"], c["tp_group"], d["tp_group"]), (0, 0, 2, 2))
+        self.assertEqual((a["tp_room"], b["tp_room"]), (a["free"], a["free"]))
+        self.assertGreater(b["free"] - b["tp_room"], 7 * GB)
+        self.assertEqual((c["tp_room"], d["tp_room"]), (d["free"], d["free"]))
+        (h,) = self.gm.view([self.r], [], engine_pid=100)        # (no group: as before)
+        self.assertNotIn("tp_room", h)
+
     def test_two_parts_on_one_card_add_up(self):
         a = dict(self.r, layers=[0, 20], slots=500)
         b = dict(self.r, layers=[20, 45], slots=700, free=self.r["free"] - GB)
@@ -691,6 +715,45 @@ class PageLogic(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr[-2000:])
         return json.loads(r.stdout.strip().splitlines()[-1])
 
+    def test_glm53_keeps_its_own_chat_defaults(self):
+        # GLM-5.3 (744B, "glm-5.3") and GLM-5.3-Flash shared "maya.sampling" before v1.1.59: the 744B gets its own
+        # key, which starts once from what was saved there - Flash's stays as it was, and nothing is lost
+        got = self.node("""
+const mem = new Map();
+globalThis.localStorage = {getItem: (k) => (mem.has(k) ? mem.get(k) : null), setItem: (k, v) => mem.set(k, String(v)),
+                           removeItem: (k) => mem.delete(k), key: (i) => [...mem.keys()][i], get length() { return mem.size; }};
+const read = (k) => JSON.parse(mem.get("maya." + k) || "null");
+const out = {};
+mem.set("maya.sampling", JSON.stringify({prefs_v: 3, temperature: 0.3, system: "Be brief", sys_default: true}));
+st.S.health = {model: "glm-5.3", model_label: "GLM-5.3 (744B) · Maya-XS"};
+mem.set("maya.model", JSON.stringify(st.modelId()));
+out.key744 = st.prefsKey();
+out.migrated = read("sampling_glm53");
+st.loadPrefs(); st.savePrefs({temperature: 0.9});
+out.after744 = read("sampling_glm53").temperature; out.flashKept = read("sampling").temperature;
+mem.set("maya.sampling", JSON.stringify({prefs_v: 3, temperature: 0.5}));
+st.prefsKey();
+out.once = read("sampling_glm53").temperature;              // (only once: never over the 744B's own again)
+st.S.health = {model: "glm-5.3-flash", model_label: "GLM-5.3-Flash · Maya-L"};
+out.keyFlash = st.prefsKey();
+st.S.health = {model: "deepseek-v4.1-flash", model_label: "x"};
+out.keyDs = st.prefsKey();
+// a first start after the update straight on another model: the 744B's copy is made before a switch clears choices
+mem.clear();
+mem.set("maya.sampling", JSON.stringify({prefs_v: 3, temperature: 0.3, system: "Be brief"}));
+mem.set("maya.model", JSON.stringify("glm-5.3|GLM-5.3 (744B) · Maya-XS"));
+st.S.health = {model: "glm-5.3-flash", model_label: "GLM-5.3-Flash · Maya-L"};
+out.switched = st.newModelCheck();
+out.switch744 = read("sampling_glm53");
+console.log(JSON.stringify(out));""")
+        self.assertEqual(got["key744"], "sampling_glm53")
+        self.assertEqual(got["migrated"], {"prefs_v": 3, "temperature": 0.3, "system": "Be brief", "sys_default": True})
+        self.assertEqual((got["after744"], got["flashKept"]), (0.9, 0.3))
+        self.assertEqual(got["once"], 0.9)
+        self.assertEqual((got["keyFlash"], got["keyDs"]), ("sampling", "sampling_deepseek"))
+        self.assertTrue(got["switched"])
+        self.assertEqual(got["switch744"]["system"], "Be brief")                 # (kept: not a sampling choice)
+
     def test_thinking_pill_covers_the_chosen_level_only(self):
         # the owner's phone: Low chosen, the fill spanned Off and Low.  Every model's levels, every level: the pill sits
         # on that level's segment alone
@@ -711,6 +774,31 @@ console.log(JSON.stringify(out));""")
                     self.assertAlmostEqual(pill["at"], 100 * i / n)
                     self.assertAlmostEqual(pill["width"], 100 / n)      # (one segment wide: not from 0 up to it)
         self.assertEqual(got["glm-5.3-flash"][1][1]["at"], 25)            # Low: the second quarter only
+
+    def test_free_room_a_tensor_parallel_partner_cannot_use_promises_no_experts(self):
+        # a --tp 2 pair: GPU 1 has 9 GB free, GPU 0 (with the drafter) 1 GB - the members hold the same expert slots, so
+        # a restart gives none more; the room is idle, a DSpark block moved there can use it
+        got = self.node("""
+const {freeAdvice} = await import(web + "/monitor.js");
+const G = 2 ** 30, more = (g, b) => Math.max(0, Math.floor(b / (g.parts.pool / g.slots)));
+const where = (gs) => gs.map((g) => "GPU " + g.index).join(" and "), pools = () => "the pools";
+const m = (index, free, room, drafter) => ({index, dev: index, free, tp_room: room, tp_group: 0, slots: 1000,
+                                           parts: {pool: 10 * G, drafter}});
+const pair = [m(0, G, G, G), m(1, 9 * G, G, 0)], both = [m(0, 5 * G, 5 * G, 0), m(1, 7 * G, 5 * G, 0)];
+const plain = [{index: 0, dev: 0, free: 5 * G, slots: 1000, parts: {pool: 10 * G}}];
+console.log(JSON.stringify({
+  pair: freeAdvice([pair[1]], pair, {engine_kind: "ds4"}, where, pools, more),
+  mm3: freeAdvice([pair[1]], pair, {engine_kind: "mm3"}, where, pools, more),
+  both: freeAdvice(both, both, {engine_kind: "ds4"}, where, pools, more),
+  plain: freeAdvice(plain, plain, {engine_kind: "ds4"}, where, pools, more)}));""")
+        self.assertNotIn("restart gives the pools", got["pair"])
+        self.assertIn("GB of GPU 1 sit idle", got["pair"])
+        self.assertIn("MAYA_DS4_DRAFT_DEV", got["pair"])
+        self.assertNotIn("MAYA_DS4_DRAFT_DEV", got["mm3"])
+        # (both have room: 5 GB each grows the pair's slots once - 400 experts, not 800; GPU 1's other 2 GB idle)
+        self.assertIn("are free: a restart gives the pools about 400 more experts.", got["both"])
+        self.assertIn("GB of GPU 1 sit idle", got["both"])
+        self.assertTrue(got["plain"].endswith("GB of GPU 0 are free: a restart gives the pools about 400 more experts."))
 
     def test_speculation_says_off_waiting_or_the_acceptance(self):
         # the Monitor's Speculation, three states: off (no drafter, or the request asked for none: "off" in the field and
@@ -769,6 +857,51 @@ console.log(JSON.stringify({glm: sv.tierShares(n, {experts: 2000}), none: sv.tie
         self.assertEqual((got["ds4"]["total"], got["ds4"]["disk"], got["ds4"]["diskGb"]), (440, 300, 75.5))
         self.assertIsNone(got["none"]["diskGb"])                                   # (an engine that reports no bytes: the count alone)
         self.assertEqual((got["full"]["disk"], got["full"]["diskGb"]), (0, 0))
+
+    def test_qwen_file_reads_are_named_for_what_they_count_and_the_ssd_tip_needs_ssd_only_experts(self):
+        # Mercury's Monitor, Qwen3.8 UD-IQ2_XS on 1x V100: 13,199 experts in VRAM, 11,377 in pinned RAM, none on the SSD
+        # alone - but 8.23 experts a token read from the model file; the card said "From SSD" and advised more RAM
+        got = self.node("""
+const m = await import(web + "/monitor.js");
+const q = {engine_kind: "qwen", experts: 24576}, n = {vram_used: 13199, ram_used: 11377, disk: 8.23, vram_hit: 0.93};
+const g = {experts: 2000}, gn = {vram_used: 300, ram_used: 500, disk: 4, vram_hit: 0.9};
+console.log(JSON.stringify({set: m.tierSet(q).find((x) => x.key === "disk"), glmSet: m.tierSet(g).find((x) => x.key === "disk"),
+  homes: m.tierTip(n, q, {disk: sv.tierShares(n, q).disk}),
+  ssdOnly: m.tierTip({...n, ram_used: 9000}, q, {disk: sv.tierShares({...n, ram_used: 9000}, q).disk}),
+  glm: m.tierTip(gn, g, {disk: sv.tierShares(gn, g).disk}), stale: m.tierTip(gn, g, {disk: 1200, stale: true}),
+  cfCpu: m.tierTip({vram_used: 100, ram_used: 24476, disk: 0, vram_hit: 0.3}, q, {disk: 0})}));""")
+        self.assertEqual(got["set"]["label"], "From the model file")
+        self.assertIn("page cache or SSD", got["set"]["sub"])
+        self.assertEqual(got["glmSet"]["label"], "From SSD")                    # (GLM's own reads: unchanged)
+        self.assertEqual(got["homes"], "")                                      # every expert has a home: no "more RAM"
+        self.assertTrue(got["ssdOnly"].startswith("Many experts are read from the SSD"))   # 2,377 on the SSD alone
+        self.assertTrue(got["glm"].startswith("Many experts are read from the SSD"))
+        self.assertEqual(got["stale"], "")
+        self.assertTrue(got["cfCpu"].startswith("Most experts run on the CPU"))
+
+    def test_about_has_the_support_line_always_and_the_update_card_none(self):
+        # owner 2026-11-05: one line on About (always, also while an update shows), its link on "supporting me" in bold
+        # violet; no row under an update's button; the sidebar's heart stays
+        web = ROOT / "serve" / "web"
+        js = (web / "settings.js").read_text(encoding="utf-8")
+        line = js[js.index("const SupportLine"):js.index("function UpdateCard")]
+        body = line.split("<span>", 1)[1].split("</span></p>", 1)[0].replace('${" "}', " ")
+        text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", body))
+        self.assertEqual(text, "I build Maya because I believe everyone should have access to great local AI. If you enjoy "
+                               "what I'm building, consider supporting me. Every little bit helps keep the project alive "
+                               "and growing. ❤️")
+        self.assertRegex(line, r'<a class="support-link" href=\$\{SUPPORT_URL\} target="_blank" rel="noopener"\s+'
+                               r'title="[^"]*">supporting me</a>')
+        self.assertNotIn('name="heart"', line)                               # (no second heart before the text)
+        card = js[js.index("function UpdateCard"):js.index("\n}\n", js.index("function UpdateCard"))]
+        self.assertNotIn("SupportLine", card)
+        self.assertIn("<${UpdateCard}/>\n    <${SupportLine}/>", js)               # (About: always, under the update)
+        css = (web / "settings.css").read_text(encoding="utf-8")
+        rule = re.search(r"\.set-support \.support-link \{([^}]*)\}", css).group(1)
+        self.assertIn("font-weight: 700", rule)
+        self.assertIn("color: var(--st-accent-text)", rule)
+        self.assertEqual(len(re.findall(r"--st-accent-text:\s*#", (web / "tokens.css").read_text(encoding="utf-8"))), 2)
+        self.assertIn("heart-link", (web / "sidebar.js").read_text(encoding="utf-8"))   # (the sidebar's heart stays)
 
     def test_context_slider_reaches_each_models_own_top(self):
         # the Models page's Context size: Settings > Model's stops over each model's range (its trained context, up to

@@ -5,8 +5,8 @@ import {Component, html, useEffect, useLayoutEffect, useRef, useState} from "./p
 import {SPRITE, coarse, ctxfmt, esc, fmt, isPhone, modelName, timeStr, tokfmt} from "./lib.js";
 import {LEVELS, P, PRESET_NAMES, S, copyText, emit, presetOf, savePrefs, thinkPill, thinkTitles} from "./state.js";
 import {mcpOn} from "./server.js";
-import {addFiles, cancelEdit, chatView, ctxMeter, editMessage, focusInput, newChat, painters, regenerate,
-        removeAttachment, scrollDown, send, setThinking, stopAnswer, thinkingOf, updateCtxMeter} from "./chats.js";
+import {addFiles, cancelEdit, chatView, ctxMeter, editMessage, focusInput, levelLeftAtDefault, newChat, painters,
+        regenerate, removeAttachment, scrollDown, send, setThinking, stopAnswer, thinkingOf, updateCtxMeter} from "./chats.js";
 import {markdown, onCodeClick, patchHtml, streamingMarkdown} from "./md.js";
 import {ChatMenuItems, openSettings, setSide, showView, status, usd} from "./sidebar.js";
 import {MS, loadModels} from "./models.js";
@@ -91,7 +91,8 @@ function UserMsg({m, i}) {
   return html`<div class="you" data-id=${m.id}>
     ${(m.files || []).length || (m.images || []).length ? html`<div class="you__files">
       ${(m.files || []).map((f) => html`<span class="chip"><${Icon} name="attach" sm/>${f.name}</span>`)}
-      ${(m.images || []).map((im) => im.url ? html`<img src=${im.url} alt=${im.name || "picture"}/>`
+      ${(m.images || []).map((im) => im.url ? (im.kind === "video" ? html`<video src=${im.url} controls preload="metadata" aria-label=${im.name || "video"}></video>`
+                                                                     : html`<img src=${im.url} alt=${im.name || "picture"}/>`)
                                             : html`<span class="chip"><${Icon} name="image" sm/>${im.name || "picture"}</span>`)}</div>` : null}
     ${m.text ? html`<div class="you__bubble">${m.text}</div>` : null}
     <div class="you__actions"><span class="you__time">${m.time ? timeStr(m.time) : ""}</span>
@@ -208,8 +209,12 @@ class Answer extends Component {
         m.thinkSecs != null ? `Thought for ${fmt(m.thinkSecs, 1)} s` : "Thoughts";
       det.classList.toggle("is-live", thinkingNow);
       const body = det.querySelector(".think__body");
-      if (det.open || thinkingNow) body.textContent = m.reasoning;
-      else body.dataset.pending = "1";
+      if (det.open || thinkingNow) {
+        // (live: the box's own scroll follows the newest thoughts down, as the chat does - unless the reader scrolled it up)
+        const atEnd = body.scrollHeight - body.scrollTop - body.clientHeight < 24;
+        body.textContent = m.reasoning;
+        if (thinkingNow && atEnd) body.scrollTop = body.scrollHeight;
+      } else body.dataset.pending = "1";
       // open while it streams (if wanted), closed once the answer starts - unless the reader toggled it themselves
       if (thinkingNow && P.show && !det.dataset.touched && !det.open) { det._auto = true; det.open = true; }
       if (!thinkingNow && det.open && !det.dataset.touched) { det._auto = true; det.open = false; }
@@ -296,7 +301,11 @@ function ThinkingBar({bar, below}) {
   const level = thinkingOf(), pill = thinkPill(level), n = pill.n, li = pill.i;
   const titles = thinkTitles();
   const track = useRef(null), dragging = useRef(false);
-  const set = (i) => { const l = LEVELS[Math.min(n - 1, Math.max(0, i))]; if (l.id !== thinkingOf()) setThinking(l.id); };
+  // (GLM-5.3: a tap on the level already set picks it when it was only the default - a Max its user picks may think
+  //  longer, levelLeftAtDefault; every other model: as before)
+  const set = (i) => { const l = LEVELS[Math.min(n - 1, Math.max(0, i))]; if (l.id !== thinkingOf() || levelLeftAtDefault()) setThinking(l.id); };
+  const leftMax = level === "max" && levelLeftAtDefault();
+  const maxHint = leftMax ? ` (the default: tap it to let it think longer, up to ${fmt(S.health.thinking_budget_max)} tokens)` : "";
   const from = (x) => { const r = track.current.getBoundingClientRect(); return Math.floor(((x - r.left) / r.width) * n); };
   const down = (e) => { dragging.current = true; e.currentTarget.setPointerCapture(e.pointerId); set(from(e.clientX)); };
   const move = (e) => { if (dragging.current) set(from(e.clientX)); };
@@ -315,7 +324,7 @@ function ThinkingBar({bar, below}) {
       onPointerDown=${down} onPointerMove=${move} onPointerUp=${up} onPointerCancel=${up} onKeyDown=${keys}>
       <span class="think-bar__fill"></span>
       ${LEVELS.map((l, i) => html`<span class=${`think-bar__seg${i === li ? " is-sel" : ""}`}
-        title=${titles[l.id]}>${l.name}</span>`)}
+        title=${titles[l.id] + (i === li ? maxHint : "")}>${l.name}</span>`)}
     </div>
   </div>`;
 }
@@ -383,7 +392,7 @@ function Composer({center}) {
         <span class="anchor">
           <button type="button" ref=${thinkBtn} class=${`think-chip${think ? " is-open" : ""}`} aria-haspopup="dialog" aria-expanded=${String(think)}
             aria-label=${`Thinking: ${lv.name}. Change it`} title="How long the model thinks" onClick=${() => setThink(!think)}>
-            <${Gauge} level=${level}/><span>${lv.name}</span></button>
+            <${Gauge} level=${level}/><span><span class="think-chip__word">Thinking · </span><b>${lv.name}</b></span></button>
         </span>
         ${mine ? html`<button type="button" class="send send--stop" aria-label="Stop the answer (Esc)" title="Stop (Esc)" onClick=${stopAnswer}>
                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg></button>`
