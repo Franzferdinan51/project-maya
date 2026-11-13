@@ -22,12 +22,24 @@ import time
 from pathlib import Path
 
 FILE = "token-savings.json"
+
+
+def ledger_path(config: Path, env=None) -> Path | None:
+    """Where the count is kept: beside the run config, or MAYA_SAVINGS_PATH (a file; its folder must be writable, the
+    temporary file is written next to it).  "off" (or "none", "0") keeps no file: the count lives only until the stop."""
+    v = ((os.environ if env is None else env).get("MAYA_SAVINGS_PATH") or "").strip()
+    if v.lower() in ("off", "none", "0"):
+        return None
+    return Path(v).expanduser() if v else Path(config).parent / FILE
 PRICES_AS_OF = "2026-10"
 # per 1M tokens, in US dollars; "peak": the factor at DeepSeek's peak hours
 REFERENCES = [
     {"match": r"deepseek[-_.]?v?4\.1[-_.]?flash|deepseek[-_.]flash", "api": "DeepSeek",
      "input": 0.15, "cached": 0.003, "output": 0.60, "peak": 2.0},
     {"match": r"glm[-_.]?5\.3[-_.]?flash", "api": "Z.ai", "input": 0.15, "cached": 0.03, "output": 0.50},
+    # GLM-5.3 (744B, glm-dsa): Z.ai's own, https://docs.z.ai/guides/overview/pricing (read 2026-11-07; its cached
+    # input storage "limited-time free").  Its API name only ("glm-5.3", "zai-org/GLM-5.3"): never a Flash or FlashX
+    {"match": r"^(?:[\w.-]+/)?glm[-_.]?5\.3$", "api": "Z.ai", "input": 1.40, "cached": 0.26, "output": 4.40},
     # MiniMax's own, flat (no context tiers or peak hours for the Flash model):
     # https://platform.minimax.io/docs/pricing/overview (read 2026-10-27)
     {"match": r"minimax[-_.]?m3\.1[-_.]?flash", "api": "MiniMax", "input": 0.15, "cached": 0.015, "output": 0.60},
@@ -104,6 +116,7 @@ class Ledger:
         self.path = Path(path) if path else None
         self.key, self.model, self.quant = key, model, quant
         self.lock = threading.Lock()
+        self.save_failed = False                      # (one log line for a file that cannot be written, not one per request)
         self.started = time.time()
         self.start = zero()
         self.doc = {"since": time.time(), "models": {}}
@@ -181,8 +194,12 @@ class Ledger:
             tmp = self.path.with_name(self.path.name + ".tmp")
             tmp.write_text(json.dumps(self.doc, indent=1), encoding="utf-8")
             os.replace(tmp, self.path)
+            self.save_failed = False
         except OSError as e:
-            print(f"[maya] could not save the token count ({self.path.name}): {e}", flush=True)
+            if not self.save_failed:
+                print(f"[maya] could not save the token count ({self.path.name}): {e}; the count is kept in memory "
+                      "(MAYA_SAVINGS_PATH names another file, 'off' keeps none)", flush=True)
+            self.save_failed = True
 
     def summary(self) -> dict:
         """The sidebar's line (GET /metrics, every second): the total saved and this start's."""

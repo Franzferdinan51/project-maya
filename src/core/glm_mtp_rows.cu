@@ -1,4 +1,4 @@
-// src/core/glm_mtp_rows.cu - several conversations drafting with the NextN (MTP) block at once (STRATA_GLM_MULTI_MTP).
+// src/core/glm_mtp_rows.cu - several conversations drafting with the NextN (MTP) block at once (MAYA_GLM_MULTI_MTP).
 //
 // The batched rows (glm_rows.cu) take one token of each of a group's conversations through the split.  Here each
 // conversation brings a WINDOW instead: the token it feeds (the last one it wrote) and up to d drafts the NextN block
@@ -34,15 +34,23 @@
 #include "glm_rows_state.hpp"
 
 #include "strata/core/mtp_rows.hpp"
+#include "strata/core/glm_maya_sync.hpp"   // glm-dsa: glm_rows_ok (these rows are Flash kernels)
 #include "strata/kernels/sampler.hpp"
 
 #include "ggml.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
 
 namespace strata::core {
 
@@ -66,6 +74,8 @@ struct Glm5Model::MtpRows {
     std::vector<float*> emb_h;       // first part: W x n_embd
     std::vector<float*> hop_h;       // parts before the last: W x hc x n_embd
     std::vector<cudaEvent_t> ev_hop;
+    std::vector<cudaEvent_t> ev_row; // per row: the same hop rows, one event each (row-by-row pipelining:
+                                     // part k+1's row t waits part k's row t, not the whole window: ev_row[sq*W + t])
     std::vector<int*> tok_h;         // last part: W picks
     std::vector<cudaEvent_t> ev_done;
     std::vector<float*> cemb_h;      // last part: W x n_embd (the NextN cache rows' embeddings)
@@ -90,7 +100,7 @@ struct Glm5Model::MtpRows {
 
 int Glm5Model::multi_mtp_setting() {
     static const int v = [] {
-        const char* e = getenv("STRATA_GLM_MULTI_MTP");
+        const char* e = getenv("MAYA_GLM_MULTI_MTP");
         return e != nullptr ? std::clamp(std::atoi(e), 0, 7) : 0;
     }();
     return v;
@@ -98,7 +108,7 @@ int Glm5Model::multi_mtp_setting() {
 
 int Glm5Model::multi_mtp_cap() {
     static const int v = [] {
-        const char* e = getenv("STRATA_GLM_MULTI_MTP_ROWS");
+        const char* e = getenv("MAYA_GLM_MULTI_MTP_ROWS");
         return e != nullptr ? std::clamp(std::atoi(e), 8, gf::kMaxMvNt) : gf::kMaxMvNt;
     }();
     return v;
@@ -113,6 +123,7 @@ size_t Glm5Model::mtpw_kin_offset(int il) const {
 
 bool Glm5Model::mtpw_alloc(std::string& err) {
     if (mtpw_ != nullptr || multi_mtp_setting() <= 0 || seq_.empty()) return true;
+    if (!glm_rows_ok(g_.arch)) return true;   // glm-dsa: the conversations draft one after the other (no MTP rows)
     const Glm5Geometry& g = g_;
     auto* M = new MtpRows();
     mtpw_ = M;
@@ -179,6 +190,15 @@ bool Glm5Model::mtpw_alloc(std::string& err) {
         if (!last && (!hmalloc((void**) &M->hop_h[(size_t) s], (size_t) M->W * hcE * sizeof(float)) ||
                       cudaEventCreateWithFlags(&M->ev_hop[(size_t) s], cudaEventDisableTiming) != cudaSuccess))
             return fail("the pinned hop rows");
+        if (!last) {
+            M->ev_row.resize((size_t) n * (size_t) M->W, nullptr);
+            for (int t = 0; t < M->W; ++t)
+                if (cudaEventCreateWithFlags(&M->ev_row[(size_t) s * (size_t) M->W + (size_t) t],
+                                             cudaEventDisableTiming) != cudaSuccess) {
+                    cudaGetLastError();
+                    return fail("the rows' hop events");
+                }
+        }
         if (last && (!hmalloc((void**) &M->tok_h[(size_t) s], (size_t) M->W * sizeof(int)) ||
                      cudaEventCreateWithFlags(&M->ev_done[(size_t) s], cudaEventDisableTiming) != cudaSuccess ||
                      !hmalloc((void**) &M->cemb_h[(size_t) s], (size_t) M->W * E * sizeof(float)) ||
@@ -220,6 +240,7 @@ bool Glm5Model::mtpw_setup(std::string& err) {
 void Glm5Model::mtpw_destroy() {
     MtpRows* M = mtpw_;
     if (M == nullptr) return;
+    rows_crew_destroy();
     cudaSetDevice(dev_);
     for (int s = 0; s < M->n_seq; ++s) {
         if (M->kin[(size_t) s]) cudaFree(M->kin[(size_t) s]);   // (the recurrent-state copies: with the sequences')
@@ -228,6 +249,10 @@ void Glm5Model::mtpw_destroy() {
         if (M->tok_h[(size_t) s]) cudaFreeHost(M->tok_h[(size_t) s]);
         for (cudaEvent_t e : {M->ev_hop[(size_t) s], M->ev_done[(size_t) s]})
             if (e) cudaEventDestroy(e);
+        if (!M->ev_row.empty())
+            for (int t = 0; t < M->W; ++t)
+                if (cudaEvent_t e = M->ev_row[(size_t) s * (size_t) M->W + (size_t) t])
+                    cudaEventDestroy(e);
         for (float* p : {M->hx[(size_t) s], M->dh[(size_t) s]})
             if (p) cudaFree(p);
     }
@@ -241,6 +266,7 @@ void Glm5Model::mtpw_destroy() {
 
 bool Glm5Model::mtpw_ok() const {
     if (multi_mtp_setting() <= 0 || seq_.empty()) return false;
+    if (!glm_rows_ok(g_.arch)) return false;   // glm-dsa: no MTP rows (mtpw_alloc made none)
     const Glm5Model* last = this;
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr || m->mtpw_ == nullptr || m->rows_ == nullptr) return false;
@@ -297,6 +323,7 @@ bool Glm5Model::rows_bind_win(const int* seqs, const int* counts, int n, RowSeq*
 bool Glm5Model::mtpw_part(const int* seqs, const int* counts, int n, const int32_t* tokens,
                           const strata::kernels::SamplerParams* sps, Glm5Model* prev, bool last, std::string& err) {
     MtpRows* M = mtpw_;
+    const size_t W = M->W;
     FastState* F = fast_;
     RowsState* S = rows_;
     const Glm5Geometry& g = g_;
@@ -352,7 +379,12 @@ bool Glm5Model::mtpw_part(const int* seqs, const int* counts, int n, const int32
     } else {
         for (int c = 0, row = 0; c < n; row += counts[c], ++c) {
             const int sq = seqs[c];
-            cudaStreamWaitEvent(s, prev->mtpw_->ev_hop[(size_t) sq], 0);
+            // one wait a row: this part's row t waits the row t of the part before, not the whole window behind
+            // its own events - the rows of the parts pipeline
+            for (int t = 0; t < counts[c] && !prev->mtpw_->ev_row.empty(); ++t)
+                cudaStreamWaitEvent(s, prev->mtpw_->ev_row[(size_t) sq * (size_t) W + (size_t) t], 0);
+            if (prev->mtpw_->ev_row.empty())
+                cudaStreamWaitEvent(s, prev->mtpw_->ev_hop[(size_t) sq], 0);
             for (int t = 0; t < counts[c]; ++t)
                 cudaMemcpyAsync(rw[row + t].res, prev->mtpw_->hop_h[(size_t) sq] + (size_t) t * hcE, hcE * sizeof(float),
                                 cudaMemcpyHostToDevice, s);
@@ -360,12 +392,16 @@ bool Glm5Model::mtpw_part(const int* seqs, const int* counts, int n, const int32
     }
     if (!rows_layers(rw, nr, err)) return false;
     if (!last) {
-        // ---- the residual rows to the next part, through this conversation's pinned hop rows
+        // ---- the residual rows to the next part, through this conversation's pinned hop rows: one event a row
+        // (rows_bind_win put the row order in), so the next part's threads take a row as soon as it lands
         for (int c = 0, row = 0; c < n; row += counts[c], ++c) {
             const int sq = seqs[c];
-            for (int t = 0; t < counts[c]; ++t)
+            for (int t = 0; t < counts[c]; ++t) {
                 cudaMemcpyAsync(M->hop_h[(size_t) sq] + (size_t) t * hcE, rw[row + t].res, hcE * sizeof(float),
                                 cudaMemcpyDeviceToHost, s);
+                if (!M->ev_row.empty())
+                    cudaEventRecord(M->ev_row[(size_t) sq * (size_t) W + (size_t) t], s);
+            }
             cudaEventRecord(M->ev_hop[(size_t) sq], s);
         }
     } else {
@@ -408,12 +444,80 @@ bool Glm5Model::mtpw_part(const int* seqs, const int* counts, int n, const int32
     return true;
 }
 
+namespace {
+
+struct RowsJob {
+    std::vector<int> seqs, counts;
+    std::vector<int32_t> toks;
+    const strata::kernels::SamplerParams* sps = nullptr;  // the back's per-conversation sampler (the caller's array)
+    RowsJob* prev_job = nullptr;      // the front's job of the same group (the back's stage chain reads it)
+    unsigned tag = 0;                  // the job's serial: the workers wait the previous part's stage == tag
+    std::atomic<unsigned> stage[8];    // set to tag when that part's enqueue of the group ended
+    RowsJob() {
+        for (auto& s : stage) s.store(0, std::memory_order_relaxed);
+    }
+};
+
+struct RowsCrew {
+    struct Worker {
+        std::thread th;
+        std::mutex mu;
+        std::condition_variable cv;
+        std::deque<RowsJob*> jobs;
+        bool quit = false;
+    };
+    std::vector<std::unique_ptr<Worker>> w;
+    std::deque<std::unique_ptr<RowsJob>> owned;   // one flight group: the front's, handed to the back at win_back
+    int n_parts = 0;
+    std::atomic<unsigned> next_tag{1};
+    std::atomic<bool> failed{false};
+    std::mutex emu;
+    std::string err;
+};
+
+}  // namespace
+
+// ---------------------------------------------------------------- the rows crews (MAYA_GLM_MTPW_CREWS=1)
+// One worker per part: each runs its part's own share of a group (mtpw_part).  The host's serial launch chain - which
+// a row-4 group's round otherwise spends ~80-100 ms on - runs on all the parts at once.  The rows still flow through
+// the per-row hop events (device-side ordering), and the workers' stage tags only gate the events' capture.  The host
+// keeps the picks/commit/drafts; the workers' errors surface at win_back rows_crew_wait.
 bool Glm5Model::mtpw_front(const int* seqs, const int* counts, int n, const int32_t* tokens, std::string& err) {
     if (!mtpw_ok()) {
         err = "glm multi mtp: not set up (MAYA_GLM_MULTI_MTP with --parallel, the NextN block loaded)";
         return false;
     }
     if (seq_[0].hop_h == nullptr && !seq_pipe_ready(err)) return false;
+    static const bool crews = getenv("MAYA_GLM_MTPW_CREWS") != nullptr &&
+                              std::atoi(getenv("MAYA_GLM_MTPW_CREWS")) != 0;
+    if (crews) {
+        auto* C = (RowsCrew*) rows_crew_;
+        if (C == nullptr) rows_crew_start(err);
+        if (C == nullptr) return false;
+        auto J = std::make_unique<RowsJob>();
+        int np = C->n_parts;
+        int n_rows = 0;
+        for (int i = 0; i < n; ++i) {
+            J->seqs.push_back(seqs[i]);
+            J->counts.push_back(counts[i]);
+            n_rows += counts[i];
+        }
+        for (int i = 0; i < n_rows; ++i) J->toks.push_back(tokens[i]);
+        J->tag = C->next_tag.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(C->emu);
+            C->owned.push_back(std::move(J));   // (the back's worker takes it for its stage read)
+        }
+        auto* Jp = C->owned.back().get();
+        for (int k = 0; k < np - 1; ++k) {
+            {
+                std::lock_guard<std::mutex> lk(C->w[(size_t) k]->mu);
+                C->w[(size_t) k]->jobs.push_back(Jp);
+            }
+            C->w[(size_t) k]->cv.notify_one();
+        }
+        return true;
+    }
     Glm5Model* prev = nullptr;
     for (Glm5Model* m = this; m != nullptr && m->split_next_; prev = m, m = m->split_next_.get())
         if (!m->mtpw_part(seqs, counts, n, tokens, nullptr, prev, false, err)) return false;
@@ -421,8 +525,145 @@ bool Glm5Model::mtpw_front(const int* seqs, const int* counts, int n, const int3
     return true;
 }
 
+void Glm5Model::rows_crew_destroy() {
+    auto* C = (RowsCrew*) rows_crew_;
+    if (C == nullptr) return;
+    for (auto& wk : C->w) {
+        {
+            std::lock_guard<std::mutex> lk(wk->mu);
+            wk->quit = true;
+        }
+        wk->cv.notify_one();
+    }
+    for (auto& wk : C->w)
+        if (wk->th.joinable()) wk->th.join();
+    C->owned.clear();
+    delete C;
+    rows_crew_ = nullptr;
+}
+
+void Glm5Model::rows_crew_kick(void* jobp, int k) {
+    auto* C = (RowsCrew*) rows_crew_;
+    auto* J = (RowsJob*) jobp;
+    if (C == nullptr || k < 0 || k >= (int) C->w.size()) return;
+    {
+        std::lock_guard<std::mutex> lk(C->w[(size_t) k]->mu);
+        C->w[(size_t) k]->jobs.push_back(J);
+    }
+    C->w[(size_t) k]->cv.notify_one();
+}
+
+bool Glm5Model::rows_crew_wait(void* jobp, int k, std::string& err) {
+    auto* C = (RowsCrew*) rows_crew_;
+    auto* J = (RowsJob*) jobp;
+    if (C == nullptr) return true;
+    if (J != nullptr && k >= 0 && k < (int) C->w.size() && k < 8)
+        while (J->stage[(size_t) k].load(std::memory_order_acquire) != J->tag) std::this_thread::yield();
+    if (C->failed.load()) {
+        std::lock_guard<std::mutex> lk(C->emu);
+        err = C->err.empty() ? std::string("glm mtpw crews: a part failed") : C->err;
+        return false;
+    }
+    return true;
+}
+
+void Glm5Model::rows_crew_start(std::string& err) {
+    int n_parts = 0;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) ++n_parts;
+    auto* C = new RowsCrew();
+    C->n_parts = n_parts;
+    for (int k = 0; k < n_parts; ++k) {
+        C->w.emplace_back(new RowsCrew::Worker());
+        RowsCrew::Worker* wk = C->w.back().get();
+        // this part's model and the part before it (mtpw_part's two arguments)
+        Glm5Model* m = this;
+        Glm5Model* prev = nullptr;
+        for (int i = 0; i < k; ++i) {
+            prev = m;
+            m = m->split_next_.get();
+        }
+        wk->th = std::thread([this, C, wk, k, m, prev, n_parts] {
+            std::unique_ptr<RowsJob> own;    // the last part's job also owned here until the host saw the picks
+            for (;;) {
+                RowsJob* J = nullptr;
+                {
+                    std::unique_lock<std::mutex> lk(wk->mu);
+                    wk->cv.wait(lk, [&] { return wk->quit || !wk->jobs.empty(); });
+                    if (wk->jobs.empty()) return;
+                    J = wk->jobs.front();
+                    wk->jobs.pop_front();
+                }
+                // the previous part's enqueue of this group first: the wait events below capture its row records
+                std::shared_ptr<RowsJob> fr;   // (the front's job of a back's group: its stage array is read below)
+                if (k == n_parts - 1) {
+                    std::lock_guard<std::mutex> lk(C->emu);
+                    if (C->owned.empty() || C->owned.front().get() == nullptr) {
+                        std::lock_guard<std::mutex> lk2(C->emu);
+                        if (C->err.empty()) C->err = "glm mtpw crews: the group's front job missing";
+                        C->failed.store(true);
+                        continue;
+                    }
+                    fr = std::move(C->owned.front());
+                    C->owned.pop_front();
+                    J->prev_job = fr.get();
+                }
+                if (k > 0) {
+                    RowsJob* W = (k == n_parts - 1 && J->prev_job != nullptr) ? J->prev_job : J;
+                    while (W->stage[(size_t) k - 1].load(std::memory_order_acquire) != W->tag)
+                        std::this_thread::yield();
+                }
+                std::string e;
+                const bool ok = m->mtpw_part(J->seqs.data(), J->counts.data(), (int) J->seqs.size(),
+                                             J->toks.data(), J->sps, prev, k == n_parts - 1, e);
+                J->stage[(size_t) k].store(J->tag, std::memory_order_release);
+                if (!ok) {
+                    bool was_failed = C->failed.load();
+                    {
+                        std::lock_guard<std::mutex> lk(C->emu);
+                        if (!was_failed) C->err = e;
+                    }
+                    C->failed.store(true);
+                } else if (k == n_parts - 1) {
+                    // the old mtpw_back's parity check (the host's kick only waited for the enqueue)
+                    for (int i = 0; i < (int) J->seqs.size(); ++i) {
+                        const int sq = J->seqs[(size_t) i];
+                        if (m->mtpw_->p0[(size_t) sq] == this->mtpw_->p0[(size_t) sq]) continue;
+                        std::lock_guard<std::mutex> lk(C->emu);
+                        if (C->err.empty())
+                            C->err = "glm multi mtp: sequence " + std::to_string(sq) + " is at a different position "
+                                                                            "on CUDA" + std::to_string(m->dev_);
+                        C->failed.store(true);
+                    }
+                }
+            }
+        });
+    }
+    rows_crew_ = C;
+    std::fprintf(stderr, "glm multi mtp: the parts' enqueue crews on (MAYA_GLM_MTPW_CREWS)\n");
+}
+
 bool Glm5Model::mtpw_back(const int* seqs, const int* counts, int n, const int32_t* tokens,
                           const strata::kernels::SamplerParams* sps, std::string& err) {
+    static const bool crews = getenv("MAYA_GLM_MTPW_CREWS") != nullptr &&
+                              std::atoi(getenv("MAYA_GLM_MTPW_CREWS")) != 0;
+    if (crews) {
+        auto* C = (RowsCrew*) rows_crew_;
+        RowsCrew::Worker* wk = C->w.back().get();
+        auto& pf = C->owned.back();   // (the queue's front job of this group: the host's serial order keeps them 1:1)
+        std::lock_guard<std::mutex> lk(C->emu);
+        if (C->owned.empty()) {
+            err = "glm mtpw crews: no flight job for the group's back";
+            return false;
+        }
+        RowsJob* J = pf.get();
+        J->sps = sps;
+        {
+            std::lock_guard<std::mutex> lk2(wk->mu);
+            wk->jobs.push_back(J);
+        }
+        wk->cv.notify_one();
+        return rows_crew_wait(J, C->n_parts - 1, err);
+    }
     Glm5Model *L = this, *prev = nullptr;
     while (L->split_next_) {
         prev = L;
@@ -742,7 +983,7 @@ bool Glm5Model::mtpw_draft_queue(const int* seqs, const int* keep, int n, const 
         return false;
     }
     static const bool whole_head = [] {
-        const char* e = getenv("STRATA_GLM_MULTI_MTP_VOCAB");
+        const char* e = getenv("MAYA_GLM_MULTI_MTP_VOCAB");
         return e != nullptr && std::atoi(e) == 0;
     }();
     const bool sub = !whole_head && F->mtp_dv > 0;
@@ -760,10 +1001,10 @@ bool Glm5Model::mtpw_draft_queue(const int* seqs, const int* keep, int n, const 
     M->d_tok.assign((size_t) n, -1);
     M->d_out.assign((size_t) n * (size_t) std::max(1, M->W - 1), -1);
     M->d_pending = false;
-    // STRATA_GLM_MULTI_MTP_DRAFT_ROWS (on): the conversations' draft steps as batched rows of the NextN block, nothing
+    // MAYA_GLM_MULTI_MTP_DRAFT_ROWS (on): the conversations' draft steps as batched rows of the NextN block, nothing
     // bound; 0: each conversation's steps through the token path's block (fast_mtp), the last part bound to it
     static const bool draft_rows = [] {
-        const char* e = getenv("STRATA_GLM_MULTI_MTP_DRAFT_ROWS");
+        const char* e = getenv("MAYA_GLM_MULTI_MTP_DRAFT_ROWS");
         return e == nullptr || std::atoi(e) != 0;
     }();
     RowSeq base[gf::kMaxMvNt];
@@ -848,8 +1089,10 @@ bool Glm5Model::mtpw_draft_queue(const int* seqs, const int* keep, int n, const 
         if (!glmfast::wait_event(M->ev_draft, "glm multi mtp drafts", err) || !F->route_ok(err)) return false;
         for (int c = 0; c < n; ++c)
             if (M->d_n[(size_t) c] > j) {
-                M->d_tok[(size_t) c] = F->mtp_tok_h[c];
-                M->d_out[(size_t) c * (size_t) (M->W - 1) + (size_t) j] = F->mtp_tok_h[c];
+                // (a draft that is no token id: the token before it in its place - glmfast::draft_id, #860)
+                M->d_tok[(size_t) c] = glmfast::draft_id(F->mtp_tok_h[c], M->d_tok[(size_t) c], g_.n_vocab,
+                                                         "glm multi mtp");
+                M->d_out[(size_t) c * (size_t) (M->W - 1) + (size_t) j] = M->d_tok[(size_t) c];
             }
     }
     const cudaError_t e = cudaGetLastError();
@@ -872,7 +1115,9 @@ bool Glm5Model::mtpw_draft_take(int32_t* out, std::string& err) {
         if (!glmfast::wait_event(M->ev_draft, "glm multi mtp drafts", err) || !F->route_ok(err)) return false;
         const int j = M->d_max - 1;
         for (int c = 0; c < M->d_n_ctx; ++c)
-            if (M->d_n[(size_t) c] > j) M->d_out[(size_t) c * (size_t) (M->W - 1) + (size_t) j] = F->mtp_tok_h[c];
+            if (M->d_n[(size_t) c] > j)
+                M->d_out[(size_t) c * (size_t) (M->W - 1) + (size_t) j] =
+                    glmfast::draft_id(F->mtp_tok_h[c], M->d_tok[(size_t) c], g_.n_vocab, "glm multi mtp");
     }
     if (gf::launch_errors() > 0) {
         err = "glm multi mtp: " + std::to_string(gf::launch_errors()) + " kernel launch(es) failed (see stderr)";

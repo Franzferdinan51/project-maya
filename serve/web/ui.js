@@ -8,10 +8,9 @@ export const Icon = ({name, sm, lg, cls = ""}) => html`
   <svg class=${`st-icon${sm ? " st-icon--sm" : ""}${lg ? " st-icon--lg" : ""}${cls ? " " + cls : ""}`} aria-hidden="true">
     <use href=${`${SPRITE}#i-${name}`}/></svg>`;
 
-// the Maya mark on its gradient (the only place the gradient is used)
+// the Maya logo (the white M with its dots on indigo - the same picture as the tab and home-screen icons)
 export const MayaMark = ({size = 28}) => html`
-  <span class="maya-mark" style=${`width:${size}px;height:${size}px`} aria-hidden="true"><svg viewBox="0 0 24 24"
-    style=${`width:${Math.round(size * 0.64)}px;height:${Math.round(size * 0.64)}px`}><use href=${`${SPRITE}#i-maya`}/></svg></span>`;
+  <img class="maya-mark" src="web/icon-192.png" width=${size} height=${size} alt="" aria-hidden="true"/>`;
 
 export function ModelLogo({model, size = 32, cls = ""}) {
   const l = modelLogo(model);
@@ -122,7 +121,7 @@ export function Seg({options, value, onChange, label, cls = ""}) {
     ${options.map((o) => html`<button type="button" role="radio" aria-checked=${String(o.id === value)} title=${o.title}
       tabIndex=${o.id === value || (none && o === options[0]) ? 0 : -1} onClick=${() => onChange(o.id)}>${o.label}</button>`)}</div>`;
 }
-// the Context size slider (Settings > Model, and each model's Engine settings on the Models page): one stop per size in
+// the Context size slider (Settings > Chat defaults, and each model's Engine settings on the Models page): one stop per size in
 // `stops` (server.js' ctxStopsIn), the size picked and "now" when it is the one the model has, the range's ends, and
 // `hint` (server.js' ctxHint) under it.  `label`: the name beside the size (empty where the row around it names it).
 export const CtxSlider = ({id, label = "Context size", value, now, stops, disabled, hint, onChange}) => html`<div class="ctx-slider">

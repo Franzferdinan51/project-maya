@@ -135,9 +135,9 @@ class ThinkingBudget(unittest.TestCase):
 
     def test_reserve_override_cannot_consume_small_limit(self):
         from unittest.mock import patch
-        with patch.dict(os.environ, {"STRATA_GLM_THINK_RESERVE": "4096"}):
+        with patch.dict(os.environ, {"MAYA_GLM_THINK_RESERVE": "4096"}):
             self.assertGreaterEqual(self.call("openai", 512)["_think_budget"], 255)
-        with patch.dict(os.environ, {"STRATA_GLM_THINK_RESERVE": "16"}):
+        with patch.dict(os.environ, {"MAYA_GLM_THINK_RESERVE": "16"}):
             self.assertEqual(self.call("openai", 512)["_think_budget"], 383)
 
     def test_tiny_limits_still_honour_total_output(self):
@@ -151,7 +151,7 @@ class ThinkingBudget(unittest.TestCase):
         from unittest.mock import patch
         from serve.server import apply_server_env
         with patch.dict(os.environ):
-            apply_server_env({"env": {"STRATA_GLM_THINK_RESERVE": "16"}})
+            apply_server_env({"env": {"MAYA_GLM_THINK_RESERVE": "16"}})
             self.assertEqual(self.call("openai", 512)["_think_budget"], 383)
 
 
@@ -249,7 +249,7 @@ class MaxTokens(unittest.TestCase):
     def test_debug_log_shows_the_resolved_budget(self):
         import contextlib
         import io
-        os.environ["STRATA_DEBUG"] = "1"
+        os.environ["MAYA_DEBUG"] = "1"
         try:
             for api in ("openai", "anthropic"):
                 with self.subTest(api=api):
@@ -258,7 +258,7 @@ class MaxTokens(unittest.TestCase):
                         _, _, pt, _ = self.call(api, max_tokens=-1)
                     self.assertIn(f"max_new={CTX - CTX_SLACK - pt} ", out.getvalue())
         finally:
-            del os.environ["STRATA_DEBUG"]
+            del os.environ["MAYA_DEBUG"]
 
 
 class FitMaxTokens(unittest.TestCase):
@@ -665,6 +665,12 @@ class SamplingKeys(unittest.TestCase):
         for bad in (2, -1, True, 1.0, "1"):
             self.assertFalse([k for k in self.keys(temperature=0, strata_tune={"suffix_draft": bad})
                               if k.startswith("suffix_draft=")], bad)
+        # ... and its trusted rounds (a lookup verified alone, no draft made): 0 or 1, nothing else
+        self.assertIn("lookup_trust=0", self.keys(temperature=0, strata_tune={"lookup_trust": 0}))
+        self.assertIn("lookup_trust=1", self.keys(temperature=0.7, strata_tune={"lookup_trust": 1}))
+        for bad in (2, -1, True, 1.0, "1"):
+            self.assertFalse([k for k in self.keys(temperature=0, strata_tune={"lookup_trust": bad})
+                              if k.startswith("lookup_trust=")], bad)
 
     def test_read_chunks_tune_key(self):
         # setup's calibration of the disk reads' size (#67): 1-16 pieces, nothing else
@@ -674,7 +680,7 @@ class SamplingKeys(unittest.TestCase):
                               if k.startswith("read_chunks=")], bad)
 
     def test_miss_skip_tune_keys(self):
-        # the GLM engine's light-miss bar and first layer for one request (STRATA_GLM_MISS_SKIP_W / _FROM)
+        # the GLM engine's light-miss bar and first layer for one request (MAYA_GLM_MISS_SKIP_W / _FROM)
         k = self.keys(temperature=0, strata_tune={"miss_skip_w": 0.14, "miss_skip_from": 23})
         self.assertIn("miss_skip_w=0.14", k)
         self.assertIn("miss_skip_from=23", k)
@@ -787,6 +793,25 @@ class RequestChecks(unittest.TestCase):
         with self.assertRaises(ValueError):
             svc.check_request({"logit_bias": {"65": 1}})
         svc.check_request({"logit_bias": {}})      # none asked for: fine anywhere
+
+    def test_ablate(self):
+        """`ablate` (Maya's refusal ablation, one name on every API): true / false; true needs an engine with a
+        direction loaded (INFO ablate=1); the GEN key goes only when on, so a line without it is the line as before."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.check_request({"ablate": False})       # off: fine anywhere
+        with self.assertRaises(ValueError):
+            svc.check_request({"ablate": True})    # no direction loaded: refused, not ignored
+        with self.assertRaises(ValueError):
+            svc.check_request({"ablate": "yes"})
+        svc.engine.info = {**svc.engine.info, "ablate": 1}
+        svc.check_request({"ablate": True})
+        self.assertEqual(svc.ablate_state(), {"available": True, "default": False, "why": ""})
+        self.assertIn("ablate=1", StrataEngine.sampling_keys({"temperature": 0, "ablate": True}).split())
+        self.assertIn("ablate=1", StrataEngine.sampling_keys({"temperature": 0.7, "ablate": True}).split())
+        for s in ({"temperature": 0}, {"temperature": 0, "ablate": False}, {"temperature": 0.7, "ablate": False}):
+            self.assertEqual(StrataEngine.sampling_keys(s), StrataEngine.sampling_keys(
+                {k: v for k, v in s.items() if k != "ablate"}))
 
     def test_ignore_eos(self):
         """ignore_eos bans every token that ends an answer through the logit bias (a client's other biases kept), needs
@@ -969,6 +994,69 @@ class NonFiniteRetry(unittest.TestCase):
         with self.assertRaises(ValueError):
             list(svc.run(tok.encode("hi"), False, None, 20, {}, threading.Event()))
         self.assertEqual(Broken.calls, 1)
+
+
+class VocabTokenizer(ByteTokenizer):
+    """ByteTokenizer with the pack tokenizer's token_bytes (tools/strata_tokenizer.py): an id outside the vocabulary
+    is an IndexError, as in #805's traceback."""
+
+    def token_bytes(self, i):
+        if i < 0 or i >= 256 + len(self.SPECIALS):
+            raise IndexError("token id %d is outside the vocabulary (%d)" % (i, 256 + len(self.SPECIALS)))
+        return self.SPECIALS[i - 256].encode() if i >= 256 else bytes([i])
+
+
+class NoRoomOrNoToken(unittest.TestCase):
+    """#805: a 351,912-token prompt read, then "done: 0 tokens (length)" and an IndexError for token id -1 in the
+    tokenizer under the loop guard.  On the engine's own lines (StrataEngine.generate): an answer of no tokens that
+    ends "length" is an empty answer, and a T line of -1 (an engine whose sample failed) is the request's error -
+    never an id for the tokenizer."""
+
+    def answer(self, lines):
+        import io
+        import queue
+        from types import SimpleNamespace
+        eng = StrataEngine.__new__(StrataEngine)
+        eng.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)
+        eng.lines = queue.Queue()
+        eng.can_stop = True
+        eng.max_context = CTX
+        for line in lines:
+            eng.lines.put(line)
+        tok = VocabTokenizer()
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.assertTrue(svc.loop_guard)                   # (the guard's piece() decoded the -1)
+        out, done, err = "", None, None
+        try:
+            for kind, v in svc.run(tok.encode("hi"), False, None, 200, {}, threading.Event()):
+                if kind == "event":
+                    out += v.text
+                elif kind == "done":
+                    done = v
+        except ValueError as e:
+            err = str(e)
+        return out, done, err, eng, svc
+
+    def test_no_tokens_length_is_an_empty_answer(self):
+        out, done, err, _, svc = self.answer(["PP 3 3 1.0 3.0", "DONE 0 3 414000.0 0.0 length 0 0 0"])
+        self.assertEqual((out, err), ("", None))
+        self.assertEqual((done["finish"], done["completion_tokens"]), ("length", 0))
+        self.assertEqual(svc.metrics()["requests"][0]["finish"], "length")
+
+    def test_token_minus_one_is_an_error(self):
+        out, done, err, eng, svc = self.answer(["PP 3 3 1.0 3.0", "T -1", "T 104", "DONE 2 3 414000.0 1.0 cancel 0 0 0"])
+        self.assertEqual((out, done), ("", None))
+        self.assertIn("could not pick a token", err)
+        self.assertIn("STOP", eng.proc.stdin.getvalue())  # (the engine stopped, drained to its DONE)
+        self.assertTrue(eng.lines.empty())
+        self.assertEqual(svc.metrics()["requests"][0]["finish"], "error")
+
+    def test_engine_token(self):
+        from serve.server import engine_token
+        self.assertEqual(engine_token("129279"), 129279)
+        for bad in ("-1", "-2"):
+            with self.assertRaises(ValueError):
+                engine_token(bad)
 
 
 class EngineDeath(unittest.TestCase):
@@ -1935,7 +2023,7 @@ class StallWatchdog(unittest.TestCase):
         import serve.server as S
         saved = {k: os.environ.get(k) for k in S.SERVER_ENV}
         try:
-            S.apply_server_env({"env": {"STRATA_ENGINE_STALL_S": "0", "STRATA_HTTP_BACKLOG": "64"}})
+            S.apply_server_env({"env": {"MAYA_ENGINE_STALL_S": "0", "MAYA_HTTP_BACKLOG": "64"}})
             self.assertEqual((S.ENGINE_STALL_S, S.Server.request_queue_size), (0.0, 64))
         finally:
             for k, v in saved.items():
@@ -2672,6 +2760,56 @@ class NoDelayStreaming(unittest.TestCase):
             self.assertEqual(conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 1)
         finally:
             conn.close(), client.close(), listener.close()
+
+
+class EngineEndTests(unittest.TestCase):
+    """An engine that ends itself (maya-ds4 after a GPU's fault): the server takes it as ended from its END line, and
+    why it ended, as the server prints it for a request it took down, comes from the end of its log."""
+
+    def note(self, tail: str, returncode=3) -> str:
+        import tempfile
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "engine.log")
+            with open(log, "w", encoding="utf-8") as f:
+                f.write(tail)
+            e = StrataEngine.__new__(StrataEngine)
+            e.log_path = log
+            e.proc = SimpleNamespace(returncode=returncode)
+            return e.death_note()
+
+    def test_a_gpu_fault_the_engine_caught_is_not_read_as_ram(self):
+        n = self.note("ds4: CUDA0: an illegal memory access was encountered - the device's state is unknown\n"
+                      "maya ds4 serve: a GPU's state is unknown after this request - the engine ends (exit 3) so the "
+                      "server starts it again for the next request\n")
+        self.assertIn("a GPU took a fault inside a kernel", n)
+        self.assertIn("the engine ends (exit 3)", n)
+        self.assertNotIn("RAM", n)
+
+    def test_end_ahead_of_done_marks_the_engine_ended_before_the_request_ends(self):
+        import io
+        import queue
+        from types import SimpleNamespace
+        e = StrataEngine.__new__(StrataEngine)
+        e.proc = SimpleNamespace(stdout=io.StringIO("ERR cudaMemcpyAsync(...): an illegal memory access was encountered\n"
+                                                    "END a GPU's state is unknown after this request - the engine ends "
+                                                    "(exit 3); the next request starts a fresh one\n"
+                                                    "DONE 0 12 0.0 0.0 cancel 0 0 0 0 0\n"),
+                                 poll=lambda: None)
+        e.lines, e.multi, e.ended = queue.Queue(), 0, False
+        e._routes, e._routes_lock = {}, threading.Lock()
+        e._pump()
+        got = []
+        while (line := e.lines.get_nowait()) is not None:
+            got.append(line.split()[0])
+        self.assertEqual(got, ["ERR", "DONE"])           # END is the server's, not the request's
+        self.assertTrue(e.ended)
+        self.assertFalse(e.alive())                      # (the process may still be exiting: the next request restarts)
+
+    def test_the_watchdog_and_ram_notes_are_unchanged(self):
+        self.assertIn("a hang it caught", self.note("maya ds4 serve: no progress for 600 s during a request - stopping "
+                                                    "the engine so the server starts it again (issue #29, #539)\n"))
+        self.assertIn("running out of RAM", self.note("ds4: something else\n", returncode=-9))
 
 
 if __name__ == "__main__":

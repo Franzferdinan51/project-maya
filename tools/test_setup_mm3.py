@@ -32,7 +32,7 @@ def fail(msg, hint=None):
 
 
 class Gate(unittest.TestCase):
-    """NVIDIA, and AMD as GLM's EXL3 quants there (experimental, said); Windows and V100 once the engine runs there
+    """NVIDIA, and AMD as GLM's EXL3 quants there; Windows and V100 once the engine runs there
     (MM3_ALL_PLATFORMS, one switch)."""
 
     def check(self, backend="cuda", win=False, everyone=False, gpus=None):
@@ -42,9 +42,9 @@ class Gate(unittest.TestCase):
                 patch.object(maya, "warn", lambda *a: None), patch.object(maya.S, "is_wsl", return_value=False):
             maya.check_pc(args(backend=backend), "minimax")
 
-    def test_amd_experimental(self):
-        """AMD: the EXL3 quant goes on to the AMD PC check with an experimental warning (as GLM's EXL3 there), the
-        GGUFs without one; neither is refused, and MiniMax's HIP check does not say "text only"."""
+    def test_amd(self):
+        """AMD: the EXL3 quant and the GGUFs go on to the AMD PC check without a warning (as GLM's EXL3 there;
+        v1.1.53); neither is refused, and MiniMax's HIP check does not say "text only"."""
         for gguf in (False, True):
             said, hip = [], []
             with patch.object(maya, "fail", fail), patch.object(maya, "step", lambda *a: None), \
@@ -52,12 +52,10 @@ class Gate(unittest.TestCase):
                     patch.object(maya, "check_hip_pc", lambda a, **kw: hip.append(kw) or {"backend": "hip"}):
                 self.assertEqual(maya.check_pc(args(backend="hip"), "minimax", gguf=gguf), {"backend": "hip"})
             self.assertEqual(hip, [{"text_only": False}])
-            self.assertEqual(len(said), 0 if gguf else 1)
-            if not gguf:
-                self.assertIn("experimental", said[0])
+            self.assertEqual(said, [])
 
     def test_amd_quants_offered(self):
-        """AMD is offered the EXL3 quant and the published GGUFs, as NVIDIA is (the EXL3 one marked experimental)."""
+        """AMD is offered the EXL3 quant and the published GGUFs, as NVIDIA is, with the same labels (v1.1.53)."""
         seen = {}
 
         def choose(title, intro, rows, default, auto):
@@ -75,7 +73,7 @@ class Gate(unittest.TestCase):
             labels = {kind(r[0]): r for r in seen["rows"]}
             self.assertEqual(sorted(labels), ["EXL3", "Maya-S", "Maya-XS"])
             self.assertTrue(all(r[0].startswith("MiniMax M3.1") for r in seen["rows"]))   # (the model's name first)
-            self.assertEqual("experimental on AMD" in labels["EXL3"][2], amd)
+            self.assertNotIn("experimental", labels["EXL3"][2])
             self.assertTrue(all("text only" not in r[2] for r in seen["rows"]))
             # (the recommendation counts the GPUs' memory: 64 + 96 GB on AMD holds Maya-S, 64 + 32 GB Maya-XS)
             rec = [r[0] for r in seen["rows"] if r[1] == "recommended"]
@@ -251,6 +249,16 @@ class Config(unittest.TestCase):
         a = self.write(args(no_vision=True))["args"]
         self.assertEqual(a[a.index("--vision") + 1], "off")
 
+    def test_prompt_lookup_on_for_one_gpu_only(self):
+        """Prompt lookup (--suffix-draft 3) is written for one GPU; on several GPUs it is the user's choice (not written,
+        the engine's default is off), and a --suffix-draft in the config before is kept."""
+        self.assertNotIn("--suffix-draft", self.write(args(), gpus=3)["args"])
+        a = self.write(args(), gpus=1)["args"]
+        self.assertEqual(a[a.index("--suffix-draft") + 1], "3")
+        old = {"installer": {"family": "minimax"}, "args": ["--pack", "/p", "--suffix-draft", "3"]}
+        a = self.write(args(), old=old, gpus=3)["args"]
+        self.assertEqual(a[a.index("--suffix-draft") + 1], "3")
+
     def test_parallel_written_kept_and_given_back(self):
         """--parallel N is written and kept by a setup again; with N above 1 a new config does not ask for KV streaming
         (the engine runs each conversation's cache in VRAM), and --parallel 1 brings it back."""
@@ -343,7 +351,7 @@ class Config(unittest.TestCase):
 
 class Gguf(unittest.TestCase):
     """Maya's GGUF quants of MiniMax: the manifest (unpublished: no revision, no sha256), the choice, AMD allowed for
-    them (and the EXL3 quant, experimental), the folder and the pack's tool."""
+    them (and the EXL3 quant), the folder and the pack's tool."""
 
     def test_manifest(self):
         for q, name in (("gguf-xs", "MiniMax-M3.1-Flash-Maya-XS"), ("gguf-s", "MiniMax-M3.1-Flash-Maya-S")):
@@ -373,7 +381,7 @@ class Gguf(unittest.TestCase):
                 patch.object(maya, "check_hip_pc", return_value={"gpus": []}) as hip:
             self.assertEqual(maya.check_pc(args(backend="hip"), "minimax", gguf=True), {"gpus": []})
             hip.assert_called_once()
-            with patch.object(maya, "warn", lambda *a: None):   # (the EXL3 quant: experimental on AMD, not refused)
+            with patch.object(maya, "warn", lambda *a: None):   # (the EXL3 quant on AMD: not refused)
                 self.assertEqual(maya.check_pc(args(backend="hip"), "minimax"), {"gpus": []})
 
     def test_folder_and_tools(self):

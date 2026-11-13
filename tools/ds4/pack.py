@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import struct
 import sys
@@ -36,6 +37,66 @@ from st import SafeTensors  # noqa: E402
 
 TEMPLATE = HERE / "chat_template.jinja"   # (a model repo without its own chat_template.jinja)
 MUL1 = 0x83DCD12D                          # the engine's mul1 codebook multiplier
+TOWER = ("vision.", "aligner.")            # the vision tower's and its aligner's tensors
+MARKS = ("image_start", "image_newline", "image_end")   # the picture span's marker rows (BF16 too)
+SHARD1 = "model-00001-of-00048.safetensors"   # DeepSeek's checkpoint: shard 1 holds only the tower, in BF16
+
+
+def flat_patch(name: str, shape: tuple) -> tuple:
+    """The patch embedding as the engine reads it, [hidden][3 * patch * patch] - a [hidden][3][p][p] copy is the same
+    bytes in the same order."""
+    if name == "vision.patch_embed.proj.weight" and len(shape) > 2:
+        return (shape[0], int(np.prod(shape[1:])))
+    return tuple(shape)
+
+
+def vision_bf16(st, model: pathlib.Path, vdir: pathlib.Path | None) -> str | None:
+    """The engine reads the vision tower in BF16 only, under DeepSeek's names: a quant that ships its own copy in
+    another type (turboderp's EXL3 quants: F16 - #886 - or, at 2.25 bits, EXL3 matrices under other names, its
+    attention's q / k / v and the MLP's gate / up apart) had its tensors count as missing and pictures off.  The tower
+    is taken from a BF16 copy instead: DeepSeek's shard 1 in the model's folder (SafeTensors keeps a name's later copies
+    in .dup; the shard is the whole tower), else vision_pack.py's folder (vdir: its vision.bin / vision.json, as a GGUF
+    install makes - every one of its tensors).  The quant's own tower tensors the copy does not replace are left out of
+    the pack (the engine does not read them).  The line to print: what was taken from where, or why pictures stay
+    off.  None: the tower is BF16 already, or there is none."""
+    bad = [k for k in st.t if (k.startswith(TOWER) or k in MARKS) and st.t[k][1] != "BF16"]
+    if not bad:
+        return None
+    kinds = ", ".join(sorted({st.t[k][1] for k in bad}))
+    src = set()
+    for k in bad:
+        e = next((e for e in st.dup.get(k, ()) if e[1] == "BF16"), None)
+        if e is not None:
+            fn, dt, shape, off, nb = e
+            st.t[k] = (fn, dt, flat_patch(k, shape), off, nb)
+            src.add(fn)
+    whole = SHARD1 if SHARD1 in st.files else None   # (a whole BF16 tower: shard 1, else the vision folder's)
+    left = [k for k in bad if st.t[k][1] != "BF16"]
+    if left and whole is None and vdir is not None and (vdir / "vision.json").is_file() and \
+            (vdir / "vision.bin").is_file():
+        have = {e[0]: e for e in json.loads((vdir / "vision.json").read_text())["tensors"]}
+        try:
+            rel = os.path.relpath(vdir / "vision.bin", model).replace(os.sep, "/")
+        except ValueError:     # (Windows: another drive)
+            rel = None
+        if rel is not None and " " not in rel and have and all(e[1] == "BF16" for e in have.values()):
+            if rel not in st.files:
+                st.files.append(rel)
+            for k, (_, dt, off, nb, shape) in have.items():
+                if (st.t.get(k) or (None, None))[1] != "BF16":
+                    st.t[k] = (rel, dt, flat_patch(k, tuple(shape)), off, nb)
+            whole = rel
+    if whole is None:
+        return "  WARNING - the vision tower is %s here and the engine reads it in BF16 only: pictures stay off.  " \
+               "Put shard 1 of DeepSeek's checkpoint (deepseek-ai/DeepSeek-V4.1-Flash-1017, %s, 0.97 GB: the tower " \
+               "in BF16) in %s and run this again" % (kinds, SHARD1, model)
+    src.add(whole)
+    for k in bad:                                    # (the quant's own layout of it: not the engine's)
+        if st.t[k][1] != "BF16":
+            del st.t[k]
+    n = sum(1 for k, v in st.t.items() if (k.startswith(TOWER) or k in MARKS) and v[0] in src)
+    return "  the vision tower: %d tensors in BF16 from %s (the quant's own copy is %s, which the engine does not " \
+           "read)" % (n, ", ".join(sorted(src)), kinds)
 
 
 def need(st: SafeTensors, t: dict) -> list[str]:
@@ -51,10 +112,44 @@ def need(st: SafeTensors, t: dict) -> list[str]:
                 miss.append(L + n)
         if li in t["engram_layer_ids"] and not st.has(L + "engram.embed.weight"):
             miss.append(L + "engram.embed.weight (shards 47 / 48 of deepseek-ai/DeepSeek-V4.1-Flash-1017)")
+        elif li in t["engram_layer_ids"] and st.t[L + "engram.embed.weight"][1] == "U8":
+            # (a quant's own INT4 Engram tables, U8 + embed.scale: the tables are DeepSeek's, unchanged by the quant)
+            miss.append(L + "engram.embed.weight: an INT4 (U8) layout the engine does not read - put DeepSeek's FP8 "
+                        "shards 47 / 48 of deepseek-ai/DeepSeek-V4.1-Flash-1017 in their place")
     for n in ("embed.weight", "norm.weight", "head.trellis"):
-        if not st.has(n):
+        # (the head as EXL3, or kept as a BF16 head.weight - the engine reads either)
+        if not st.has(n) and not (n == "head.trellis" and st.has("head.weight")):
             miss.append(n)
     return miss
+
+
+def type_ordered(st: SafeTensors) -> str | None:
+    """A layer whose experts share one layout (each part's K and pieces' bytes) is read by the engine as one region an
+    expert, its trellis / suh / svh close together in one file.  Shards that write their tensors grouped by type (all
+    trellis, then all suh, ...) put every expert's pieces far apart - the engine would stop at its start.
+    -> the first such layer's message, None when every layer is fine."""
+    layers: dict[str, list[int]] = {}
+    for n in st.t:
+        p, _, rest = n.partition(".ffn.experts.")
+        if rest.endswith(".w1.trellis") and rest[:-len(".w1.trellis")].isdigit():
+            layers.setdefault(p + ".ffn.experts.", []).append(int(rest[:-len(".w1.trellis")]))
+    for P, es in layers.items():
+        sigs, apart = set(), None
+        for e in sorted(es):
+            ts = [st.t.get("%s%d.%s.%s" % (P, e, r, q)) for r in ("w1", "w3", "w2") for q in ("trellis", "suh", "svh")]
+            if any(x is None for x in ts):
+                sigs = None   # (a missing piece: the engine names it)
+                break
+            sigs.add(tuple(x[4] for x in ts) + tuple(ts[i][2][-1] for i in (0, 3, 6)))
+            nb = sum(x[4] for x in ts)
+            lo, hi = min(x[3] for x in ts), max(x[3] + x[4] for x in ts)
+            if apart is None and len({x[0] for x in ts}) == 1 and hi - lo > 2 * nb + (1 << 20):
+                apart = e
+        if sigs is not None and len(sigs) == 1 and apart is not None:
+            return ("%s%d: its pieces are not together in their file (the shards' tensors ordered by type, not expert "
+                    "by expert?) - rewrite those shards with each expert's tensors back to back (the same tensors, "
+                    "only their order changes)" % (P, apart))
+    return None
 
 
 def write_engram(out: pathlib.Path, model: pathlib.Path, t: dict):
@@ -163,6 +258,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", help="default: <model>/maya-ds4")
+    ap.add_argument("--vision", help="vision_pack.py's folder, the BF16 vision tower for a quant whose own is not BF16 "
+                                     "and without DeepSeek's shard 1 beside it (default: <model>/../vision)")
     a = ap.parse_args()
     model = pathlib.Path(a.model).expanduser().resolve()
     out = pathlib.Path(a.out).expanduser() if a.out else model / "maya-ds4"
@@ -188,9 +285,13 @@ def main() -> int:
     elif any(v[1] == "F8_E4M3" and not k.startswith("vision.") and ".engram.embed." not in k and
              not (k.endswith(".weight") and k[:-len("weight")] + "trellis" in st.t) for k, v in st.t.items()):
         raise SystemExit("%s keeps dense weights in FP8: python tools/ds4/fp8_dense.py --model %s first" % (model, model))
+    vis = vision_bf16(st, model, pathlib.Path(a.vision).expanduser().resolve() if a.vision else model.parent / "vision")
     miss = need(st, t)
     if miss:
         raise SystemExit("missing tensors:\n  " + "\n  ".join(miss[:20]))
+    apart = type_ordered(st)
+    if apart:
+        raise SystemExit(apart)
     out.mkdir(parents=True, exist_ok=True)
 
     with (out / "ds4.txt").open("w") as f:
@@ -223,6 +324,8 @@ def main() -> int:
     print("%s: %d tensors in %d files, Engram %d layers x %d hash columns -> %s" %
           (model.name, len(st.t), len(st.files), nl, cols, out))
     print("  chat template: %s%s" % (tpl, "" if tpl.parent == model else " (the repo has none)"))
+    if vis:
+        print(vis)
     if nk is not None:
         print("  exl3_k_map.json: every one of %d EXL3 matrices' K agrees" % nk)
     return 0

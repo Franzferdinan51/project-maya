@@ -67,6 +67,8 @@ struct Args {
     int act = kActSwiglu;    // the activation (kActOai: MiniMax's)
     int tu = 0;              // (kActOai) the up's type when it is not the gate's (0: tg): gate and up then in two passes,
                              // the gate's sums in h first - each value the same as one pass gives
+    int pexp = 0;            // 1: the token kernels' SwiGLU takes exp_portable (ds4_par_exp.h, DS4_LANE_PARITY), the
+                             // CPU lane's exp bit for bit, in place of CUDA's expf (its ex2.approx)
 };
 /// grid (n_ff / 8, groups): h of every entry (ne_max: a group's most entries).  false: a type not covered.
 bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s);
@@ -77,7 +79,7 @@ bool down(const Args& a, int groups, int ne_max, cudaStream_t s);
 /// [bounds[i], bounds[i + 1]) (local row = sorted row - row0); gate / up: h16[local] = F16 swiglu over x[idx[local]]
 /// (F32 rows, ldx); down: y[local] = down(h16[local]) (F16 rows in, ldx; F32 out, ldo).  A set's experts of at most 16
 /// rows take the token kernels' form (each weight read once, the rows' inputs rounded to int8 per 32 as the token path
-/// rounds them; STRATA_DS4_NO_LIGHT=1: never), the others GEMM tiles (tensor cores on CUDA, F16 operands).
+/// rounds them; MAYA_DS4_NO_LIGHT=1: never), the others GEMM tiles (tensor cores on CUDA, F16 operands).
 struct SetArgs {
     const uint8_t* wbase = nullptr;
     size_t stride = 0;
@@ -114,7 +116,7 @@ private:
     int previous_rows_;
     const int* previous_bounds_;
 };
-// The prompt set's scratch for its int8 activations (the fused experts, STRATA_DS4_PREFILL_FUSED): the caller's down
+// The prompt set's scratch for its int8 activations (the fused experts, MAYA_DS4_PREFILL_FUSED): the caller's down
 // output rows, which the set's gate / up leaves unused until its down writes them; nested scopes restore their caller's.
 class FusedScratchScope {
 public:
