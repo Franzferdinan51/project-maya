@@ -137,6 +137,13 @@ def pack_of(cfg: dict) -> Path | None:
     return Path(p) if p else None
 
 
+def gguf_of(cfg: dict) -> Path | None:
+    """A Metal config's model: the GGUF file its --gguf names (Metal configs name the model file itself,
+    not a pack directory)."""
+    p = flag(cfg.get("args") or [], "--gguf")
+    return Path(p) if p else None
+
+
 # ------------------------------------------------------------------ the context a model was trained for
 def trained_context(model_dir) -> int | None:
     """The context the model was trained for (`<arch>.context_length` in its first GGUF's header; GLM-5.3-Flash:
@@ -179,6 +186,8 @@ def trained_context_of(cfg: dict) -> int | None:
     args = [str(x) for x in cfg.get("args") or []]
     if "--glm-pack" in args[:-1]:
         key, read_it = ("gguf", str(Path(args[args.index("--glm-pack") + 1]).resolve().parent)), trained_context
+    elif "--gguf" in args[:-1]:
+        key, read_it = ("gguf", str(Path(args[args.index("--gguf") + 1]).resolve().parent)), trained_context
     elif "--pack" in args[:-1]:
         key, read_it = ("pack", args[args.index("--pack") + 1]), trained_context_ds4
     else:
@@ -590,12 +599,18 @@ def write(path: Path, cfg: dict):
     os.replace(tmp, p)
 
 
-def folder_size(pack: Path | None) -> int | None:
-    """The model's files: its folder's (the GGUF shards beside the pack) and the pack's, one level each."""
+def folder_size(pack: Path | None, cfg: dict | None = None) -> int | None:
+    """The model's files: its folder's (the GGUF shards beside the pack) and the pack's, one level each.
+    A Metal config has no pack: its --gguf file's folder, one level."""
     if pack is None:
-        return None
+        g = gguf_of(cfg) if cfg else None
+        if g is None:
+            return None
+        dirs = (g.parent,)
+    else:
+        dirs = (pack.parent, pack)
     total = 0
-    for d in (pack.parent, pack):
+    for d in dirs:
         try:
             with os.scandir(d) as it:
                 for e in it:
@@ -603,6 +618,16 @@ def folder_size(pack: Path | None) -> int | None:
                         total += e.stat(follow_symlinks=False).st_size
         except OSError:
             continue
+    if pack is not None and cfg:
+        # (a config whose engine names its weight files itself -- the Qwen/Strata layout's --native and
+        # --ple-gguf shards live outside the pack folder, so the folder sum above misses them entirely)
+        args = cfg.get("args") or []
+        for i, a in enumerate(args[:-1]):
+            if a in ("--native", "--ple-gguf"):
+                try:
+                    total += Path(args[i + 1]).stat().st_size
+                except OSError:
+                    pass
     return total or None
 
 
@@ -611,14 +636,23 @@ def quant_label(cfg: dict, path: Path) -> str:
     names, maya_quants); else its installer key, or the config's own name for one the setup did not write."""
     fam, key = family(cfg), maya_quants.config_key(cfg)
     what = maya_quants.tier(fam, key) or maya_quants.OTHERS.get((fam, key)) or OTHER_QUANTS.get((fam, str(key).lower()))
-    return str(what or key or path.stem.removeprefix("maya-").removesuffix("-hip"))
+    g = gguf_of(cfg)   # (a Metal config the setup did not write: its GGUF's folder carries the set's name)
+    return str(what or key or (g.parent.name if g else None) or
+               path.stem.removeprefix("maya-").removesuffix("-hip"))
 
 
 def missing(cfg: dict) -> str | None:
     """What keeps a config from starting (maya.py stops at it - a switch to it would leave no model running): None when
-    its engine and pack are named and the pack is on this PC."""
+    its engine and pack are named and the pack is on this PC (a Metal config: its engine and its --gguf file)."""
     pack = pack_of(cfg)
-    if not cfg.get("exe") or pack is None:
+    if pack is None:   # (a Metal config: the --gguf file being on this PC is its model being on this PC)
+        g = gguf_of(cfg)
+        if not cfg.get("exe") or g is None:
+            return "its engine or pack is not set"
+        if not g.is_file():
+            return f"its model files are not on this PC ({g.parent})"
+        return None
+    if not cfg.get("exe"):
         return "its engine or pack is not set"
     if not pack.is_dir():
         return f"its model files are not on this PC ({pack.parent})"
@@ -649,7 +683,7 @@ def describe(path: Path, running: str | None, port: int | None = None) -> dict:
             "written": inst.get("written"),
             "used": used, "running": is_running,
             "port": cfg.get("port") or (port if is_running else None), "script": script, "folder": folder,
-            "size": folder_size(pack), "ok": why is None, "missing": why,
+            "size": folder_size(pack, cfg), "ok": why is None, "missing": why,
             "settings": cur, "setup": setup, "choices": choices(cfg), "command": command(cfg),
             "contexts": {"deepseek": DS4_CONTEXTS, "minimax": MM3_CONTEXTS, "qwen": QWEN_CONTEXTS}.get(family(cfg),
                                                                                                        CONTEXTS),
