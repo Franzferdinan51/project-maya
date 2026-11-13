@@ -211,17 +211,29 @@ def context_range(trained: int | None, current: int, engine_kind: str = "") -> d
 
 # ------------------------------------------------------------------ what a config can be switched to
 def dflash_file(cfg: dict) -> Path | None:
-    """GLM's DFlash2 drafter: the one the config drafts with, else one a setup downloaded into its models folder."""
+    """GLM's DFlash2 drafter: the one the config drafts with, else the one in the GLM-5.3-Flash-DFlash2 folder
+    of the config's models folder - the installer's, or, when the config records none (one the setup did not
+    write: a hand-kept Metal config), the folder its own model file sits in, so a drafter kept beside the
+    model is found the way the MiniMax engine finds a dspark folder beside its GGUF."""
     p = flag(cfg.get("args") or [], "--dflash")
     if p:
         return Path(p)
+    roots = []
     models = (cfg.get("installer") or {}).get("models_dir")
-    d = Path(models) / "GLM-5.3-Flash-DFlash2" if models else None
-    try:
-        found = sorted(d.glob("*.gguf")) if d is not None and d.is_dir() else []
-    except OSError:
-        found = []
-    return found[0] if found else None
+    if models:
+        roots.append(Path(models))
+    g = gguf_of(cfg)
+    if g is not None:
+        roots += [g.parent.parent, g.parent]
+    for root in roots:
+        d = root / "GLM-5.3-Flash-DFlash2"
+        try:
+            found = sorted(d.glob("*.gguf")) if d.is_dir() else []
+        except OSError:
+            found = []
+        if found:
+            return found[0]
+    return None
 
 
 def ds4_has_drafter(cfg: dict) -> bool:
