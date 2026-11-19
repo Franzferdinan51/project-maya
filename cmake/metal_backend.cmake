@@ -524,4 +524,27 @@ if(MAYA_HY4_METAL)
   target_link_libraries(metal_hy4_matvec_test PRIVATE ggml ggml-base ggml-cpu ggml-metal)
   target_compile_features(metal_hy4_matvec_test PRIVATE cxx_std_17)
   add_test(NAME metal_hy4_matvec_test COMMAND metal_hy4_matvec_test)
+
+  # Stage 3: the trunk forward (ggml graphs over ggml-metal) against a scalar CPU golden
+  # written from the same kernel semantics, on a complete-block fixture pack (the real
+  # packer over tools/hy4_metal_block_fixture.py's seeded GGUF set: an indexed dense
+  # layer, an SWA MoE layer with the Engram module, an SWA MoE layer).  The model
+  # sources are a small library the stage-4 binary links too.
+  add_library(maya_hy4_metal_model STATIC src/hy4-metal/hy4_metal_ref.cpp
+                                          src/hy4-metal/hy4_metal_ggml.cpp)
+  target_include_directories(maya_hy4_metal_model PUBLIC src/hy4-metal src/hy4 src/mm3)
+  target_link_libraries(maya_hy4_metal_model PUBLIC ggml ggml-base ggml-cpu ggml-metal)
+  target_compile_features(maya_hy4_metal_model PUBLIC cxx_std_17)
+  add_executable(metal_hy4_block_test src/hy4-metal/metal_hy4_block_test.cpp)
+  target_link_libraries(metal_hy4_block_test PRIVATE maya_hy4_metal_model)
+  target_compile_features(metal_hy4_block_test PRIVATE cxx_std_17)
+  if(MAYA_HY4_FIXTURE_PYTHON3)
+    add_test(NAME metal_hy4_block_fixture_gen
+             COMMAND ${MAYA_HY4_FIXTURE_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/hy4_metal_block_fixture.py
+                     --out ${CMAKE_CURRENT_BINARY_DIR}/hy4-block)
+    set_tests_properties(metal_hy4_block_fixture_gen PROPERTIES FIXTURES_SETUP metal_hy4_block_pack)
+    add_test(NAME metal_hy4_block_test
+             COMMAND metal_hy4_block_test ${CMAKE_CURRENT_BINARY_DIR}/hy4-block/gguf/maya-hy4)
+    set_tests_properties(metal_hy4_block_test PROPERTIES FIXTURES_REQUIRED metal_hy4_block_pack)
+  endif()
 endif()
