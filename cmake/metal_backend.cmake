@@ -514,4 +514,14 @@ if(MAYA_HY4_METAL)
              COMMAND metal_hy4_pack_real_test ${CMAKE_CURRENT_BINARY_DIR}/hy4-synth/maya-hy4)
     set_tests_properties(metal_hy4_pack_real_test PROPERTIES FIXTURES_REQUIRED metal_hy4_pack)
   endif()
+
+  # Stage 2: the S trunk's four weight formats (IQ2_XXS / IQ3_XXS routed experts, Q6_K
+  # attention + head, Q8_0 shared expert) multiplied on the Metal backend against the
+  # same quantized bytes on the CPU backend - the kernel layer of the ggml-graph
+  # forward (the inventory found all four in the linked ggml's Metal backend; the
+  # vendored third_party/ggml has none).
+  add_executable(metal_hy4_matvec_test src/hy4-metal/metal_hy4_matvec_test.cpp)
+  target_link_libraries(metal_hy4_matvec_test PRIVATE ggml ggml-base ggml-cpu ggml-metal)
+  target_compile_features(metal_hy4_matvec_test PRIVATE cxx_std_17)
+  add_test(NAME metal_hy4_matvec_test COMMAND metal_hy4_matvec_test)
 endif()
