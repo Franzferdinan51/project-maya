@@ -477,4 +477,41 @@ if(MAYA_HY4_METAL)
   target_include_directories(metal_hy4_pack_test PRIVATE src/hy4 src/mm3)
   target_compile_features(metal_hy4_pack_test PRIVATE cxx_std_17)
   add_test(NAME metal_hy4_pack_test COMMAND metal_hy4_pack_test)
+
+  # Stage 1 (port plan): upstream's plan host test (tests/hy4_plan_test.cpp) in the Metal
+  # build - the top-level hy4_plan_test target registers only under STRATA_BUILD_TESTS,
+  # which this build does not set, so the --kv auto pick would otherwise go untested here.
+  add_executable(metal_hy4_plan_test tests/hy4_plan_test.cpp)
+  target_compile_features(metal_hy4_plan_test PRIVATE cxx_std_17)
+  add_test(NAME metal_hy4_plan_test COMMAND metal_hy4_plan_test)
+
+  # Stage 1: the loader against a pack written by the REAL packer (tools/hy4/pack_gguf.py)
+  # over a synthetic GGUF set (tools/hy4_metal_fixture.py: the packer test's own set, its
+  # expert latent width raised to the loader's whole-256s rule) - the full geometry, the
+  # tensor table and the Engram hash asserted against the GGUF's known values.
+  add_executable(metal_hy4_pack_real_test src/hy4-metal/metal_hy4_pack_real_test.cpp)
+  target_include_directories(metal_hy4_pack_real_test PRIVATE src/hy4 src/mm3)
+  target_compile_features(metal_hy4_pack_real_test PRIVATE cxx_std_17)
+  # The fixture chain (the packer test's set builder) reads the byte alphabet through
+  # tools/strata_tokenizer.py, which needs the regex module - not every python3 has it
+  # (Homebrew's does not; the system's and the ComfyUI venv's do), so probe for one,
+  # the way the DSpark block above probes for torch.
+  foreach(_cand "$ENV{HOME}/ComfyUI/.venv/bin/python" python3)
+    if(NOT MAYA_HY4_FIXTURE_PYTHON3)
+      execute_process(COMMAND ${_cand} -c "import regex"
+                      RESULT_VARIABLE _rc OUTPUT_QUIET ERROR_QUIET)
+      if(_rc EQUAL 0)
+        set(MAYA_HY4_FIXTURE_PYTHON3 ${_cand})
+      endif()
+    endif()
+  endforeach()
+  if(MAYA_HY4_FIXTURE_PYTHON3)
+    add_test(NAME metal_hy4_fixture_gen
+             COMMAND ${MAYA_HY4_FIXTURE_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/hy4_metal_fixture.py
+                     --out ${CMAKE_CURRENT_BINARY_DIR}/hy4-synth)
+    set_tests_properties(metal_hy4_fixture_gen PROPERTIES FIXTURES_SETUP metal_hy4_pack)
+    add_test(NAME metal_hy4_pack_real_test
+             COMMAND metal_hy4_pack_real_test ${CMAKE_CURRENT_BINARY_DIR}/hy4-synth/maya-hy4)
+    set_tests_properties(metal_hy4_pack_real_test PROPERTIES FIXTURES_REQUIRED metal_hy4_pack)
+  endif()
 endif()
