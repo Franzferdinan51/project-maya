@@ -69,8 +69,15 @@ inline fd_t open_direct(const std::string& path) {
     (void) path;
     return kBadFd;
 #else
+#if defined(__APPLE__)
+    // (macOS has no O_DIRECT: F_NOCACHE after the open is its unbuffered read)
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd >= 0) (void) ::fcntl(fd, F_NOCACHE, 1);
+    return fd < 0 ? kBadFd : (fd_t) fd;
+#else
     const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
     return fd < 0 ? kBadFd : (fd_t) fd;
+#endif
 #endif
 }
 /// [off, off + n) through an unbuffered descriptor into dst, a kDirectAlign-aligned buffer of at least
@@ -322,7 +329,18 @@ inline void advise(fd_t f, uint64_t off, uint64_t n, bool need) {
     if (off > UINT64_MAX - n) return;
     (void) unlock_range(base + off, n);
 #else
+#if defined(__APPLE__)
+    // (macOS has no posix_fadvise: F_RDADVISE is the read-ahead hint; the drop side is a
+    //  no-op - both are advisory only, so nothing downstream can observe the difference)
+    if (need) {
+        struct radvisory ra;
+        ra.ra_offset = (off_t) off;
+        ra.ra_count = (int) (n > 0x7fffffff ? 0x7fffffff : n);
+        (void) ::fcntl((int) f, F_RDADVISE, &ra);
+    }
+#else
     posix_fadvise((int) f, (off_t) off, (off_t) n, need ? POSIX_FADV_WILLNEED : POSIX_FADV_DONTNEED);
+#endif
 #endif
 }
 
@@ -372,8 +390,16 @@ inline uint64_t release_copied_cache(fd_t f, const void* mapped_base, uint64_t o
     // Microsoft's Working Set documentation: unlocked pages are removed even though the call reports NOT_LOCKED.
     return unlocked || error == ERROR_NOT_LOCKED ? end - begin : 0;
 #else
+#if defined(__APPLE__)
+    // (macOS: madvise DONTNEED on the mapped range - the pages stay recoverable by a
+    //  later fault from the file, as this function's contract requires)
+    return ::madvise((void*) ((const uint8_t*) mapped_base + begin), (size_t) (end - begin),
+                     MADV_DONTNEED) == 0
+               ? end - begin : 0;
+#else
     return posix_fadvise((int) f, (off_t) begin, (off_t) (end - begin), POSIX_FADV_DONTNEED) == 0
                ? end - begin : 0;
+#endif
 #endif
 }
 
@@ -407,7 +433,11 @@ inline bool resident(const void* p, size_t n) {
 #else
     const uintptr_t pg = 4096, a = (uintptr_t) p, b = a & ~(pg - 1);
     const size_t len = n + (a - b), np = (len + pg - 1) / pg;
+#if defined(__APPLE__)
+    thread_local std::vector<char> v;   // (macOS mincore's vec is char*; the resident bit is the same)
+#else
     thread_local std::vector<unsigned char> v;
+#endif
     if (v.size() < np) v.resize(np);
     if (mincore((void*) b, len, v.data()) != 0) return false;
     for (size_t i = 0; i < np; ++i)
@@ -435,7 +465,11 @@ inline bool resident_sampled(const void* p, size_t bytes, int samples = 8) {
     return true;
 #else
     for (int i = 0; i < samples; ++i) {
+#if defined(__APPLE__)
+        char v = 0;
+#else
         unsigned char v = 0;
+#endif
         const uintptr_t at = (a + (samples > 1 ? span / (samples - 1) * i : 0)) & ~(pg - 1);
         if (mincore((void*) at, pg, &v) != 0 || !(v & 1)) return false;
     }
@@ -483,8 +517,10 @@ inline void drop_cached(const std::vector<std::pair<uint8_t*, size_t>>& maps, co
 #else
     for (const auto& m : maps)
         if (m.first != nullptr && m.second > 0) madvise((void*) m.first, m.second, MADV_DONTNEED);
+#if !defined(__APPLE__)
     for (fd_t f : fds)
         if (f != kBadFd) posix_fadvise((int) f, 0, 0, POSIX_FADV_DONTNEED);
+#endif
 #endif
 }
 
@@ -501,7 +537,10 @@ inline void* anon_alloc(size_t bytes, int node, int nodes) {
 #else
     void* m = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (m == MAP_FAILED) return nullptr;
+#if defined(__linux__)
     madvise(m, bytes, MADV_HUGEPAGE);
+#endif
+#if defined(__linux__)
     if (node >= 0 && nodes > 1) {
         unsigned long mask[4] = {0, 0, 0, 0};
         mask[node / 64] = 1ul << (node % 64);
@@ -514,6 +553,7 @@ inline void* anon_alloc(size_t bytes, int node, int nodes) {
                                      "(a container needs SYS_NICE)\n", node, std::strerror(errno));
         }
     }
+#endif
     return m;
 #endif
 }
@@ -558,6 +598,11 @@ inline void* huge_alloc(size_t bytes, int node, int nodes, size_t* got) {
     (void) bytes, (void) node, (void) nodes, (void) got;
     return nullptr;
 #else
+#if defined(__APPLE__)
+    // (no MAP_HUGETLB pool on macOS: nullptr, as on Windows - the caller falls back to anon_alloc)
+    (void) bytes, (void) node, (void) nodes, (void) got;
+    return nullptr;
+#else
 #ifndef MAP_HUGE_SHIFT
 #define MAP_HUGE_SHIFT 26
 #endif
@@ -573,6 +618,7 @@ inline void* huge_alloc(size_t bytes, int node, int nodes, size_t* got) {
     if (got != nullptr) *got = hb;
     return m;
 #endif
+#endif
 }
 
 /// The calling thread, or `t`, on logical CPU `cpu` (Windows: the first 64 CPUs, processor group 0).
@@ -580,20 +626,28 @@ inline void pin_self(int cpu) {
 #if defined(_WIN32)
     if (cpu >= 0 && cpu < 64) SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << cpu);
 #else
+#if defined(__APPLE__)
+    (void) cpu;   // (macOS has no sched_setaffinity; affinity here is a hint only, so this is a no-op)
+#else
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);
     sched_setaffinity(0, sizeof set, &set);
+#endif
 #endif
 }
 inline void pin_thread(std::thread& t, int cpu) {
 #if defined(_WIN32)
     if (cpu >= 0 && cpu < 64) SetThreadAffinityMask((HANDLE) t.native_handle(), (DWORD_PTR) 1 << cpu);
 #else
+#if defined(__APPLE__)
+    (void) t, (void) cpu;   // (no pthread_setaffinity_np on macOS; a hint only, so this is a no-op)
+#else
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);
     pthread_setaffinity_np(t.native_handle(), sizeof(set), &set);
+#endif
 #endif
 }
 

@@ -457,3 +457,24 @@ else()
   message(STATUS "maya-metal-qwen skipped: vendored metal-cpp headers not found at "
                  "${_maya_qwen_root}/metal-cpp (MAYA_QWEN_METAL=${MAYA_QWEN_METAL})")
 endif()
+
+# ---- Hy4-Flash on Metal: maya-metal-hy4 ------------------------------------------------------
+# The Metal port of upstream's maya-hy4 (src/hy4, CUDA), staged per the port plan
+# (HY4-METAL-PORT-PLAN.md in the Maya goal workspace): upstream's host loader
+# (src/hy4/hy4_pack.hpp) and plan (src/hy4/hy4_plan.hpp) are reused unchanged; the GPU
+# forward is reimplemented under src/hy4-metal/. Until a stage lands, the binary loads
+# a pack and stops loudly rather than serving anything (the fork's stub rule).
+option(MAYA_HY4_METAL "Build the Hy4-Flash Metal engine (maya-metal-hy4)" ON)
+if(MAYA_HY4_METAL)
+  add_executable(maya-metal-hy4 src/hy4-metal/hy4_metal_main.cpp)
+  target_include_directories(maya-metal-hy4 PRIVATE src/hy4 src/mm3)
+  target_compile_features(maya-metal-hy4 PRIVATE cxx_std_17)
+
+  # Loader fixture gate: a synthetic mini-pack written by the test itself (no model
+  # files), loaded through upstream's own hy4::Pack - geometry, tensor table and the
+  # Engram hash parse asserted, plus a wrong-arch pack refused.
+  add_executable(metal_hy4_pack_test src/hy4-metal/metal_hy4_pack_test.cpp)
+  target_include_directories(metal_hy4_pack_test PRIVATE src/hy4 src/mm3)
+  target_compile_features(metal_hy4_pack_test PRIVATE cxx_std_17)
+  add_test(NAME metal_hy4_pack_test COMMAND metal_hy4_pack_test)
+endif()
