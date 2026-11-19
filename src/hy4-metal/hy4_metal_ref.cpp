@@ -73,6 +73,10 @@ public:
         for (auto& v : pooled_) std::fill(v.begin(), v.end(), 0.0f);
     }
     int64_t pos() const override { return pos_; }
+    void rewind_to(int64_t n) override {
+        pos_ = n;
+        hist_.resize((size_t) n);
+    }
 
     bool run(const int* ids, int T, float* logits_out, Trace* trace, std::string& err) override {
         const hy4::Geo& g = g_;

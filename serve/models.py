@@ -99,6 +99,10 @@ def _metal_mm3(cfg: dict) -> bool:
     return Path(str(cfg.get("exe", ""))).name.startswith("maya-metal-mm3")
 
 
+def _metal_hy4(cfg: dict) -> bool:
+    return Path(str(cfg.get("exe", ""))).name.startswith("maya-metal-hy4")
+
+
 def set_flag(args: list, name: str, value) -> list:
     """The arguments with `name value` (replaced where it was, else added at the end)."""
     out = [str(a) for a in args]
@@ -139,6 +143,8 @@ def family(cfg: dict) -> str:
     """"minimax", "deepseek", "qwen", "hy4" or "glm" (maya_quants.family_of, as maya.py and the server read it)."""
     if _metal_mm3(cfg):   # (family_of knows the CUDA exe name, maya-mm3; the Metal MiniMax engine's is maya-metal-mm3)
         return "minimax"
+    if _metal_hy4(cfg):   # (family_of knows the CUDA exe name, maya-hy4, or the installer record; the Metal
+        return "hy4"      #  Hy4 engine's exe is maya-metal-hy4 - and a bare --pack would read as DeepSeek's)
     return maya_quants.family_of(cfg)
 
 

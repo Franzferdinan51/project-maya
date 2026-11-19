@@ -466,8 +466,11 @@ endif()
 # a pack and stops loudly rather than serving anything (the fork's stub rule).
 option(MAYA_HY4_METAL "Build the Hy4-Flash Metal engine (maya-metal-hy4)" ON)
 if(MAYA_HY4_METAL)
-  add_executable(maya-metal-hy4 src/hy4-metal/hy4_metal_main.cpp)
+  add_executable(maya-metal-hy4 src/hy4-metal/hy4_metal_main.cpp
+                                 src/hy4-metal/hy4_metal_serve.cpp
+                                 src/metal/sampler.cpp)
   target_include_directories(maya-metal-hy4 PRIVATE src/hy4 src/mm3)
+  target_link_libraries(maya-metal-hy4 PRIVATE maya_hy4_metal_model)
   target_compile_features(maya-metal-hy4 PRIVATE cxx_std_17)
 
   # Loader fixture gate: a synthetic mini-pack written by the test itself (no model
@@ -546,5 +549,14 @@ if(MAYA_HY4_METAL)
     add_test(NAME metal_hy4_block_test
              COMMAND metal_hy4_block_test ${CMAKE_CURRENT_BINARY_DIR}/hy4-block/gguf/maya-hy4)
     set_tests_properties(metal_hy4_block_test PROPERTIES FIXTURES_REQUIRED metal_hy4_block_pack)
+
+    # Stage 4: greedy end-to-end through the real binary - --ids on Metal vs --ids on
+    # the CPU reference (token-for-token), then the serve protocol against the same
+    # fixture pack (READY, a greedy GEN matching the ids chain, a follow-up GEN whose
+    # DONE reports the conversation-prefix reuse).
+    add_test(NAME metal_hy4_e2e_test
+             COMMAND ${MAYA_HY4_FIXTURE_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/hy4_metal_e2e.py
+                     $<TARGET_FILE:maya-metal-hy4> ${CMAKE_CURRENT_BINARY_DIR}/hy4-block/gguf/maya-hy4)
+    set_tests_properties(metal_hy4_e2e_test PROPERTIES FIXTURES_REQUIRED metal_hy4_block_pack)
   endif()
 endif()

@@ -202,7 +202,17 @@ public:
     virtual bool run(const int* ids, int T, float* logits_out, Trace* trace, std::string& err) = 0;
     virtual void reset() = 0;
     virtual int64_t pos() const = 0;
+    // Rewind the state to position n (0 <= n <= pos()): the caches are positional, so the
+    // rows past n are simply overwritten by whatever is fed next; the history (which the
+    // Engram gather reads by absolute position) is truncated to match.  The serve loop's
+    // conversation-prefix reuse rides on this.
+    virtual void rewind_to(int64_t n) = 0;
 };
+
+// The serve protocol (serve/server.py's StrataEngine): INFO/READY, then GEN lines in,
+// T/DONE lines out.  Defined in hy4_metal_serve.cpp; declared here so the engine main
+// stays a thin CLI.
+int serve_hy4(Forward& fwd, const hy4::Geo& g, int64_t max_ctx, int chunk);
 
 std::unique_ptr<Forward> make_ref_forward(Weights& w, int64_t max_ctx);
 std::unique_ptr<Forward> make_ggml_forward(Weights& w, ggml_backend_t be, int64_t max_ctx, bool want_all_logits);
