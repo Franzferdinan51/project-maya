@@ -910,124 +910,92 @@ bool Ggml::ffn(Win& win, int il, std::string& err) {
         return true;
     }
     const int LAT = g.n_lat, FFE = g.n_ff_exp, NU = g.n_used, NE = g.n_expert;
-    // span A: the hc fold and the router logits / latent input / shared expert's hidden
-    // rows in one graph (the host picks need only the logits, which this writes)
-    {
-        c = build_begin();
-        std::vector<ggml_tensor*> roots;
-        hc_pre_roots(c, roots, win, x, p + "hc_ffn", W(p + "ffn_norm.weight"), xf, post);
-        ggml_tensor* rl = ggml_mul_mat(c, W(p + "ffn_gate_inp.weight"), xf);
-        ggml_tensor* lat = ggml_mul_mat(c, W(p + "ffn_routed_down.weight"), xf);
-        ggml_tensor* sh = ggml_mul(c, ggml_silu(c, ggml_mul_mat(c, W(p + "ffn_gate_shexp.weight"), xf)),
-                                   ggml_mul_mat(c, W(p + "ffn_up_shexp.weight"), xf));
-        ggml_tensor* hdv = ggml_view_2d(c, win.get("hd"), FFE, T, win.get("hd")->nb[1], 0);
-        roots.push_back(ggml_cpy(c, rl, win.get("rl")));
-        roots.push_back(ggml_cpy(c, lat, win.get("lat")));
-        roots.push_back(ggml_cpy(c, sh, hdv));
-        ggml_cgraph* gr = ggml_new_graph_custom(c, 65536, false);
-        for (ggml_tensor* r : roots) ggml_build_forward_expand(gr, r);
-        if (!run_graph(win, gr, err)) {
-            err = "hy4-metal: ffn router failed";
-            return false;
-        }
-        build_end();
+    // The whole MoE ffn in ONE graph: the hc fold, the router, the picks IN-GRAPH
+    // (sigmoid + correction bias + argsort_top_k, the mm3/Qwen pattern - no host round-trip,
+    // so nothing forces a commit between the router and the experts), the grouped experts,
+    // the shared expert and the hc residual. The picks' tie order is the sort kernel's;
+    // the e2e token parity and the real-prompt coherence gate verify it against the old
+    // host sigmoid+bias+sort.
+    c = build_begin();
+    const float limit = (float) g.limit[(size_t) il];
+    ggml_tensor* latout = win.get("latout");
+    std::vector<ggml_tensor*> roots;
+    hc_pre_roots(c, roots, win, x, p + "hc_ffn", W(p + "ffn_norm.weight"), xf, post);
+    ggml_tensor* rl = ggml_mul_mat(c, W(p + "ffn_gate_inp.weight"), xf);      // [NE, T]
+    ggml_tensor* lat = ggml_mul_mat(c, W(p + "ffn_routed_down.weight"), xf);  // [LAT, T]
+    ggml_tensor* sh = ggml_mul(c, ggml_silu(c, ggml_mul_mat(c, W(p + "ffn_gate_shexp.weight"), xf)),
+                               ggml_mul_mat(c, W(p + "ffn_up_shexp.weight"), xf));
+    ggml_tensor* hdv = ggml_view_2d(c, win.get("hd"), FFE, T, win.get("hd")->nb[1], 0);
+    roots.push_back(ggml_cpy(c, rl, win.get("rl")));
+    roots.push_back(ggml_cpy(c, sh, hdv));
+    // the picks and their weights, in-graph
+    ggml_tensor* sig = ggml_sigmoid(c, rl);                                   // [NE, T]
+    ggml_tensor* biased = ggml_add(c, sig, ggml_reshape_3d(c, W(p + "exp_probs_b.bias"), NE, 1, 1));
+    // argsort_top_k is a strided VIEW of the sorted rows (stride NE between tokens), so it
+    // must be made contiguous before the ids layout (ids[j + NU*t]) and the gather read it
+    ggml_tensor* top = ggml_cont(c, ggml_argsort_top_k(c, biased, NU));        // [NU, T] i32, desc
+    ggml_tensor* rw_raw = ggml_get_rows(c, ggml_reshape_3d(c, sig, 1, NE, T), top);   // [1, NU, T]
+    ggml_tensor* rw2 = ggml_reshape_2d(c, rw_raw, NU, T);
+    ggml_tensor* rw = ggml_reshape_3d(c, rw_raw, NU, 1, T);
+    if (g.w_norm) {
+        ggml_tensor* wsum = ggml_clamp(c, ggml_sum_rows(c, rw2), 6.103515625e-5f, 3.4e38f);   // [1, T], the 2^-14 floor
+        rw = ggml_div(c, rw, ggml_reshape_3d(c, wsum, 1, 1, T));
     }
-    // the picks, this forward's own selection from the graph's logits
-    prof_.begin("router_host");
-    std::vector<float> rlv((size_t) T * NE);
-    readback(win.get("rl"), rlv.data());
-    const float* biasv = wconst(W(p + "exp_probs_b.bias"), (size_t) NE);
-    std::vector<std::vector<int>> ids((size_t) T);
-    std::vector<std::vector<float>> rw((size_t) T);
-    std::vector<float> tr_ids, tr_rw, tr_sc;
+    rw = ggml_scale(c, rw, (float) g.w_scale);
+    // the routed experts (grouped matmuls), the per-token accumulation in the old order
+    ggml_tensor* ge = W(p + "ffn_gate_exps.weight"), *ue = W(p + "ffn_up_exps.weight"),
+                *de = W(p + "ffn_down_exps.weight");
+    ggml_tensor* lat3 = ggml_reshape_3d(c, lat, LAT, 1, T);
+    ggml_tensor* gv = ggml_mul_mat_id(c, ge, lat3, top);   // [FFE, NU, T]
+    ggml_tensor* uv = ggml_mul_mat_id(c, ue, lat3, top);
+    if (limit > 0) {
+        gv = ggml_clamp(c, gv, -3.4e38f, limit);
+        uv = ggml_clamp(c, uv, -limit, limit);
+    }
+    ggml_tensor* h = ggml_mul(c, ggml_silu(c, gv), uv);
+    ggml_tensor* eo = ggml_mul_mat_id(c, de, h, top);      // [LAT, NU, T]
+    eo = ggml_mul(c, eo, ggml_reshape_3d(c, rw, 1, NU, T));
     for (int t = 0; t < T; ++t) {
-        const float* rl = &rlv[(size_t) t * NE];
-        auto sig = [](float v) { return 1.0f / (1.0f + std::exp(-v)); };
-        std::vector<std::pair<float, int>> cand((size_t) NE);
-        for (int e = 0; e < NE; ++e) cand[(size_t) e] = {sig(rl[e]) + biasv[(size_t) e], e};
-        for (int e = 0; e < NE; ++e) tr_sc.push_back(cand[(size_t) e].first);
-        std::sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) {
-            return a.first != b.first ? a.first > b.first : a.second < b.second;
-        });
-        float wsum = 0;
+        ggml_tensor* acc = nullptr;
         for (int j = 0; j < NU; ++j) {
-            ids[(size_t) t].push_back(cand[(size_t) j].second);
-            rw[(size_t) t].push_back(sig(rl[cand[(size_t) j].second]));
-            wsum += rw[(size_t) t][(size_t) j];
+            ggml_tensor* eo_j = ggml_view_2d(c, eo, LAT, 1, eo->nb[1],
+                                             ((size_t) j + (size_t) NU * t) * LAT * 4);
+            acc = acc ? ggml_add(c, acc, eo_j) : eo_j;
         }
-        for (int j = 0; j < NU; ++j) {
-            float wgt = rw[(size_t) t][(size_t) j];
-            if (g.w_norm) wgt /= std::max(wsum, 6.103515625e-5f);   // upstream's 2^-14 floor
-            wgt *= (float) g.w_scale;
-            rw[(size_t) t][(size_t) j] = wgt;
-            tr_ids.push_back((float) ids[(size_t) t][(size_t) j]);
-            tr_rw.push_back(wgt);
-        }
+        roots.push_back(ggml_cpy(
+            c, acc, ggml_view_2d(c, latout, LAT, 1, latout->nb[1], (size_t) t * LAT * 4)));
     }
-    prof_.end("router_host");
+    ggml_tensor* yv = ggml_add(c, ggml_mul_mat(c, W(p + "ffn_routed_up.weight"), latout),
+                               ggml_mul_mat(c, W(p + "ffn_down_shexp.weight"), hdv));
+    roots.push_back(ggml_cpy(c, yv, y));
+    hc_post_roots(c, roots, x, y, post, W(p + "post_ffw_norm.weight"));
+    ggml_cgraph* gr = ggml_new_graph_custom(c, 65536 + (size_t) T * NU * 16, false);
+    for (ggml_tensor* r : roots) ggml_build_forward_expand(gr, r);
+    if (!run_graph(win, gr, err)) {
+        err = "hy4-metal: ffn failed";
+        return false;
+    }
+    build_end();
     if (trace_) {
+        // the picks/weights/scores now live on the GPU; read them back for the trace only
+        std::vector<int32_t> topv((size_t) NU * T);
+        std::vector<float> rwv((size_t) NU * T), rlv((size_t) NE * T);
+        ggml_backend_tensor_get(top, topv.data(), 0, topv.size() * 4);
+        ggml_backend_tensor_get(rw, rwv.data(), 0, rwv.size() * 4);
+        ggml_backend_tensor_get(win.get("rl"), rlv.data(), 0, rlv.size() * 4);
+        const float* biasv = wconst(W(p + "exp_probs_b.bias"), (size_t) NE);
+        std::vector<float> tr_ids, tr_rw, tr_sc;
+        for (int t = 0; t < T; ++t) {
+            auto sigf = [](float v) { return 1.0f / (1.0f + std::exp(-v)); };
+            for (int e = 0; e < NE; ++e) tr_sc.push_back(sigf(rlv[(size_t) t * NE + e]) + biasv[e]);
+            for (int j = 0; j < NU; ++j) {
+                tr_ids.push_back((float) topv[(size_t) j + (size_t) NU * t]);
+                tr_rw.push_back(rwv[(size_t) j + (size_t) NU * t]);
+            }
+        }
         trace_->put("router_ids-" + ils, tr_ids);
         trace_->put("router_rw-" + ils, tr_rw);
         trace_->put("router_sc-" + ils, tr_sc);
-    }
-    // span B: the routed experts in the latent space, the up projection, the shared
-    // expert, and the hc residual - one graph commit
-    {
-        c = build_begin();
-        const float limit = (float) g.limit[(size_t) il];
-        ggml_tensor* lat = win.get("lat"), *latout = win.get("latout");
-        std::vector<ggml_tensor*> roots;
-        ggml_tensor* ge = W(p + "ffn_gate_exps.weight"), *ue = W(p + "ffn_up_exps.weight"),
-                    *de = W(p + "ffn_down_exps.weight");
-        // the picks as a tensor [NU, T] (ids[j + NU*t]), and the routing weights beside
-        // them: the experts run as one grouped matmul each way (ggml_mul_mat_id, the MoE
-        // kernel) - sixteen separate expert chains were ~140 dispatches a layer a token.
-        // The per-token accumulation order below is the old one, so the sum is unchanged.
-        ggml_tensor* eid = ggml_new_tensor_2d(c, GGML_TYPE_I32, NU, T);
-        {
-            std::vector<int32_t> ev((size_t) NU * T);
-            std::vector<float> rv((size_t) NU * T);
-            for (int t = 0; t < T; ++t)
-                for (int j = 0; j < NU; ++j) {
-                    ev[(size_t) j + (size_t) NU * t] = ids[(size_t) t][(size_t) j];
-                    rv[(size_t) j + (size_t) NU * t] = rw[(size_t) t][(size_t) j];
-                }
-            pending_iconsts_.push_back({eid, std::move(ev)});
-            ggml_tensor* rwv = ggml_new_tensor_1d(c, GGML_TYPE_F32, (int64_t) rv.size());
-            pending_consts_.push_back({rwv, std::move(rv)});
-            ggml_tensor* lat3 = ggml_reshape_3d(c, lat, LAT, 1, T);
-            ggml_tensor* gv = ggml_mul_mat_id(c, ge, lat3, eid);   // [FFE, NU, T]
-            ggml_tensor* uv = ggml_mul_mat_id(c, ue, lat3, eid);
-            if (limit > 0) {
-                gv = ggml_clamp(c, gv, -3.4e38f, limit);
-                uv = ggml_clamp(c, uv, -limit, limit);
-            }
-            ggml_tensor* h = ggml_mul(c, ggml_silu(c, gv), uv);
-            ggml_tensor* eo = ggml_mul_mat_id(c, de, h, eid);      // [LAT, NU, T]
-            eo = ggml_mul(c, eo, ggml_reshape_3d(c, rwv, 1, NU, T));
-            for (int t = 0; t < T; ++t) {
-                ggml_tensor* acc = nullptr;
-                for (int j = 0; j < NU; ++j) {
-                    ggml_tensor* eo_j = ggml_view_2d(c, eo, LAT, 1, eo->nb[1],
-                                                     ((size_t) j + (size_t) NU * t) * LAT * 4);
-                    acc = acc ? ggml_add(c, acc, eo_j) : eo_j;
-                }
-                roots.push_back(ggml_cpy(
-                    c, acc, ggml_view_2d(c, latout, LAT, 1, latout->nb[1], (size_t) t * LAT * 4)));
-            }
-        }
-        ggml_tensor* hdv = ggml_view_2d(c, win.get("hd"), FFE, T, win.get("hd")->nb[1], 0);
-        ggml_tensor* yv = ggml_add(c, ggml_mul_mat(c, W(p + "ffn_routed_up.weight"), latout),
-                                   ggml_mul_mat(c, W(p + "ffn_down_shexp.weight"), hdv));
-        roots.push_back(ggml_cpy(c, yv, y));
-        hc_post_roots(c, roots, x, y, post, W(p + "post_ffw_norm.weight"));
-        ggml_cgraph* gr = ggml_new_graph_custom(c, 65536 + (size_t) T * NU * 16, false);
-        for (ggml_tensor* r : roots) ggml_build_forward_expand(gr, r);
-        if (!run_graph(win, gr, err)) {
-            err = "hy4-metal: ffn G4 failed";
-            return false;
-        }
-        build_end();
     }
     trace_put("ffn_latout-" + ils, win.get("latout"));
     trace_put("ffn_y-" + ils, y);
