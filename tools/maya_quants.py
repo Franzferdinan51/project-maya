@@ -283,9 +283,9 @@ def family_of(cfg: dict) -> str:
     "glm"."""
     inst = cfg.get("installer") or {}
     exe = Path(str(cfg.get("exe", ""))).name
-    if inst.get("family") == "hy4" or exe.startswith("maya-hy4"):
+    if inst.get("family") == "hy4" or exe.startswith(("maya-hy4", "maya-metal-hy4")):
         return "hy4"
-    if inst.get("family") == "minimax" or exe.startswith("maya-mm3"):
+    if inst.get("family") == "minimax" or exe.startswith(("maya-mm3", "maya-metal-mm3")):
         return "minimax"
     args = cfg.get("args") or []
     if inst.get("family") == "qwen" or "--ple-gguf" in args[:-1]:
@@ -301,12 +301,15 @@ def config_key(cfg: dict) -> str | None:
     if not isinstance(inst, dict):
         return None
     fam = family_of(cfg)
+    # (the defaults below are the CUDA-era sets of configs from before their quants were recorded; a Metal engine
+    # runs GGUF files, never those - no key: the label falls back to the model's own folder, serve/models.py)
+    metal = Path(str(cfg.get("exe", ""))).name.startswith("maya-metal")
     if fam == "deepseek":
-        return inst.get("ds4_quant") or "exl3"
+        return inst.get("ds4_quant") or (None if metal else "exl3")
     if fam == "minimax":
-        return inst.get("mm3_quant") or "exl3"
+        return inst.get("mm3_quant") or (None if metal else "exl3")
     if fam == "hy4":
-        return inst.get("hy4_quant") or "maya-xs"
+        return inst.get("hy4_quant") or (None if metal else "maya-xs")
     if fam == "qwen":   # (its keys are lower case: a hand-edited "UD-IQ2_XS" is the same files and the same name)
         return str(inst.get("qwen_quant") or "q5_k_m").lower()
     if fam == "hy4":

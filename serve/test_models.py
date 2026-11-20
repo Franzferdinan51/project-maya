@@ -165,6 +165,36 @@ class Settings(unittest.TestCase):
         self.assertEqual(M.settings_of(new)["draft"], "dflash2")
         self.assertEqual(M.settings_of(M.apply(new, {"draft": "mtp", "gpus": [0]}))["draft"], "mtp")
 
+    def test_metal_hy4_without_an_installer_is_hy4_not_deepseek(self):
+        # (a hand-kept Metal Hy4 config: its exe name is the setup's with -metal in it, and its --pack must not
+        # make it read as a DeepSeek config - the server wires DeepSeek's drafter and lookup by the family)
+        pack = self.d / "Maya-S" / "maya-hy4"
+        pack.mkdir(parents=True)
+        p = self.d / "maya-hy4.json"
+        p.write_text(json.dumps({"exe": "/b/maya-metal-hy4",
+                                 "args": ["--pack", str(pack), "--max-context", "262144"],
+                                 "model_name": "hy4-flash"}))
+        cfg = M.read(p)
+        self.assertEqual(M.family(cfg), "hy4")
+        self.assertIsNone(M.missing(cfg))
+        self.assertEqual(M.settings_of(cfg)["context"], 262144)
+
+    def test_metal_configs_not_labelled_with_the_cuda_era_defaults(self):
+        # (the EXL3 / Maya-XS defaults are the CUDA-era sets of configs from before quants were recorded; a Metal
+        # engine runs GGUF files: with no quant recorded the label is the model folder's own name, not another set's)
+        g = self.d / "models" / "MiniMax-M3.1-Flash-Metal" / "model.gguf"
+        g.parent.mkdir(parents=True)
+        g.write_bytes(b"x")
+        p = self.d / "maya-mm3-metal.json"
+        p.write_text(json.dumps({"exe": "/b/maya-metal-mm3", "args": ["--gguf", str(g)],
+                                 "model_name": "minimax-m3.1-flash", "installer": {"family": "minimax"}}))
+        self.assertEqual(M.quant_label(M.read(p), p), "MiniMax-M3.1-Flash-Metal")
+        # (the CUDA-era default stays for the CUDA engines' old configs)
+        old = self.d / "maya-mm3.json"
+        old.write_text(json.dumps({"exe": "/b/maya-mm3", "args": ["--pack", str(self.d / "p")],
+                                   "model_name": "minimax-m3.1-flash", "installer": {}}))
+        self.assertEqual(M.quant_label(M.read(old), old), "EXL3 3.5 bpw")
+
     def test_checked_before_anything_changes(self):
         cfg = M.read(glm_cfg(self.d))
         for bad in ({"context": "lots"}, {"parallel": 9}, {"gpus": []}, {"gpus": ["0"]}, {"reserve_mib": -1},
