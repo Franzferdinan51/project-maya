@@ -14,6 +14,7 @@
 #pragma once
 
 #include "../hy4/hy4_pack.hpp"
+#include "hy4_metal_egcache.hpp"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -146,12 +147,14 @@ struct EgRows {
 // toks[s] the mapped id s positions back (the pad before the start / unmapped); the rolling
 // hash picks a table row a (column, position-in-group) at a time.
 inline EgRows engram_gather(const hy4::Pack& pk, int module, const std::vector<int>& history, int64_t p0,
-                            int T) {
+                            int T, EgCache* cache = nullptr, EgStats* st = nullptr) {
     const hy4::Engram& eg = pk.eg;
     const int n = eg.ngram, cols = eg.cols(), hd = eg.head_dim;
     EgRows out;
     out.bytes.resize((size_t) T * cols * hd);
     out.valid.assign((size_t) T, 0.0f);
+    EgStats local;
+    EgStats& s = st ? *st : local;
     const hy4::Tensor* tab = pk.get("per_layer_token_embd.weight");
     if (!tab || module < 0) return out;
     const uint8_t* table = pk.data(*tab);
@@ -177,8 +180,16 @@ inline EgRows engram_gather(const hy4::Pack& pk, int module, const std::vector<i
             for (int h = 0; h < eg.heads; ++h) {
                 const int col = (oo - 1) * eg.heads + h;
                 const uint64_t row = rolling % primes[(size_t) col] + offs[(size_t) col];
-                std::memcpy(out.bytes.data() + ((size_t) t * cols + col) * hd, table + row * (uint64_t) hd,
-                            (size_t) hd);
+                uint8_t* dst = out.bytes.data() + ((size_t) t * cols + col) * hd;
+                const uint8_t* src = table + row * (uint64_t) hd;
+                if (cache && cache->on()) {
+                    cache->fetch(row, src, dst, s);
+                } else {
+                    s.rows++;
+                    s.reads++;
+                    if (!eg_page_resident(src)) s.disk++;
+                    std::memcpy(dst, src, (size_t) hd);
+                }
             }
         }
         out.valid[(size_t) t] = dead ? 0.0f : 1.0f;
@@ -192,10 +203,22 @@ inline float engram_eps(const hy4::Pack& pk) {
     return pk.has("engram_eps") ? (float) pk.num("engram_eps") : 1.1920929e-07f;
 }
 
+// What the serve's STAT/INFO lines report: the Engram tier's counters and the resident
+// weight bytes. Every routed expert is copied into a Metal buffer at load - on this
+// unified-memory machine they are all resident; the tier that streams is the n-gram table.
+struct TierInfo {
+    EgStats eg;
+    double resident_gb = 0.0;
+    int64_t eg_cache_rows = 0, eg_cache_cap = 0;
+    size_t eg_row_bytes = 0;
+    int engram_lookups = 0;
+};
+
 // ------------------------------------------------------------------ the forwards
 class Forward {
 public:
     virtual ~Forward() = default;
+    virtual TierInfo tier_info() const { return {}; }
     // Process T tokens at the current position (the state's history grows by them).  On
     // success the state has advanced; logits_out holds the window's logits - all T rows
     // [T][n_vocab] for the reference and for a ggml forward built with want_all_logits,
@@ -216,6 +239,7 @@ public:
 int serve_hy4(Forward& fwd, const hy4::Geo& g, int64_t max_ctx, int chunk);
 
 std::unique_ptr<Forward> make_ref_forward(Weights& w, int64_t max_ctx);
-std::unique_ptr<Forward> make_ggml_forward(Weights& w, ggml_backend_t be, int64_t max_ctx, bool want_all_logits);
+std::unique_ptr<Forward> make_ggml_forward(Weights& w, ggml_backend_t be, int64_t max_ctx, bool want_all_logits,
+                                           double eg_cache_gb = 1.0);
 
 }  // namespace hym

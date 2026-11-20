@@ -29,6 +29,7 @@ void usage() {
                  "usage: maya-metal-hy4 --pack DIR [--serve | --ids 1,2,3 [--n N]]\n"
                  "  --max-context N      tokens the caches hold (default 32768, or the pack's own context if smaller)\n"
                  "  --chunk N            prompt tokens per window slice (default 512)\n"
+                 "  --engram-cache-gb N  Engram n-gram row cache in RAM, GB (default 1; 0 disables)\n"
                  "  --cpu                run on the scalar CPU reference instead of the GPU\n");
 }
 
@@ -55,6 +56,7 @@ int main(int argc, char** argv) {
     int n_gen = 32;
     int64_t max_ctx = 0;
     int chunk = 512;
+    double eg_gb = 1.0;
     std::vector<std::string> noted;
     bool mtp = false, vision = false;
     for (int i = 1; i < argc; ++i) {
@@ -73,6 +75,7 @@ int main(int argc, char** argv) {
         else if (a == "--cpu") cpu = true;
         else if (a == "--max-context") max_ctx = std::atoll(next());
         else if (a == "--chunk") chunk = std::atoi(next());
+        else if (a == "--engram-cache-gb") eg_gb = std::atof(next());
         else if (a == "--mtp") mtp = true;
         else if (a == "--vision") vision = std::strcmp(next(), "off") != 0;
         else if (a == "--gpus" || a == "--tp" || a == "--reserve-gb" || a == "--cpu-threads") {
@@ -123,10 +126,16 @@ int main(int argc, char** argv) {
     }
     const auto t0 = std::chrono::steady_clock::now();
     std::unique_ptr<hym::Forward> fwd =
-        cpu ? hym::make_ref_forward(w, max_ctx) : hym::make_ggml_forward(w, be, max_ctx, false);
+        cpu ? hym::make_ref_forward(w, max_ctx) : hym::make_ggml_forward(w, be, max_ctx, false, eg_gb);
     if (!fwd) {
         std::fprintf(stderr, "maya-metal-hy4: forward init failed\n");
         return 1;
+    }
+    {
+        const hym::TierInfo ti = fwd->tier_info();
+        std::fprintf(stderr, "maya-metal-hy4: engram row cache %.2f GB (%lld rows of %zu B), experts resident %.1f GB\n",
+                     (double) ti.eg_cache_cap * (double) ti.eg_row_bytes / 1073741824.0,
+                     (long long) ti.eg_cache_cap, ti.eg_row_bytes, ti.resident_gb);
     }
     const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::fprintf(stderr, "maya-metal-hy4: forward ready in %.1f s (%s, context %lld)\n", load_s,

@@ -105,6 +105,7 @@ struct Serve {
     Input in;
     std::vector<int32_t> cached;   // the ids the forward has been fed, in order (pos() == its size)
     PickScratch scratch;
+    EgStats eg_prev{};   // the Engram tier's counters at the last STAT: the rates are per request
 
     void out(const std::string& s) {
         std::fputs(s.c_str(), stdout);
@@ -305,9 +306,25 @@ struct Serve {
         const auto t2 = std::chrono::steady_clock::now();
         const double decode_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
         if (produced > 0 && decode_ms > 0) {
-            char buf[200];
-            std::snprintf(buf, sizeof buf, "STAT tok_s=%.2f ms_tok=%.2f vram_hit=1 ram_fetch=0 disk=0 promo=0\n",
-                          (double) produced * 1000.0 / decode_ms, decode_ms / (double) produced);
+            // the truth this engine owes the Monitor: every expert resident in unified memory
+            // (vram_gb, vram_hit=1, no slot fields - the unified card), and the Engram tier's
+            // real activity: ram_fetch/disk split by page residency, promo the rows promoted
+            const TierInfo ti = fwd.tier_info();
+            const EgStats d{ti.eg.rows - eg_prev.rows, ti.eg.hits - eg_prev.hits,
+                            ti.eg.reads - eg_prev.reads, ti.eg.disk - eg_prev.disk,
+                            ti.eg.promo - eg_prev.promo, ti.eg.ms - eg_prev.ms};
+            eg_prev = ti.eg;
+            const double np = (double) produced;
+            char buf[512];
+            std::snprintf(buf, sizeof buf,
+                          "STAT tok_s=%.2f ms_tok=%.2f vram_gb=%.1f vram_hit=1 ram_fetch=%.2f disk=%.2f promo=%.2f "
+                          "eg_lookup_rows=%llu eg_lookup_hits=%llu eg_lookup_reads=%llu eg_cache_rows=%lld "
+                          "eg_cache_cap=%lld eg_cache_row_bytes=%zu engram_ms=%.2f\n",
+                          (double) produced * 1000.0 / decode_ms, decode_ms / np, ti.resident_gb,
+                          (double) (d.reads - d.disk) / np, (double) d.disk / np, (double) d.promo / np,
+                          (unsigned long long) ti.eg.rows, (unsigned long long) ti.eg.hits,
+                          (unsigned long long) ti.eg.reads, (long long) ti.eg_cache_rows,
+                          (long long) ti.eg_cache_cap, ti.eg_row_bytes, d.ms / np);
             out(buf);
         }
         char buf[256];
@@ -327,9 +344,12 @@ int serve_hy4(Forward& fwd, const hy4::Geo& g, int64_t max_ctx, int chunk) {
     std::thread th([&] { s.in.run(); });
     th.detach();
     char buf[320];
+    const TierInfo ti0 = fwd.tier_info();
     std::snprintf(buf, sizeof buf,
-                  "INFO engine=%s arch=hy_v4_flash context=%lld kv=f16 experts=%d vision=0 spec=none\n",
-                  MAYA_VERSION, (long long) max_ctx, g.n_expert);
+                  "INFO engine=%s arch=hy_v4_flash engine_kind=hy4-metal context=%lld kv=f16 experts=%d vision=0 "
+                  "spec=none engram_lookups=%d engram_cache_gb=%.2f\n",
+                  MAYA_VERSION, (long long) max_ctx, g.n_expert, ti0.engram_lookups,
+                  (double) ti0.eg_cache_cap * (double) ti0.eg_row_bytes / 1073741824.0);
     s.out(buf);
     std::snprintf(buf, sizeof buf, "READY %lld stop\n", (long long) max_ctx);
     s.out(buf);

@@ -116,7 +116,12 @@ inline const uint8_t* map_file(const std::string& path, size_t& bytes) {
 /// Windows: VirtualUnlock on pages that are not locked takes them out of the working set.  Partial edge pages stay
 /// (a neighbour's bytes).  Advisory: a failure changes nothing, a later read just faults the page in again.
 inline void drop_mapped(const void* p, size_t n) {
+#if defined(_WIN32)
     const uintptr_t pg = 4096;
+#else
+    // (the hardware page: 16K on Apple Silicon, where madvise rejects a 4K-aligned address)
+    const uintptr_t pg = (uintptr_t) ::sysconf(_SC_PAGESIZE);
+#endif
     const uintptr_t a = (uintptr_t) p, b = a + n;
     const uintptr_t lo = (a + pg - 1) / pg * pg, hi = b / pg * pg;
     if (hi <= lo) return;

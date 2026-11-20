@@ -113,7 +113,11 @@ export function tierShares(n, eng = {}) {
   const total = (ds4 ? vu + (n.cpu_n != null ? n.cpu_n : +eng.cpu_experts || 0) : eng.experts) || Math.max(1, vu + ru);
   const disk = Math.max(0, total - vu - ru);
   const gbOf = (x) => (typeof x === "number" && Number.isFinite(x) ? x : null);
-  return {vu, ru, total, disk, vramGb: gbOf(n.vram_gb), ramGb: gbOf(n.ram_gb), diskGb: gbOf(n.disk_gb)};
+  // one memory, no tiers: every expert resident in unified memory (the Metal engines) -
+  // nothing is SSD-only, whatever the slot-less arithmetic above would say
+  const unified = !ds4 && vu === 0 && ru === 0 && !(n.vram_slots > 0) && !(n.ram_slots > 0) &&
+                  gbOf(n.vram_gb) != null && n.vram_gb > 0 && (n.vram_hit == null || n.vram_hit >= 0.999);
+  return {vu, ru, total, disk: unified ? 0 : disk, vramGb: gbOf(n.vram_gb), ramGb: gbOf(n.ram_gb), diskGb: gbOf(n.disk_gb)};
 }
 
 // ------------------------------------------------------------------ MCP servers (GET /mcp)

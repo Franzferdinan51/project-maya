@@ -251,10 +251,18 @@ const TIER_SETS = {
     {key: "disk", label: "From the model file", unit: "/tok", digits: 2, tone: "warn",
      sub: "experts read from the model file (page cache or SSD)"},
   ],
+  // the Metal Hy4 port: every expert resident in unified memory; the streaming tier is the
+  // Engram n-gram table, and its counters are the row cache's (the Strata pattern)
+  "hy4-metal": [
+    {key: "engram_ms", label: "N-gram memory", unit: " ms/tok", digits: 2, sub: "the n-gram table's read time"},
+    {key: "disk", label: "N-gram from SSD", unit: "/tok", digits: 2, tone: "warn", sub: "n-gram rows faulted from the SSD"},
+    {key: "promo", label: "Promoted", unit: "/tok", digits: 2, sub: "n-gram rows copied into the RAM cache"},
+  ],
 };
 export const tierSet = (eng) => TIER_SETS[eng && eng.engine_kind === "ds4" ? "ds4" : eng && eng.engine_kind === "mm3" ? "mm3"
                                            : eng && eng.engine_kind === "qwen" ? "qwen"
-                                           : eng && eng.engine_kind === "hy4" ? "hy4" : "glm"];
+                                           : eng && eng.engine_kind === "hy4" ? "hy4"
+                                           : eng && eng.engine_kind === "hy4-metal" ? "hy4-metal" : "glm"];
 // the card's advice, from the live reading n (stale: the last answer's), the SSD-only share (disk: experts with no home
 // in VRAM or RAM) and the helper pool.  The "more RAM" advice only where experts really live on the SSD alone: a model
 // read from its file (Qwen) can count file reads while every expert has a home in VRAM or RAM
