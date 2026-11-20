@@ -3351,7 +3351,11 @@ class Service:
         except (OSError, ValueError):
             return
         p = Path(str(note.get("config") or ""))
-        if time.time() - float(note.get("time") or 0) > 900 or not p.is_file() or p.parent != self.models_root():
+        # (both sides resolved: the note stores a resolved path, and the models folder may sit behind a symlink -
+        # macOS's /var -> /private/var temp dirs are one - an unresolved comparison drops the note, and the model
+        # the page deleted after a switch would never go)
+        if (time.time() - float(note.get("time") or 0) > 900 or not p.is_file()
+                or p.resolve().parent != self.models_root().resolve()):
             return                                       # (stale, gone already, or not one of these configs)
         if self._is_running(p):                          # (the switch did not happen: it runs again)
             self.deleted = {"file": p.name, "error": "it is the model running now", "time": time.time()}
