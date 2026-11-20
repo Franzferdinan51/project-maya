@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <dispatch/dispatch.h>
 #include <limits>
 
 namespace hym {
@@ -279,7 +280,9 @@ private:
     // HY4_PROFILE=1: where a window's milliseconds go, dumped to stderr every 100 windows.
     // Off by default; the only cost when off is one bool test per measured span.
     struct Prof {
-        bool on = ::getenv("HY4_PROFILE") != nullptr;
+        const char* env = ::getenv("HY4_PROFILE");
+        bool on = env != nullptr;
+        std::string path = (env && env[0] && env[0] != '1') ? env : "";
         std::map<std::string, std::pair<double, int64_t>> acc;
         std::chrono::steady_clock::time_point t0;
         int64_t windows = 0, nodes = 0;
@@ -293,10 +296,13 @@ private:
         }
         void dump() {
             if (!on) return;
-            std::fprintf(stderr, "[hy4-profile] windows=%lld nodes=%lld", (long long) windows, (long long) nodes);
+            std::FILE* f = path.empty() ? stderr : std::fopen(path.c_str(), "a");
+            if (!f) f = stderr;
+            std::fprintf(f, "[hy4-profile] windows=%lld nodes=%lld", (long long) windows, (long long) nodes);
             for (const auto& [k, v] : acc)
-                std::fprintf(stderr, " %s=%.1f/%lld", k.c_str(), v.first, (long long) v.second);
-            std::fprintf(stderr, "\n");
+                std::fprintf(f, " %s=%.1f/%lld", k.c_str(), v.first, (long long) v.second);
+            std::fprintf(f, "\n");
+            if (f != stderr) std::fclose(f);
             acc.clear();
             windows = 0;
             nodes = 0;
@@ -679,29 +685,44 @@ bool Ggml::attention(Win& win, int il, int64_t p0, std::string& err) {
             build_end();
             if (!ok) return false;
         }
-        // the picks, from the graph's own scores (this forward's own selection code)
+        // the picks, from the graph's own scores (this forward's own selection code).
+        // Only the live prefix of the pool is read back - the whole 256K pool was a
+        // 33 MB GPU->CPU copy a layer a token; and the groups score in parallel, the
+        // same double arithmetic per group (the picks must not move).
         prof_.begin();
         const int IH = g.ix_heads;
         std::vector<float> iqv((size_t) T * IH * D), wtv((size_t) T * IH);
         readback(win.get("iq"), iqv.data());
         readback(win.get("wt"), wtv.data());
-        const int64_t npool = max_ctx_ / KP + 1;
-        std::vector<float> poolv((size_t) npool * D);
-        readback(pooled_[(size_t) il], poolv.data());
+        const int64_t nv_max = (p0 + T - 1) / KP;
+        std::vector<float> poolv((size_t) nv_max * D);
+        if (nv_max > 0) {
+            prof_.begin();
+            ggml_backend_tensor_get(pooled_[(size_t) il], poolv.data(), 0, (size_t) nv_max * D * 4);
+            prof_.end("readback");
+        }
         keys_.assign((size_t) T, {});
         const int top = g.ix_top_k / KP - 1;
         for (int t = 0; t < T; ++t) {
             const int64_t pos = p0 + t, nv = pos / KP;
-            std::vector<std::pair<float, int64_t>> scored;
-            for (int64_t gr = 0; gr < nv; ++gr) {
+            const float* iq_t = &iqv[(size_t) t * IH * D];
+            const float* wt_t = &wtv[(size_t) t * IH];
+            std::vector<std::pair<float, int64_t>> scored((size_t) nv);
+            auto score_gr = [&](int64_t gr) {
                 double s = 0;
                 for (int h = 0; h < IH; ++h) {
                     double d = 0;
                     for (int i = 0; i < D; ++i)
-                        d += (double) iqv[((size_t) t * IH + h) * D + i] * poolv[(size_t) gr * D + i];
-                    s += std::max(d, 0.0) * wtv[(size_t) t * IH + h];
+                        d += (double) iq_t[(size_t) h * D + i] * poolv[(size_t) gr * D + i];
+                    s += std::max(d, 0.0) * wt_t[h];
                 }
-                scored.push_back({(float) s, gr});
+                scored[(size_t) gr] = {(float) s, gr};
+            };
+            if (nv >= 64) {
+                dispatch_apply((size_t) nv, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+                               ^(size_t gr) { score_gr((int64_t) gr); });
+            } else {
+                for (int64_t gr = 0; gr < nv; ++gr) score_gr(gr);
             }
             std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) {
                 return a.first != b.first ? a.first > b.first : a.second < b.second;
@@ -722,7 +743,13 @@ bool Ggml::attention(Win& win, int il, int64_t p0, std::string& err) {
             trace_->put("ix_keys-" + ils, kk);
         }
     }
-    // ---- G2: qcat, the scores, the latent outputs
+    // ---- G2+G3 in one graph: qcat, the scores over JUST the visible rows, the latent
+    // outputs, the gate, the output projection. The old shape converted the whole F16
+    // prefix to F32 and uploaded a P x H mask every token - work that grows with the
+    // context (25 GB a token at 256K). A SWA layer's visible set is one contiguous window
+    // (a view, no mask); an indexer layer's is its picks (a gather, deduplicated exactly
+    // as the mask's set was). The sink row still appends; the softmax sees the same
+    // values, minus the exp(-1e30) zeros that contributed nothing.
     {
         c = build_begin();
         const int64_t P = p0 + T;
@@ -735,66 +762,61 @@ bool Ggml::attention(Win& win, int il, int64_t p0, std::string& err) {
         roots.push_back(ggml_cpy(c, per, ggml_view_3d(c, qcat, R, H, T, qcat->nb[1], qcat->nb[2], (size_t) KL * 4)));
         ggml_tensor* K16 = ggml_view_2d(c, kv_[(size_t) il], KR, P, kv_[(size_t) il]->nb[1], 0);
         ggml_tensor* V16 = ggml_view_2d(c, kv_[(size_t) il], KL, P, kv_[(size_t) il]->nb[1], 0);
-        ggml_tensor* K = ggml_cpy(c, K16, ggml_new_tensor_2d(c, GGML_TYPE_F32, KR, P));
-        ggml_tensor* Vf = ggml_cpy(c, V16, ggml_new_tensor_2d(c, GGML_TYPE_F32, KL, P));
         ggml_tensor* zeros = konst(win, "zeros" + std::to_string(KL), std::vector<float>((size_t) KL, 0.0f).data(), KL);
-        ggml_tensor* Vz = ggml_concat(c, Vf, ggml_reshape_2d(c, zeros, KL, 1), 1);
         ggml_tensor* sinkrow = konst(win, "sinks" + ils, sinks, H);
-        for (int h = 0; h < H; ++h) {
-            ggml_tensor* kb_h = ggml_view_2d(c, W(p + "attn_k_b.weight"), NOPE, KL,
-                                             W(p + "attn_k_b.weight")->nb[1],
-                                             (size_t) h * W(p + "attn_k_b.weight")->nb[2]);
-            ggml_tensor* qn_h = ggml_view_2d(c, q, NOPE, T, q->nb[2], (size_t) h * q->nb[1]);
-            ggml_tensor* dst = ggml_view_2d(c, qcat, KL, T, qcat->nb[2], (size_t) h * qcat->nb[1]);
-            roots.push_back(ggml_cpy(c, ggml_mul_mat(c, kb_h, qn_h), dst));
+        {
+            // the q absorption for all heads in one batched matmul: H tiny GEMV dispatches
+            // a layer a token became one (the same kernel per head, batched)
+            ggml_tensor* kb = W(p + "attn_k_b.weight");   // [NOPE, KL, H]
+            ggml_tensor* qn = ggml_permute(c, ggml_view_3d(c, q, NOPE, H, T, q->nb[1], q->nb[2], 0), 0, 2, 1, 3);
+            ggml_tensor* qabs = ggml_mul_mat(c, kb, ggml_cont(c, qn));   // [KL, T, H]
+            ggml_tensor* dst = ggml_view_3d(c, qcat, KL, H, T, qcat->nb[1], qcat->nb[2], 0);
+            roots.push_back(ggml_cpy(c, ggml_permute(c, qabs, 0, 2, 1, 3), dst));
         }
         ggml_tensor* obpre = win.get("obpre");
         for (int t = 0; t < T; ++t) {
             const int64_t pos = p0 + t;
-            std::vector<int> ks;
+            ggml_tensor *K, *Vf;
+            int64_t n;
             if (ix) {
-                ks = keys_[(size_t) t];
+                std::vector<int> ks = keys_[(size_t) t];
+                std::sort(ks.begin(), ks.end());
+                ks.erase(std::unique(ks.begin(), ks.end()), ks.end());
+                n = (int64_t) ks.size();
+                ggml_tensor* kid = ggml_new_tensor_1d(c, GGML_TYPE_I32, n);
+                pending_iconsts_.push_back({kid, std::vector<int32_t>(ks.begin(), ks.end())});
+                K = ggml_cpy(c, ggml_get_rows(c, K16, kid), ggml_new_tensor_2d(c, GGML_TYPE_F32, KR, n));
+                Vf = ggml_cpy(c, ggml_get_rows(c, V16, kid), ggml_new_tensor_2d(c, GGML_TYPE_F32, KL, n));
             } else {
                 const int64_t lo = std::max<int64_t>(0, pos - g.n_swa + 1);
-                for (int64_t pp = lo; pp <= pos; ++pp) ks.push_back((int) pp);
+                n = pos - lo + 1;
+                ggml_tensor* Kw16 = ggml_view_2d(c, kv_[(size_t) il], KR, n, kv_[(size_t) il]->nb[1],
+                                                 (size_t) lo * kv_[(size_t) il]->nb[1]);
+                ggml_tensor* Vw16 = ggml_view_2d(c, kv_[(size_t) il], KL, n, kv_[(size_t) il]->nb[1],
+                                                 (size_t) lo * kv_[(size_t) il]->nb[1]);
+                K = ggml_cpy(c, Kw16, ggml_new_tensor_2d(c, GGML_TYPE_F32, KR, n));
+                Vf = ggml_cpy(c, Vw16, ggml_new_tensor_2d(c, GGML_TYPE_F32, KL, n));
             }
-            std::vector<char> in((size_t) P, 0);
-            for (int pp : ks) in[(size_t) pp] = 1;
-            std::vector<float> mask((size_t) P * H, kMaskOff);
-            for (int64_t pp = 0; pp < P; ++pp)
-                if (in[(size_t) pp])
-                    for (int h = 0; h < H; ++h) mask[(size_t) h * P + pp] = 0.0f;
-            ggml_tensor* mt = konst(win, "mask" + ils + "_" + std::to_string(t), mask.data(), (int64_t) mask.size());
+            ggml_tensor* Vz = ggml_concat(c, Vf, ggml_reshape_2d(c, zeros, KL, 1), 1);
             ggml_tensor* qt = ggml_view_3d(c, qcat, KR, H, 1, qcat->nb[1], qcat->nb[2],
                                            (size_t) t * qcat->nb[2]);
             ggml_tensor* sc = ggml_scale(c, ggml_mul_mat(c, K, qt), ascale);
-            ggml_tensor* S = ggml_add(c, sc, ggml_reshape_3d(c, mt, P, H, 1));
-            ggml_tensor* S2 = ggml_concat(c, S, ggml_reshape_3d(c, sinkrow, 1, H, 1), 0);
+            ggml_tensor* S2 = ggml_concat(c, sc, ggml_reshape_3d(c, sinkrow, 1, H, 1), 0);
             ggml_tensor* probs = ggml_soft_max(c, S2);
             ggml_tensor* o = ggml_mul_mat(c, ggml_cont(c, ggml_transpose(c, Vz)), probs);
             roots.push_back(ggml_cpy(
                 c, o, ggml_view_3d(c, obpre, KL, H, 1, obpre->nb[1], obpre->nb[2], (size_t) t * obpre->nb[2])));
         }
-        ggml_cgraph* gr = ggml_new_graph_custom(c, 65536, false);
-        for (ggml_tensor* r : roots) ggml_build_forward_expand(gr, r);
-        if (!run_graph(win, gr, err)) {
-            err = "hy4-metal: attention G2 failed";
-            return false;
-        }
-        build_end();
-    }
-    // ---- G3: v_b per head, the gate, the output projection
-    {
-        c = build_begin();
-        std::vector<ggml_tensor*> roots;
-        ggml_tensor* ob = win.get("ob"), *obpre = win.get("obpre");
-        for (int h = 0; h < H; ++h) {
-            ggml_tensor* vb_h = ggml_view_2d(c, W(p + "attn_v_b.weight"), KL, VM,
-                                             W(p + "attn_v_b.weight")->nb[1],
-                                             (size_t) h * W(p + "attn_v_b.weight")->nb[2]);
-            ggml_tensor* o_h = ggml_view_2d(c, obpre, KL, T, obpre->nb[2], (size_t) h * obpre->nb[1]);
-            ggml_tensor* dst = ggml_view_2d(c, ob, VM, T, ob->nb[2], (size_t) h * ob->nb[1]);
-            roots.push_back(ggml_cpy(c, ggml_mul_mat(c, vb_h, o_h), dst));
+        // G3: v_b per head, the gate, the output projection
+        ggml_tensor* ob = win.get("ob");
+        {
+            // v_b for all heads in one batched matmul (the same kernel per head, batched)
+            ggml_tensor* vb = W(p + "attn_v_b.weight");   // [KL, VM, H]
+            ggml_tensor* obp = ggml_view_3d(c, obpre, KL, H, T, obpre->nb[1], obpre->nb[2], 0);
+            ggml_tensor* oh = ggml_permute(c, obp, 0, 2, 1, 3);   // [KL, T, H]
+            ggml_tensor* vo = ggml_mul_mat(c, vb, ggml_cont(c, oh));   // [VM, T, H]
+            ggml_tensor* odst = ggml_view_3d(c, ob, VM, H, T, ob->nb[1], ob->nb[2], 0);
+            roots.push_back(ggml_cpy(c, ggml_permute(c, vo, 0, 2, 1, 3), odst));
         }
         ggml_tensor* gated = ggml_mul(c, ggml_cont(c, ggml_view_3d(c, ob, VM, H, T, ob->nb[1], ob->nb[2], 0)),
                                       ggml_sigmoid(c, ggml_view_3d(c, ggt, VM, H, T, ggt->nb[1], ggt->nb[2], 0)));
@@ -805,7 +827,7 @@ bool Ggml::attention(Win& win, int il, int64_t p0, std::string& err) {
         ggml_cgraph* gr = ggml_new_graph_custom(c, 65536, false);
         for (ggml_tensor* r : roots) ggml_build_forward_expand(gr, r);
         if (!run_graph(win, gr, err)) {
-            err = "hy4-metal: attention G3 failed";
+            err = "hy4-metal: attention G2/G3 failed";
             return false;
         }
         build_end();
@@ -815,7 +837,6 @@ bool Ggml::attention(Win& win, int il, int64_t p0, std::string& err) {
     trace_put("hc_attn_out-" + ils, x);
     return true;
 }
-
 bool Ggml::ffn(Win& win, int il, std::string& err) {
     if (verbose_) std::fprintf(stderr, "[hy4-metal] ffn %d\n", il);
     const hy4::Geo& g = g_;
