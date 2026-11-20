@@ -365,10 +365,11 @@ private:
         return r;
     }
 
-    // hc_pre: cur_out [E, T] (folded norm when norm_w), post_out [hc, T]; one graph.
-    bool hc_pre(Win& win, ggml_tensor* x, const std::string& pfx, ggml_tensor* norm_w, ggml_tensor* cur_out,
-                ggml_tensor* post_out, std::string& err) {
-        ggml_context* c = build_begin();
+    // hc_pre: cur_out [E, T] (folded norm when norm_w), post_out [hc, T]. The roots form
+    // appends to a caller's graph (the attention span fuses it with what follows); the
+    // wrapper runs it alone (the ffn side).
+    void hc_pre_roots(ggml_context* c, std::vector<ggml_tensor*>& roots, Win& win, ggml_tensor* x,
+                      const std::string& pfx, ggml_tensor* norm_w, ggml_tensor* cur_out, ggml_tensor* post_out) {
         const int64_t E = g_.n_embd, hc = g_.hc, T = x->ne[2];
         ggml_tensor* fn = W(pfx + "_fn.weight");
         ggml_tensor* base = W(pfx + "_base.weight");
@@ -393,20 +394,33 @@ private:
         ggml_tensor* xp = ggml_mul(c, x, pre);                          // [E, hc, T]
         ggml_tensor* cur = ggml_reshape_2d(c, ggml_sum_rows(c, ggml_cont(c, ggml_permute(c, xp, 1, 0, 2, 3))), E, T);
         if (norm_w) cur = rms_w(c, cur, norm_w, (float) g_.eps);
-        const bool ok = compute(
-            win, {ggml_cpy(c, cur, cur_out), ggml_cpy(c, mixout(hc, s1, (float) g_.hc_mag), post_out)}, err);
+        roots.push_back(ggml_cpy(c, cur, cur_out));
+        roots.push_back(ggml_cpy(c, mixout(hc, s1, (float) g_.hc_mag), post_out));
+    }
+    bool hc_pre(Win& win, ggml_tensor* x, const std::string& pfx, ggml_tensor* norm_w, ggml_tensor* cur_out,
+                ggml_tensor* post_out, std::string& err) {
+        ggml_context* c = build_begin();
+        std::vector<ggml_tensor*> roots;
+        hc_pre_roots(c, roots, win, x, pfx, norm_w, cur_out, post_out);
+        const bool ok = compute(win, roots, err);
         build_end();
         return ok;
     }
 
-    bool hc_post_norm(Win& win, ggml_tensor* x, ggml_tensor* y, ggml_tensor* post, ggml_tensor* norm_w,
-                      std::string& err) {
-        ggml_context* c = build_begin();
+    void hc_post_roots(ggml_context* c, std::vector<ggml_tensor*>& roots, ggml_tensor* x, ggml_tensor* y,
+                       ggml_tensor* post, ggml_tensor* norm_w) {
         ggml_tensor* yn = rms_w(c, y, norm_w, (float) g_.eps);
         const int64_t E = yn->ne[0], hc = post->ne[0], T = yn->ne[1];
         ggml_tensor* d = ggml_mul(c, expand_to(c, ggml_reshape_3d(c, yn, E, 1, T), E, hc, T),
                                   expand_to(c, ggml_reshape_3d(c, post, 1, hc, T), E, hc, T));
-        const bool ok = compute(win, {ggml_cpy(c, ggml_add(c, x, d), x)}, err);
+        roots.push_back(ggml_cpy(c, ggml_add(c, x, d), x));
+    }
+    bool hc_post_norm(Win& win, ggml_tensor* x, ggml_tensor* y, ggml_tensor* post, ggml_tensor* norm_w,
+                      std::string& err) {
+        ggml_context* c = build_begin();
+        std::vector<ggml_tensor*> roots;
+        hc_post_roots(c, roots, x, y, post, norm_w);
+        const bool ok = compute(win, roots, err);
         build_end();
         return ok;
     }
@@ -620,21 +634,96 @@ bool Ggml::attention(Win& win, int il, int64_t p0, std::string& err) {
               VM = g.v_mla;
     const bool ix = is_ix(il);
     const float base = is_swa(il) ? (float) g.rope_base_swa : (float) g.rope_base;
-    ggml_context* c = win.ctx;
     ggml_tensor* x = win.get("x"), *xa = win.get("xa"), *post = win.get("post"), *y = win.get("y");
     ggml_tensor* pos_t = win.get("pos");
-    if (!hc_pre(win, x, p + "hc_attn", W(p + "attn_norm.weight"), xa, post, err)) return false;
-    trace_put("attn_norm-" + ils, xa);
     ggml_tensor* qr = win.get("qr"), *q = win.get("q"), *kvr = win.get("kvr"), *ggt = win.get("gg");
-    // ---- G1: projections, the q resid, the cache store, the indexer's prep
+    // G2+G3: qcat, the scores over JUST the visible rows, the latent outputs, the gate,
+    // the output projection. A SWA layer's visible set is one contiguous window (a view,
+    // no mask); an indexer layer's is its picks (a gather, deduplicated exactly as the
+    // mask's set was). The sink row still appends. Appends to the caller's graph.
+    auto g2g3 = [&](ggml_context* c, std::vector<ggml_tensor*>& roots) {
+        const int64_t P = p0 + T;
+        const float* sinks = wconst(W(p + "attn_sinks.weight"), (size_t) H);
+        const float ascale = (float) (1.0 / std::sqrt((double) KMLA));
+        ggml_tensor* qcat = win.get("qcat");
+        ggml_tensor* pe = ggml_view_3d(c, q, R, H, T, q->nb[1], q->nb[2], (size_t) NOPE * 4);
+        ggml_tensor* per = rope_ext(c, pe, pos_t, R, base);
+        roots.push_back(ggml_cpy(c, per, ggml_view_3d(c, qcat, R, H, T, qcat->nb[1], qcat->nb[2], (size_t) KL * 4)));
+        ggml_tensor* K16 = ggml_view_2d(c, kv_[(size_t) il], KR, P, kv_[(size_t) il]->nb[1], 0);
+        ggml_tensor* V16 = ggml_view_2d(c, kv_[(size_t) il], KL, P, kv_[(size_t) il]->nb[1], 0);
+        ggml_tensor* zeros = konst(win, "zeros" + std::to_string(KL), std::vector<float>((size_t) KL, 0.0f).data(), KL);
+        ggml_tensor* sinkrow = konst(win, "sinks" + ils, sinks, H);
+        {
+            // the q absorption for all heads in one batched matmul
+            ggml_tensor* kb = W(p + "attn_k_b.weight");   // [NOPE, KL, H]
+            ggml_tensor* qn = ggml_permute(c, ggml_view_3d(c, q, NOPE, H, T, q->nb[1], q->nb[2], 0), 0, 2, 1, 3);
+            ggml_tensor* qabs = ggml_mul_mat(c, kb, ggml_cont(c, qn));   // [KL, T, H]
+            ggml_tensor* dst = ggml_view_3d(c, qcat, KL, H, T, qcat->nb[1], qcat->nb[2], 0);
+            roots.push_back(ggml_cpy(c, ggml_permute(c, qabs, 0, 2, 1, 3), dst));
+        }
+        ggml_tensor* obpre = win.get("obpre");
+        for (int t = 0; t < T; ++t) {
+            const int64_t pos = p0 + t;
+            ggml_tensor *K, *Vf;
+            int64_t n;
+            if (ix) {
+                std::vector<int> ks = keys_[(size_t) t];
+                std::sort(ks.begin(), ks.end());
+                ks.erase(std::unique(ks.begin(), ks.end()), ks.end());
+                n = (int64_t) ks.size();
+                ggml_tensor* kid = ggml_new_tensor_1d(c, GGML_TYPE_I32, n);
+                pending_iconsts_.push_back({kid, std::vector<int32_t>(ks.begin(), ks.end())});
+                K = ggml_cpy(c, ggml_get_rows(c, K16, kid), ggml_new_tensor_2d(c, GGML_TYPE_F32, KR, n));
+                Vf = ggml_cpy(c, ggml_get_rows(c, V16, kid), ggml_new_tensor_2d(c, GGML_TYPE_F32, KL, n));
+            } else {
+                const int64_t lo = std::max<int64_t>(0, pos - g.n_swa + 1);
+                n = pos - lo + 1;
+                ggml_tensor* Kw16 = ggml_view_2d(c, kv_[(size_t) il], KR, n, kv_[(size_t) il]->nb[1],
+                                                 (size_t) lo * kv_[(size_t) il]->nb[1]);
+                ggml_tensor* Vw16 = ggml_view_2d(c, kv_[(size_t) il], KL, n, kv_[(size_t) il]->nb[1],
+                                                 (size_t) lo * kv_[(size_t) il]->nb[1]);
+                K = ggml_cpy(c, Kw16, ggml_new_tensor_2d(c, GGML_TYPE_F32, KR, n));
+                Vf = ggml_cpy(c, Vw16, ggml_new_tensor_2d(c, GGML_TYPE_F32, KL, n));
+            }
+            ggml_tensor* Vz = ggml_concat(c, Vf, ggml_reshape_2d(c, zeros, KL, 1), 1);
+            ggml_tensor* qt = ggml_view_3d(c, qcat, KR, H, 1, qcat->nb[1], qcat->nb[2],
+                                           (size_t) t * qcat->nb[2]);
+            ggml_tensor* sc = ggml_scale(c, ggml_mul_mat(c, K, qt), ascale);
+            ggml_tensor* S2 = ggml_concat(c, sc, ggml_reshape_3d(c, sinkrow, 1, H, 1), 0);
+            ggml_tensor* probs = ggml_soft_max(c, S2);
+            ggml_tensor* o = ggml_mul_mat(c, ggml_cont(c, ggml_transpose(c, Vz)), probs);
+            roots.push_back(ggml_cpy(
+                c, o, ggml_view_3d(c, obpre, KL, H, 1, obpre->nb[1], obpre->nb[2], (size_t) t * obpre->nb[2])));
+        }
+        ggml_tensor* ob = win.get("ob");
+        {
+            // v_b for all heads in one batched matmul
+            ggml_tensor* vb = W(p + "attn_v_b.weight");   // [KL, VM, H]
+            ggml_tensor* obp = ggml_view_3d(c, obpre, KL, H, T, obpre->nb[1], obpre->nb[2], 0);
+            ggml_tensor* oh = ggml_permute(c, obp, 0, 2, 1, 3);   // [KL, T, H]
+            ggml_tensor* vo = ggml_mul_mat(c, vb, ggml_cont(c, oh));   // [VM, T, H]
+            ggml_tensor* odst = ggml_view_3d(c, ob, VM, H, T, ob->nb[1], ob->nb[2], 0);
+            roots.push_back(ggml_cpy(c, ggml_permute(c, vo, 0, 2, 1, 3), odst));
+        }
+        ggml_tensor* gated = ggml_mul(c, ggml_cont(c, ggml_view_3d(c, ob, VM, H, T, ob->nb[1], ob->nb[2], 0)),
+                                      ggml_sigmoid(c, ggml_view_3d(c, ggt, VM, H, T, ggt->nb[1], ggt->nb[2], 0)));
+        ggml_tensor* gatedc = ggml_cpy(c, gated, ggml_new_tensor_3d(c, GGML_TYPE_F32, VM, H, T));
+        ggml_tensor* yv = ggml_mul_mat(c, W(p + "attn_output.weight"),
+                                       ggml_reshape_2d(c, gatedc, (int64_t) H * VM, T));
+        roots.push_back(ggml_cpy(c, yv, y));
+    };
+    // ---- span 1: the hc fold, the projections, the cache store, the indexer's prep -
+    // and for a SWA layer the whole attention besides (nothing needs the host until the
+    // router): one graph commit instead of four a layer a token.
     {
-        c = build_begin();
+        ggml_context* c = build_begin();
+        std::vector<ggml_tensor*> roots;
+        hc_pre_roots(c, roots, win, x, p + "hc_attn", W(p + "attn_norm.weight"), xa, post);
         ggml_tensor* qa = ggml_mul_mat(c, W(p + "attn_q_a.weight"), xa);
         ggml_tensor* qrn = rms_w(c, qa, W(p + "attn_q_a_norm.weight"), (float) g.eps);
         ggml_tensor* qfull = ggml_mul_mat(c, W(p + "attn_q_b.weight"), qrn);
         ggml_tensor* kvfull = ggml_mul_mat(c, W(p + "attn_kv_a_mqa.weight"), xa);
         ggml_tensor* gfull = ggml_mul_mat(c, W(p + "attn_gate.weight"), xa);
-        std::vector<ggml_tensor*> roots;
         roots.push_back(ggml_cpy(c, qrn, qr));
         roots.push_back(ggml_cpy(c, ggml_reshape_3d(c, qfull, KMLA, H, T),
                                  ggml_view_3d(c, q, KMLA, H, T, q->nb[1], q->nb[2], 0)));
@@ -671,21 +760,26 @@ bool Ggml::attention(Win& win, int il, int64_t p0, std::string& err) {
                                          (float) (1.0 / std::sqrt((double) g.ix_dim * g.ix_heads)));
             roots.push_back(ggml_cpy(c, wt, win.get("wt")));
         }
+        if (!ix) {
+            g2g3(c, roots);
+            hc_post_roots(c, roots, x, y, post, W(p + "post_attention_norm.weight"));
+        }
         ggml_cgraph* gr = ggml_new_graph_custom(c, 65536, false);
         for (ggml_tensor* r : roots) ggml_build_forward_expand(gr, r);
         if (!run_graph(win, gr, err)) {
-            err = "hy4-metal: attention G1 failed";
+            err = "hy4-metal: attention span 1 failed";
             return false;
         }
         build_end();
     }
+    trace_put("attn_norm-" + ils, xa);
     trace_put("q_resid-" + ils, qr);
-    // ---- the indexer's pools, then the host-side picks
+    // ---- the indexer's pools, then the host-side picks, then the attention span
     if (ix) {
         const int D = g.ix_dim, KP = g.ix_kpool;
         const int64_t g0 = p0 / KP, g1 = (p0 + T) / KP;
         for (int64_t gr = g0; gr < g1; ++gr) {
-            c = build_begin();
+            ggml_context* c = build_begin();
             ggml_tensor* src = ggml_view_2d(c, ivg_[(size_t) il], 2 * D, KP, ivg_[(size_t) il]->nb[1],
                                             (size_t) (gr * KP) * ivg_[(size_t) il]->nb[1]);
             ggml_tensor* valf = ggml_cpy(c, ggml_view_2d(c, src, D, KP, src->nb[1], 0),
@@ -712,10 +806,8 @@ bool Ggml::attention(Win& win, int il, int64_t p0, std::string& err) {
             build_end();
             if (!ok) return false;
         }
-        // the picks, from the graph's own scores (this forward's own selection code).
-        // Only the live prefix of the pool is read back - the whole 256K pool was a
-        // 33 MB GPU->CPU copy a layer a token; and the groups score in parallel, the
-        // same double arithmetic per group (the picks must not move).
+        // the picks: only the live prefix of the pool is read back, and the groups score
+        // in parallel - the same double arithmetic per group (the picks must not move).
         prof_.begin("ix_host");
         const int IH = g.ix_heads;
         std::vector<float> iqv((size_t) T * IH * D), wtv((size_t) T * IH);
@@ -769,98 +861,19 @@ bool Ggml::attention(Win& win, int il, int64_t p0, std::string& err) {
                     kk[(size_t) t * (g.ix_top_k + KP) + i] = (float) keys_[(size_t) t][i];
             trace_->put("ix_keys-" + ils, kk);
         }
-    }
-    // ---- G2+G3 in one graph: qcat, the scores over JUST the visible rows, the latent
-    // outputs, the gate, the output projection. The old shape converted the whole F16
-    // prefix to F32 and uploaded a P x H mask every token - work that grows with the
-    // context (25 GB a token at 256K). A SWA layer's visible set is one contiguous window
-    // (a view, no mask); an indexer layer's is its picks (a gather, deduplicated exactly
-    // as the mask's set was). The sink row still appends; the softmax sees the same
-    // values, minus the exp(-1e30) zeros that contributed nothing.
-    {
-        c = build_begin();
-        const int64_t P = p0 + T;
-        const float* sinks = wconst(W(p + "attn_sinks.weight"), (size_t) H);
-        const float ascale = (float) (1.0 / std::sqrt((double) KMLA));
+        ggml_context* c = build_begin();
         std::vector<ggml_tensor*> roots;
-        ggml_tensor* qcat = win.get("qcat");
-        ggml_tensor* pe = ggml_view_3d(c, q, R, H, T, q->nb[1], q->nb[2], (size_t) NOPE * 4);
-        ggml_tensor* per = rope_ext(c, pe, pos_t, R, base);
-        roots.push_back(ggml_cpy(c, per, ggml_view_3d(c, qcat, R, H, T, qcat->nb[1], qcat->nb[2], (size_t) KL * 4)));
-        ggml_tensor* K16 = ggml_view_2d(c, kv_[(size_t) il], KR, P, kv_[(size_t) il]->nb[1], 0);
-        ggml_tensor* V16 = ggml_view_2d(c, kv_[(size_t) il], KL, P, kv_[(size_t) il]->nb[1], 0);
-        ggml_tensor* zeros = konst(win, "zeros" + std::to_string(KL), std::vector<float>((size_t) KL, 0.0f).data(), KL);
-        ggml_tensor* sinkrow = konst(win, "sinks" + ils, sinks, H);
-        {
-            // the q absorption for all heads in one batched matmul: H tiny GEMV dispatches
-            // a layer a token became one (the same kernel per head, batched)
-            ggml_tensor* kb = W(p + "attn_k_b.weight");   // [NOPE, KL, H]
-            ggml_tensor* qn = ggml_permute(c, ggml_view_3d(c, q, NOPE, H, T, q->nb[1], q->nb[2], 0), 0, 2, 1, 3);
-            ggml_tensor* qabs = ggml_mul_mat(c, kb, ggml_cont(c, qn));   // [KL, T, H]
-            ggml_tensor* dst = ggml_view_3d(c, qcat, KL, H, T, qcat->nb[1], qcat->nb[2], 0);
-            roots.push_back(ggml_cpy(c, ggml_permute(c, qabs, 0, 2, 1, 3), dst));
-        }
-        ggml_tensor* obpre = win.get("obpre");
-        for (int t = 0; t < T; ++t) {
-            const int64_t pos = p0 + t;
-            ggml_tensor *K, *Vf;
-            int64_t n;
-            if (ix) {
-                std::vector<int> ks = keys_[(size_t) t];
-                std::sort(ks.begin(), ks.end());
-                ks.erase(std::unique(ks.begin(), ks.end()), ks.end());
-                n = (int64_t) ks.size();
-                ggml_tensor* kid = ggml_new_tensor_1d(c, GGML_TYPE_I32, n);
-                pending_iconsts_.push_back({kid, std::vector<int32_t>(ks.begin(), ks.end())});
-                K = ggml_cpy(c, ggml_get_rows(c, K16, kid), ggml_new_tensor_2d(c, GGML_TYPE_F32, KR, n));
-                Vf = ggml_cpy(c, ggml_get_rows(c, V16, kid), ggml_new_tensor_2d(c, GGML_TYPE_F32, KL, n));
-            } else {
-                const int64_t lo = std::max<int64_t>(0, pos - g.n_swa + 1);
-                n = pos - lo + 1;
-                ggml_tensor* Kw16 = ggml_view_2d(c, kv_[(size_t) il], KR, n, kv_[(size_t) il]->nb[1],
-                                                 (size_t) lo * kv_[(size_t) il]->nb[1]);
-                ggml_tensor* Vw16 = ggml_view_2d(c, kv_[(size_t) il], KL, n, kv_[(size_t) il]->nb[1],
-                                                 (size_t) lo * kv_[(size_t) il]->nb[1]);
-                K = ggml_cpy(c, Kw16, ggml_new_tensor_2d(c, GGML_TYPE_F32, KR, n));
-                Vf = ggml_cpy(c, Vw16, ggml_new_tensor_2d(c, GGML_TYPE_F32, KL, n));
-            }
-            ggml_tensor* Vz = ggml_concat(c, Vf, ggml_reshape_2d(c, zeros, KL, 1), 1);
-            ggml_tensor* qt = ggml_view_3d(c, qcat, KR, H, 1, qcat->nb[1], qcat->nb[2],
-                                           (size_t) t * qcat->nb[2]);
-            ggml_tensor* sc = ggml_scale(c, ggml_mul_mat(c, K, qt), ascale);
-            ggml_tensor* S2 = ggml_concat(c, sc, ggml_reshape_3d(c, sinkrow, 1, H, 1), 0);
-            ggml_tensor* probs = ggml_soft_max(c, S2);
-            ggml_tensor* o = ggml_mul_mat(c, ggml_cont(c, ggml_transpose(c, Vz)), probs);
-            roots.push_back(ggml_cpy(
-                c, o, ggml_view_3d(c, obpre, KL, H, 1, obpre->nb[1], obpre->nb[2], (size_t) t * obpre->nb[2])));
-        }
-        // G3: v_b per head, the gate, the output projection
-        ggml_tensor* ob = win.get("ob");
-        {
-            // v_b for all heads in one batched matmul (the same kernel per head, batched)
-            ggml_tensor* vb = W(p + "attn_v_b.weight");   // [KL, VM, H]
-            ggml_tensor* obp = ggml_view_3d(c, obpre, KL, H, T, obpre->nb[1], obpre->nb[2], 0);
-            ggml_tensor* oh = ggml_permute(c, obp, 0, 2, 1, 3);   // [KL, T, H]
-            ggml_tensor* vo = ggml_mul_mat(c, vb, ggml_cont(c, oh));   // [VM, T, H]
-            ggml_tensor* odst = ggml_view_3d(c, ob, VM, H, T, ob->nb[1], ob->nb[2], 0);
-            roots.push_back(ggml_cpy(c, ggml_permute(c, vo, 0, 2, 1, 3), odst));
-        }
-        ggml_tensor* gated = ggml_mul(c, ggml_cont(c, ggml_view_3d(c, ob, VM, H, T, ob->nb[1], ob->nb[2], 0)),
-                                      ggml_sigmoid(c, ggml_view_3d(c, ggt, VM, H, T, ggt->nb[1], ggt->nb[2], 0)));
-        ggml_tensor* gatedc = ggml_cpy(c, gated, ggml_new_tensor_3d(c, GGML_TYPE_F32, VM, H, T));
-        ggml_tensor* yv = ggml_mul_mat(c, W(p + "attn_output.weight"),
-                                       ggml_reshape_2d(c, gatedc, (int64_t) H * VM, T));
-        roots.push_back(ggml_cpy(c, yv, y));
+        g2g3(c, roots);
+        hc_post_roots(c, roots, x, y, post, W(p + "post_attention_norm.weight"));
         ggml_cgraph* gr = ggml_new_graph_custom(c, 65536, false);
         for (ggml_tensor* r : roots) ggml_build_forward_expand(gr, r);
         if (!run_graph(win, gr, err)) {
-            err = "hy4-metal: attention G2/G3 failed";
+            err = "hy4-metal: attention span 2 failed";
             return false;
         }
         build_end();
     }
     trace_put("attn_y-" + ils, y);
-    if (!hc_post_norm(win, x, y, post, W(p + "post_attention_norm.weight"), err)) return false;
     trace_put("hc_attn_out-" + ils, x);
     return true;
 }
