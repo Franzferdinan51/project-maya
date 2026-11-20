@@ -917,26 +917,42 @@ bool Ggml::ffn(Win& win, int il, std::string& err) {
             std::vector<ggml_tensor*> roots;
             ggml_tensor* ge = W(p + "ffn_gate_exps.weight"), *ue = W(p + "ffn_up_exps.weight"),
                         *de = W(p + "ffn_down_exps.weight");
-            for (int t = 0; t < T; ++t) {
-                ggml_tensor* lat_t = ggml_view_2d(c, lat, LAT, 1, lat->nb[1], (size_t) t * LAT * 4);
-                ggml_tensor* acc = nullptr;
-                for (int j = 0; j < NU; ++j) {
-                    const int e = ids[(size_t) t][(size_t) j];
-                    ggml_tensor* ge_e = ggml_view_2d(c, ge, LAT, FFE, ge->nb[1], (size_t) e * ge->nb[2]);
-                    ggml_tensor* ue_e = ggml_view_2d(c, ue, LAT, FFE, ue->nb[1], (size_t) e * ue->nb[2]);
-                    ggml_tensor* de_e = ggml_view_2d(c, de, FFE, LAT, de->nb[1], (size_t) e * de->nb[2]);
-                    ggml_tensor* gv = ggml_mul_mat(c, ge_e, lat_t);
-                    ggml_tensor* uv = ggml_mul_mat(c, ue_e, lat_t);
-                    if (limit > 0) {
-                        gv = ggml_clamp(c, gv, -3.4e38f, limit);
-                        uv = ggml_clamp(c, uv, -limit, limit);
+            // the picks as a tensor [NU, T] (ids[j + NU*t]), and the routing weights beside
+            // them: the experts run as one grouped matmul each way (ggml_mul_mat_id, the MoE
+            // kernel) - sixteen separate expert chains were ~140 dispatches a layer a token.
+            // The per-token accumulation order below is the old one, so the sum is unchanged.
+            ggml_tensor* eid = ggml_new_tensor_2d(c, GGML_TYPE_I32, NU, T);
+            {
+                std::vector<int32_t> ev((size_t) NU * T);
+                std::vector<float> rv((size_t) NU * T);
+                for (int t = 0; t < T; ++t)
+                    for (int j = 0; j < NU; ++j) {
+                        ev[(size_t) j + (size_t) NU * t] = ids[(size_t) t][(size_t) j];
+                        rv[(size_t) j + (size_t) NU * t] = rw[(size_t) t][(size_t) j];
                     }
-                    ggml_tensor* h = ggml_mul(c, ggml_silu(c, gv), uv);
-                    ggml_tensor* eo = ggml_scale(c, ggml_mul_mat(c, de_e, h), rw[(size_t) t][(size_t) j]);
-                    acc = acc ? ggml_add(c, acc, eo) : eo;
+                pending_iconsts_.push_back({eid, std::move(ev)});
+                ggml_tensor* rwv = ggml_new_tensor_1d(c, GGML_TYPE_F32, (int64_t) rv.size());
+                pending_consts_.push_back({rwv, std::move(rv)});
+                ggml_tensor* lat3 = ggml_reshape_3d(c, lat, LAT, 1, T);
+                ggml_tensor* gv = ggml_mul_mat_id(c, ge, lat3, eid);   // [FFE, NU, T]
+                ggml_tensor* uv = ggml_mul_mat_id(c, ue, lat3, eid);
+                if (limit > 0) {
+                    gv = ggml_clamp(c, gv, -3.4e38f, limit);
+                    uv = ggml_clamp(c, uv, -limit, limit);
                 }
-                roots.push_back(ggml_cpy(
-                    c, acc, ggml_view_2d(c, latout, LAT, 1, latout->nb[1], (size_t) t * LAT * 4)));
+                ggml_tensor* h = ggml_mul(c, ggml_silu(c, gv), uv);
+                ggml_tensor* eo = ggml_mul_mat_id(c, de, h, eid);      // [LAT, NU, T]
+                eo = ggml_mul(c, eo, ggml_reshape_3d(c, rwv, 1, NU, T));
+                for (int t = 0; t < T; ++t) {
+                    ggml_tensor* acc = nullptr;
+                    for (int j = 0; j < NU; ++j) {
+                        ggml_tensor* eo_j = ggml_view_2d(c, eo, LAT, 1, eo->nb[1],
+                                                         ((size_t) j + (size_t) NU * t) * LAT * 4);
+                        acc = acc ? ggml_add(c, acc, eo_j) : eo_j;
+                    }
+                    roots.push_back(ggml_cpy(
+                        c, acc, ggml_view_2d(c, latout, LAT, 1, latout->nb[1], (size_t) t * LAT * 4)));
+                }
             }
             ggml_tensor* hdv = ggml_view_2d(c, win.get("hd"), FFE, T, win.get("hd")->nb[1], 0);
             ggml_tensor* yv = ggml_add(c, ggml_mul_mat(c, W(p + "ffn_routed_up.weight"), latout),
