@@ -517,7 +517,9 @@ export function ChatPage() {
     };
   }, []);
   const onScroll = () => {
-    const s = scroller.current, gap = s.scrollHeight - s.scrollTop - s.clientHeight;
+    const s = scroller.current;
+    if (!s) return;                    // (a scroll event after the view unmounted: the ref is already null)
+    const gap = s.scrollHeight - s.scrollTop - s.clientHeight;
     if (s.scrollTop < chatView.lastTop - 2 && gap >= 8) chatView.follow = false;             // moved up: keys, scrollbar
     else if (s.scrollTop > chatView.lastTop && gap < 8 && !chatView.held) chatView.follow = true;   // back down at the end
     chatView.lastTop = s.scrollTop;
