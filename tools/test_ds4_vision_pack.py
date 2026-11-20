@@ -246,8 +246,8 @@ class EngramSet(unittest.TestCase):
         old = self.table("Engram", 67)
         q6 = self.table("Engram-Q6_K", 14)
         d, egs = self.pg.engram_set(self.model, str(q6))
-        self.assertEqual((d, egs[0].tensors[0][1]), (q6, 14))
-        self.assertEqual(self.pg.engram_set(self.model, str(old))[0], old)
+        self.assertEqual((d, egs[0].tensors[0][1]), (q6.resolve(), 14))
+        self.assertEqual(self.pg.engram_set(self.model, str(old))[0], old.resolve())
         self.table("Engram", 67, cut=1)
         with self.assertRaises(SystemExit) as e:
             self.pg.engram_set(self.model, str(old))

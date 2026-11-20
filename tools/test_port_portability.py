@@ -44,7 +44,8 @@ SRC_DIRS = ("src", "include", "tests")
 SRC_EXT = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".cu", ".cuh", ".inl", ".ipp"}
 
 # --- check 1 --------------------------------------------------------------------------------------------------------
-MSVC_SKIP_DIRS = ("include/strata/hip_compat/", "tests/hip/")   # the AMD build's only (ROCm clang compiles them)
+MSVC_SKIP_DIRS = ("include/strata/hip_compat/", "tests/hip/",   # the AMD build's only (ROCm clang compiles them)
+                  "src/qwen-metal/")   # the vendored Metal-only engine: cmake/metal_backend.cmake builds it, MSVC never
 MSVC_SKIP_FILES = {
     "tests/mm3_lane_test.cpp": "CMakeLists.txt builds it only if(NOT WIN32)",
 }

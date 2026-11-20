@@ -214,7 +214,7 @@ class PackTest(unittest.TestCase):
         self.assertEqual(geo["swiglu_limit"], "0.0,10.0,10.0,10.0")
         self.assertEqual(geo["n_expert_latent"], "128")
         self.assertEqual(geo["bos"], "256")
-        self.assertEqual(geo["model_dir"], str(self.root))
+        self.assertEqual(geo["model_dir"], str(self.root.resolve()))
         lines = (out / "tensors.txt").read_text().splitlines()
         files = [ln.split() for ln in lines if ln.startswith("file ")]
         self.assertEqual([f[2] for f in files], ["Hy4-flash-Q4_K_M-00001-of-00002.gguf",

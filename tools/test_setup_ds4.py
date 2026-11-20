@@ -684,16 +684,16 @@ class Gguf(unittest.TestCase):
         other.mkdir()
         (d / "b.gguf").symlink_to(other / "b.gguf")
         shards = [d / "a.gguf", d / "b.gguf"]
-        disks = {str(d): 1, str(other): 2}
+        disks = {str(d.resolve()): 1, str(other.resolve()): 2}
         free = {1: 15e9, 2: 100e9}
 
         def usage(p):
-            return SimpleNamespace(free=free[disks[str(maya.existing(Path(p)))]])
-        with patch.object(maya, "disk_of", lambda p: disks[str(Path(p))]), \
+            return SimpleNamespace(free=free[disks[str(maya.existing(Path(p)).resolve())]])
+        with patch.object(maya, "disk_of", lambda p: disks[str(Path(p).resolve())]), \
                 patch.object(maya.shutil, "disk_usage", usage), patch.object(maya, "say", lambda *a: None), \
                 patch.object(maya, "hf_token", return_value="t"), patch.object(maya, "ask", return_value="n"), \
                 patch.object(maya, "rotational", return_value=False):
-            self.assertEqual(maya.linked_downloads(m, d, shards), {str(other): (100.0, 20.0)})
+            self.assertEqual(maya.linked_downloads(m, d, shards), {str(other.resolve()): (100.0, 20.0)})
             # 30 GB do not fit the folder's 15 GB free, but only 10 GB land there (20 GB go to the other disk's 100)
             self.assertFalse(maya.offer_download(args(download_model=False), "x", d, shards, m))
             free[2] = 21e9
@@ -1579,7 +1579,7 @@ class MayaQuants(unittest.TestCase):
                 maya.set_up_ds4(args(ds4_quant="maya-s", model_dir=str(self.d), models_dir=str(self.tmp)), {})
             (a, k), = packs
             self.assertEqual(sorted(f.name for f in k["files"]), sorted(e["files"]))
-            self.assertEqual(k["engram"], self.base / "Engram")
+            self.assertEqual(k["engram"], (self.base / "Engram").resolve())
 
     def test_pack_follows_the_engram_folder(self):
         """The pack indexes the files and the Engram folder the setup picked (--shards, --engram), and is built again

@@ -92,12 +92,13 @@ def hip_lines(text: str):
 def unmapped(repo: Path) -> list:
     """[(file, line, name)] for every name the HIP build compiles without a mapping."""
     compat = repo / "include" / "strata" / "hip_compat"
+    qwen_metal = repo / "src" / "qwen-metal"   # the vendored Metal-only engine: the HIP build never compiles it
     have = mapped_names(compat)
     found = []
     for top in ("src", "include", "tests"):
         for pat in SOURCES:
             for f in sorted((repo / top).rglob(pat)):
-                if compat in f.parents:
+                if compat in f.parents or qwen_metal in f.parents:
                     continue
                 text = strip_comments_and_strings(f.read_text(encoding="utf-8", errors="replace"))
                 for no, line in hip_lines(text):

@@ -5947,6 +5947,7 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
     """--report: maya-report.txt in the Maya folder - this PC, the installed setup and the engine log's speed lines,
     for a bug or speed report.  Nothing is sent anywhere; the home folder is written as ~ and API keys are left out."""
     home = str(Path.home())
+    home_real = str(Path.home().resolve())   # (the paths below are resolved; macOS's /var -> /private/var)
     lines = []
     have = [cfg_path] if cfg_path is not None else configs()
     cfg = {}
@@ -5961,7 +5962,7 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
 
     def add(title, text=""):
         lines.append(f"## {title}")
-        lines.extend(str(text).rstrip().replace(home, "~").splitlines() or ["(nothing)"])
+        lines.extend(str(text).rstrip().replace(home_real, "~").replace(home, "~").splitlines() or ["(nothing)"])
         lines.append("")
 
     git = S.out(["git", "-C", str(ROOT), "log", "-1", "--format=%h %cd", "--date=short"]).strip()
@@ -6207,7 +6208,8 @@ def bench(cfg_path: Path, version: str) -> int:
                                                     n_mean < sum(x[0] == "decode" for x in results) else "")
               for r in results if r[0] == "decode"]
     lines += [f"prefill (reading the prompt): {r[2]:.0f} tokens/s, {r[1]}" for r in results if r[0] == "prefill"]
-    lines += ["", "engine lines:"] + [x.replace(str(Path.home()), "~") for x in stats[-40:]]
+    lines += ["", "engine lines:"] + [x.replace(str(Path.home().resolve()), "~").replace(str(Path.home()), "~")
+                                      for x in stats[-40:]]
     out = ROOT / "maya-bench.txt"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     say()
@@ -6668,7 +6670,8 @@ def ds4_vision_model(mmproj: bool = False) -> dict:
 
 def ds4_vision_dir(d: Path, models: Path | None = None) -> Path:
     """The shared vision folder; a model directly in --models-dir keeps it inside that folder."""
-    return (d if models is not None and d == models else d.parent) / "vision"
+    # (both sides resolved: models arrives resolved, d may not - macOS's /var -> /private/var temp dirs are one)
+    return (d if models is not None and d.resolve() == models.resolve() else d.parent) / "vision"
 
 
 def ds4_pack_has_vision(pack: Path) -> bool:

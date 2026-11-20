@@ -349,7 +349,7 @@ class HipSetupTests(unittest.TestCase):
         self.assertIn("-DSTRATA_ENABLE_CUDA=OFF", conf)
         self.assertIn("-DSTRATA_PREFILL_MMQ=ON", conf)
         self.assertIn("-DCMAKE_HIP_ARCHITECTURES=gfx1100", conf)     # the chosen card's (#255)
-        self.assertEqual(env["ROCM_PATH"], str(self.rocm))
+        self.assertEqual(env["ROCM_PATH"], str(self.rocm.resolve()))
         self.assertEqual(meta["backend"], "hip")
 
     def test_refresh_compiles_a_target_the_new_source_has_not_built(self):
@@ -554,7 +554,7 @@ class HipSetupTests(unittest.TestCase):
         self.assertIn("AMD Radeon AI PRO R9700", text)
         self.assertIn(str(32 * 2**30), text)
         self.assertIn("6.14.0-37", text)
-        shown = str(self.rocm).replace(str(Path.home()), "~")
+        shown = str(self.rocm.resolve()).replace(str(Path.home().resolve()), "~")
         self.assertIn(f"path {shown}\nversion 7.2.1", text)
         self.assertIn('"backend": "hip"', text)
         self.assertIn("test-date", text)
@@ -596,14 +596,14 @@ class HipSetupTests(unittest.TestCase):
         self.assertIn("amdgpu driver:", text)
         self.assertIn("kernel", text)
         self.assertIn("using KFD topology", text)
-        self.assertIn("path " + str(self.rocm).replace(str(Path.home()), "~"), text)
+        self.assertIn("path " + str(self.rocm.resolve()).replace(str(Path.home().resolve()), "~"), text)
         self.assertIn("version unknown", text)
         self.assertFalse(any(Path(c.args[0][0]).name in ("rocm-smi", "amd-smi", "hipcc")
                              for c in query.call_args_list))
 
     def test_report_rocm_path_inside_and_outside_home(self):
         self.installed_config()
-        for home, shown in ((self.root, str(Path("~") / "rocm")), (self.root / "other-home", str(self.rocm))):
+        for home, shown in ((self.root, str(Path("~") / "rocm")), (self.root / "other-home", str(self.rocm.resolve()))):
             with self.subTest(home=home), patch.object(Path, "home", return_value=home):
                 text, _ = self.run_report()
                 self.assertIn(f"path {shown}\n", text)
@@ -641,7 +641,7 @@ class HipSetupTests(unittest.TestCase):
                                        "hipcc": "HIP version: 7.2.1"})
         self.assertIn("rocm-smi (tool GPU indices)", text)
         self.assertIn("version HIP version: 7.2.1", text)
-        query.assert_any_call([str(self.rocm / "bin/hipcc"), "--version"])
+        query.assert_any_call([str((self.rocm / "bin/hipcc").resolve()), "--version"])
 
     def test_report_hip_without_config_or_gpus(self):
         with patch.object(maya.S, "amd_gpus", return_value=[]):
@@ -661,7 +661,7 @@ class HipSetupTests(unittest.TestCase):
         path.write_text(json.dumps(cfg))
         path.with_suffix(".log").write_text("glm stat: decode 50.0 ms/tok | prompt 413 tok/s\n")
         text, _ = self.run_report(cfg_path=path)
-        shown = str(root).replace(str(Path.home()), "~")
+        shown = str(root.resolve()).replace(str(Path.home().resolve()), "~")
         self.assertIn(f"path {shown}\nversion 7.2.2", text)
         self.assertIn("Setup chosen.json", text)
         self.assertIn("Engine log chosen.log: the speed and memory lines", text)
