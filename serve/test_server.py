@@ -2991,7 +2991,8 @@ class NoDelayStreaming(unittest.TestCase):
             handler.end_headers = lambda *a, **k: None
             self.assertEqual(conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 0)
             handler._sse()
-            self.assertEqual(conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 1)
+            # (nonzero = enabled: macOS's getsockopt reads TCP_NODELAY back as 4, Linux as 1)
+            self.assertTrue(conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
         finally:
             conn.close(), client.close(), listener.close()
 
