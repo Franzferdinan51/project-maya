@@ -101,8 +101,16 @@ public:
             return false;
         }
         for (int t = 0; t < T; ++t) hist_.push_back(ids[t]);
-        prof_.begin();
-        {
+        prof_.begin("window_total");
+        if (T == 1 && !all_logits_) {
+            // the decode window keeps its tensors, buffer and gallocr across tokens: only
+            // the graphs rebuild (their shapes are the picks' and the position's). Every
+            // window tensor is rewritten before it is read, so nothing stale carries over.
+            if (!dwin_) dwin_ = std::make_unique<Win>();
+            if (!window(*dwin_, ids, T, err)) return false;
+            if (!head(*dwin_, T, 1, logits_out, err)) return false;
+        } else {
+            dwin_.reset();
             Win win;
             if (!window(win, ids, T, err)) return false;
             const int want = all_logits_ ? T : 1;
@@ -224,12 +232,20 @@ private:
 
     ggml_tensor* mk(Win& win, const std::string& name, ggml_type type, int64_t n0, int64_t n1 = 1,
                     int64_t n2 = 1) {
+        auto it = win.t.find(name);
+        if (it != win.t.end()) {
+            ggml_tensor* t = it->second;
+            if (t->type == type && t->ne[0] == n0 && t->ne[1] == n1 && t->ne[2] == n2) return t;
+        }
         ggml_tensor* t = ggml_new_tensor_3d(win.ctx, type, n0, n1, n2);
         win.t[name] = t;
         return t;
     }
     ggml_tensor* konst(Win& win, const std::string& name, const float* vals, int64_t n) {
-        ggml_tensor* t = mk(win, "k_" + name, GGML_TYPE_F32, n);
+        // the section's scratch, not the window: a reused window tensor would keep the
+        // data pointer a previous graph's gallocr assigned it, and the next graph would
+        // allocate over that region (constants are graph inputs, fresh each section)
+        ggml_tensor* t = ggml_new_tensor_1d(bc_ ? bc_ : win.ctx, GGML_TYPE_F32, n);
         pending_consts_.push_back({t, std::vector<float>(vals, vals + n)});
         return t;
     }
@@ -244,7 +260,7 @@ private:
     // allocated, the pending constants written into their fresh buffers, then computed.
     bool run_graph(Win& win, ggml_cgraph* gr, std::string& err) {
         if (verbose_) std::fprintf(stderr, "[hy4-metal] graph\n");
-        prof_.begin();
+        prof_.begin("galloc");
         if (!win.alloc) win.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be_));
         if (!ggml_gallocr_alloc_graph(win.alloc, gr)) {
             err = "hy4-metal: graph allocation failed";
@@ -252,7 +268,7 @@ private:
         }
         prof_.end("galloc");
         flush_consts();
-        prof_.begin();
+        prof_.begin("gcompute");
         if (ggml_backend_graph_compute(be_, gr) != GGML_STATUS_SUCCESS) {
             err = "hy4-metal: graph compute failed";
             return false;
@@ -272,7 +288,7 @@ private:
         return run_graph(win, gr, err);
     }
     void readback(ggml_tensor* t, float* dst) const {
-        prof_.begin();
+        prof_.begin("readback");
         ggml_backend_tensor_get(t, dst, 0, ggml_nbytes(t));
         prof_.end("readback");
     }
@@ -284,15 +300,20 @@ private:
         bool on = env != nullptr;
         std::string path = (env && env[0] && env[0] != '1') ? env : "";
         std::map<std::string, std::pair<double, int64_t>> acc;
-        std::chrono::steady_clock::time_point t0;
+        std::map<std::string, std::chrono::steady_clock::time_point> starts_;
         int64_t windows = 0, nodes = 0;
-        void begin() { if (on) t0 = std::chrono::steady_clock::now(); }
+        // one start per key: spans nest (window_total holds gcompute holds nothing, but
+        // ix_host holds readback), and a single shared start let the inner span steal the
+        // outer's beginning
+        void begin(const char* k) { if (on) starts_[k] = std::chrono::steady_clock::now(); }
         void end(const char* k) {
-            if (on) {
-                auto& e = acc[k];
-                e.first += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                e.second += 1;
-            }
+            if (!on) return;
+            auto it = starts_.find(k);
+            if (it == starts_.end()) return;
+            auto& e = acc[k];
+            e.first += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - it->second).count();
+            e.second += 1;
+            starts_.erase(it);
         }
         void dump() {
             if (!on) return;
@@ -443,6 +464,7 @@ private:
     EgCache egc_;                          // the Engram table's RAM tier (the Strata row-cache pattern)
     EgStats egst_;
     double resident_bytes_ = 0.0;          // weight bytes copied into Metal buffers: all resident
+    std::unique_ptr<Win> dwin_;            // the reused decode window (T==1)
 };
 
 bool Ggml::window(Win& win, const int* ids, int T, std::string& err) {
@@ -450,6 +472,7 @@ bool Ggml::window(Win& win, const int* ids, int T, std::string& err) {
     const int E = g.n_embd, hc = g.hc;
     const int64_t p0 = pos_;
     T_ = T;
+    if (!win.ctx) {
     win.ctx = ggml_init({1024 * 1024 * 1024, nullptr, true});
     int Hmax = 0;
     for (int64_t h : g.heads) Hmax = std::max(Hmax, (int) h);
@@ -483,13 +506,17 @@ bool Ggml::window(Win& win, const int* ids, int T, std::string& err) {
     mk(win, "kvo", GGML_TYPE_F32, (hc + 1) * E, T);
     mk(win, "hcur", GGML_TYPE_F32, E, T);
     mk(win, "logits", GGML_TYPE_F32, g.n_vocab, T);
-    prof_.begin();
+    prof_.begin("win_alloc");
     if (!ggml_backend_alloc_ctx_tensors(win.ctx, be_)) {
         err = "hy4-metal: window allocation failed";
         return false;
     }
     prof_.end("win_alloc");
     win.buf = win.t.begin()->second->buffer;
+    }
+    ggml_tensor* ids_t = win.get("ids");
+    ggml_tensor* pos_t = win.get("pos");
+    ggml_tensor* x = win.get("x");
     {
         std::vector<int32_t> iv((size_t) T), pv((size_t) T);
         for (int t = 0; t < T; ++t) {
@@ -527,7 +554,7 @@ bool Ggml::engram(Win& win, int il, int module, int64_t p0, std::string& err) {
     const int E = g.n_embd, hc = g.hc, T = T_;
     const std::string p = "blk." + std::to_string(il) + ".";
     const auto egt0 = std::chrono::steady_clock::now();
-    prof_.begin();
+    prof_.begin("engram_host");
     const EgRows rows = engram_gather(w_.pk, module, hist_, p0, T, &egc_, &egst_);
     const int cols = w_.pk.eg.cols(), hd = w_.pk.eg.head_dim;
     ggml_tensor* egrows = win.get("egrows");
@@ -689,7 +716,7 @@ bool Ggml::attention(Win& win, int il, int64_t p0, std::string& err) {
         // Only the live prefix of the pool is read back - the whole 256K pool was a
         // 33 MB GPU->CPU copy a layer a token; and the groups score in parallel, the
         // same double arithmetic per group (the picks must not move).
-        prof_.begin();
+        prof_.begin("ix_host");
         const int IH = g.ix_heads;
         std::vector<float> iqv((size_t) T * IH * D), wtv((size_t) T * IH);
         readback(win.get("iq"), iqv.data());
@@ -697,7 +724,7 @@ bool Ggml::attention(Win& win, int il, int64_t p0, std::string& err) {
         const int64_t nv_max = (p0 + T - 1) / KP;
         std::vector<float> poolv((size_t) nv_max * D);
         if (nv_max > 0) {
-            prof_.begin();
+            prof_.begin("readback");
             ggml_backend_tensor_get(pooled_[(size_t) il], poolv.data(), 0, (size_t) nv_max * D * 4);
             prof_.end("readback");
         }
@@ -872,7 +899,7 @@ bool Ggml::ffn(Win& win, int il, std::string& err) {
             if (!ok) return false;
         }
         // the picks, this forward's own selection from the graph's logits
-        prof_.begin();
+        prof_.begin("router_host");
         std::vector<float> rlv((size_t) T * NE);
         readback(win.get("rl"), rlv.data());
         const float* biasv = wconst(W(p + "exp_probs_b.bias"), (size_t) NE);
