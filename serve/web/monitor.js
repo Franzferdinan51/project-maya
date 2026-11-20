@@ -305,7 +305,7 @@ function Tiers({t, eng}) {
     : html`<div class="tierbar" role="img" aria-label=${hy4 ? `${fmt(pc(vu), 0)}% of the experts in VRAM, ${fmt(pc(ru), 0)}% in RAM, computed on the CPU`
       : `${fmt(pc(vu), 0)}% of the experts in VRAM, ${fmt(pc(ru), 0)}% in ${ds4 ? "RAM" : "pinned RAM"}, ${fmt(pc(disk), 0)}% on the SSD only`}>
       <span class="tierbar__vram" style=${`flex-grow:${vu}`}></span><span class="tierbar__ram" style=${`flex-grow:${ru}`}></span>
-      <span class="tierbar__disk" style=${`flex-grow:${disk}`}></span></div>
+      <span class="tierbar__disk" style=${`flex-grow:${disk}`}></span></div>`}
     ${hy4 ? html`<div class="legend">
       <span><i class="sw sw--vram"></i>VRAM <b class="num">${fmt(vu)}</b></span>
       <span><i class="sw sw--ram"></i>RAM, computed on the CPU <b class="num">${fmt(ru)}</b></span></div>` : html`<div class="legend">
