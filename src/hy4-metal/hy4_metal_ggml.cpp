@@ -228,12 +228,12 @@ private:
         return true;
     }
     bool compute(Win& win, std::initializer_list<ggml_tensor*> roots, std::string& err) {
-        ggml_cgraph* gr = ggml_new_graph_custom(win.ctx, 65536, false);
+        ggml_cgraph* gr = ggml_new_graph_custom(bc_ ? bc_ : win.ctx, 65536, false);
         for (ggml_tensor* r : roots) ggml_build_forward_expand(gr, r);
         return run_graph(win, gr, err);
     }
     bool compute(Win& win, const std::vector<ggml_tensor*>& roots, std::string& err) {
-        ggml_cgraph* gr = ggml_new_graph_custom(win.ctx, 65536, false);
+        ggml_cgraph* gr = ggml_new_graph_custom(bc_ ? bc_ : win.ctx, 65536, false);
         for (ggml_tensor* r : roots) ggml_build_forward_expand(gr, r);
         return run_graph(win, gr, err);
     }
@@ -261,7 +261,7 @@ private:
     // hc_pre: cur_out [E, T] (folded norm when norm_w), post_out [hc, T]; one graph.
     bool hc_pre(Win& win, ggml_tensor* x, const std::string& pfx, ggml_tensor* norm_w, ggml_tensor* cur_out,
                 ggml_tensor* post_out, std::string& err) {
-        ggml_context* c = win.ctx;
+        ggml_context* c = build_begin();
         const int64_t E = g_.n_embd, hc = g_.hc, T = x->ne[2];
         ggml_tensor* fn = W(pfx + "_fn.weight");
         ggml_tensor* base = W(pfx + "_base.weight");
@@ -287,18 +287,22 @@ private:
         ggml_tensor* xp = ggml_mul(c, x, pre);                          // [E, hc, T]
         ggml_tensor* cur = ggml_reshape_2d(c, ggml_sum_rows(c, ggml_cont(c, ggml_permute(c, xp, 1, 0, 2, 3))), E, T);
         if (norm_w) cur = rms_w(c, cur, norm_w, (float) g_.eps);
-        return compute(win, {ggml_cpy(c, cur, cur_out), ggml_cpy(c, mixout(hc, s1, (float) g_.hc_mag), post_out)},
-                       err);
+        const bool ok = compute(
+            win, {ggml_cpy(c, cur, cur_out), ggml_cpy(c, mixout(hc, s1, (float) g_.hc_mag), post_out)}, err);
+        build_end();
+        return ok;
     }
 
     bool hc_post_norm(Win& win, ggml_tensor* x, ggml_tensor* y, ggml_tensor* post, ggml_tensor* norm_w,
                       std::string& err) {
-        ggml_context* c = win.ctx;
+        ggml_context* c = build_begin();
         ggml_tensor* yn = rms_w(c, y, norm_w, (float) g_.eps);
         const int64_t E = yn->ne[0], hc = post->ne[0], T = yn->ne[1];
         ggml_tensor* d = ggml_mul(c, expand_to(c, ggml_reshape_3d(c, yn, E, 1, T), E, hc, T),
                                   expand_to(c, ggml_reshape_3d(c, post, 1, hc, T), E, hc, T));
-        return compute(win, {ggml_cpy(c, ggml_add(c, x, d), x)}, err);
+        const bool ok = compute(win, {ggml_cpy(c, ggml_add(c, x, d), x)}, err);
+        build_end();
+        return ok;
     }
 
     ggml_tensor* rope_ext(ggml_context* c, ggml_tensor* a, ggml_tensor* pos, int n_dims, float base) {
@@ -329,6 +333,25 @@ private:
     Trace* trace_ = nullptr;
     std::vector<std::pair<ggml_tensor*, std::vector<float>>> pending_consts_;
     std::vector<std::pair<ggml_tensor*, std::vector<int32_t>>> pending_iconsts_;
+    // H2 (Hermes review 2026-11-19): graph building used to allocate every graph and
+    // intermediate in the window context, which is freed only at window end - at real
+    // geometry (45 layers, a graph per indexer group, G4's per-token expert chains)
+    // that exhausts any fixed context mid-window.  Sections now build in a scratch
+    // context that is freed as soon as the section's graphs have computed; sections
+    // communicate only through the persistent window/cache tensors, never through
+    // intermediates, so nothing outlives its section.
+    ggml_context* bc_ = nullptr;
+    ggml_context* build_begin() {
+        build_end();
+        bc_ = ggml_init({512 * 1024 * 1024, nullptr, true});
+        return bc_;
+    }
+    void build_end() {
+        if (bc_) {
+            ggml_free(bc_);
+            bc_ = nullptr;
+        }
+    }
     int T_ = 0;   // the live window's size (layer() reads it)
     bool verbose_ = false;
     std::vector<std::vector<int>> keys_;   // the live window's indexer picks, a token at a time
@@ -387,10 +410,12 @@ bool Ggml::window(Win& win, const int* ids, int T, std::string& err) {
         ggml_backend_tensor_set(pos_t, pv.data(), 0, (size_t) T * 4);
     }
     {
-        ggml_context* c = win.ctx;
+        ggml_context* c = build_begin();
         ggml_tensor* emb = ggml_get_rows(c, ggml_reshape_2d(c, W("token_embd.weight"), E, g.n_vocab), ids_t);
         ggml_tensor* xr = ggml_repeat(c, ggml_reshape_3d(c, emb, E, 1, T), x);
-        if (!compute(win, {ggml_cpy(c, xr, x)}, err)) return false;
+        const bool ok = compute(win, {ggml_cpy(c, xr, x)}, err);
+        build_end();
+        if (!ok) return false;
     }
     for (int il = 0; il < g.n_layer; ++il)
         if (!layer(win, il, p0, err)) return false;
@@ -424,7 +449,7 @@ bool Ggml::engram(Win& win, int il, int module, int64_t p0, std::string& err) {
         ggml_backend_tensor_set(egrows, host.data(), 0, host.size() * 4);
     }
     const float eeps = engram_eps(w_.pk);
-    ggml_context* c = win.ctx;
+    ggml_context* c = build_begin();
     ggml_tensor* valid = win.get("egvalid");
     ggml_backend_tensor_set(valid, rows.valid.data(), 0, (size_t) T * 4);
     {
@@ -460,6 +485,7 @@ bool Ggml::engram(Win& win, int il, int module, int64_t p0, std::string& err) {
         if (!compute(win, {ggml_cpy(c, ggml_add(c, x, delta), x)}, err)) return false;
     }
     trace_put("engram_out-" + std::to_string(il), win.get("x"));
+    build_end();
     return true;
 }
 
@@ -481,6 +507,7 @@ bool Ggml::attention(Win& win, int il, int64_t p0, std::string& err) {
     ggml_tensor* qr = win.get("qr"), *q = win.get("q"), *kvr = win.get("kvr"), *ggt = win.get("gg");
     // ---- G1: projections, the q resid, the cache store, the indexer's prep
     {
+        c = build_begin();
         ggml_tensor* qa = ggml_mul_mat(c, W(p + "attn_q_a.weight"), xa);
         ggml_tensor* qrn = rms_w(c, qa, W(p + "attn_q_a_norm.weight"), (float) g.eps);
         ggml_tensor* qfull = ggml_mul_mat(c, W(p + "attn_q_b.weight"), qrn);
@@ -529,6 +556,7 @@ bool Ggml::attention(Win& win, int il, int64_t p0, std::string& err) {
             err = "hy4-metal: attention G1 failed";
             return false;
         }
+        build_end();
     }
     trace_put("q_resid-" + ils, qr);
     // ---- the indexer's pools, then the host-side picks
@@ -536,6 +564,7 @@ bool Ggml::attention(Win& win, int il, int64_t p0, std::string& err) {
         const int D = g.ix_dim, KP = g.ix_kpool;
         const int64_t g0 = p0 / KP, g1 = (p0 + T) / KP;
         for (int64_t gr = g0; gr < g1; ++gr) {
+            c = build_begin();
             ggml_tensor* src = ggml_view_2d(c, ivg_[(size_t) il], 2 * D, KP, ivg_[(size_t) il]->nb[1],
                                             (size_t) (gr * KP) * ivg_[(size_t) il]->nb[1]);
             ggml_tensor* valf = ggml_cpy(c, ggml_view_2d(c, src, D, KP, src->nb[1], 0),
@@ -558,7 +587,9 @@ bool Ggml::attention(Win& win, int il, int64_t p0, std::string& err) {
             ggml_tensor* full = ggml_concat(c, headp, ggml_reshape_2d(c, rope_ext(c, tail, post1, R, base), R, 1), 0);
             ggml_tensor* dst = ggml_view_2d(c, pooled_[(size_t) il], D, 1, pooled_[(size_t) il]->nb[1],
                                             (size_t) gr * pooled_[(size_t) il]->nb[1]);
-            if (!compute(win, {ggml_cpy(c, full, dst)}, err)) return false;
+            const bool ok = compute(win, {ggml_cpy(c, full, dst)}, err);
+            build_end();
+            if (!ok) return false;
         }
         // the picks, from the graph's own scores (this forward's own selection code)
         const int IH = g.ix_heads;
@@ -603,6 +634,7 @@ bool Ggml::attention(Win& win, int il, int64_t p0, std::string& err) {
     }
     // ---- G2: qcat, the scores, the latent outputs
     {
+        c = build_begin();
         const int64_t P = p0 + T;
         std::vector<float> sinks((size_t) H);
         readback(W(p + "attn_sinks.weight"), sinks.data());
@@ -660,9 +692,11 @@ bool Ggml::attention(Win& win, int il, int64_t p0, std::string& err) {
             err = "hy4-metal: attention G2 failed";
             return false;
         }
+        build_end();
     }
     // ---- G3: v_b per head, the gate, the output projection
     {
+        c = build_begin();
         std::vector<ggml_tensor*> roots;
         ggml_tensor* ob = win.get("ob"), *obpre = win.get("obpre");
         for (int h = 0; h < H; ++h) {
@@ -685,6 +719,7 @@ bool Ggml::attention(Win& win, int il, int64_t p0, std::string& err) {
             err = "hy4-metal: attention G3 failed";
             return false;
         }
+        build_end();
     }
     trace_put("attn_y-" + ils, y);
     if (!hc_post_norm(win, x, y, post, W(p + "post_attention_norm.weight"), err)) return false;
@@ -702,25 +737,29 @@ bool Ggml::ffn(Win& win, int il, std::string& err) {
     ggml_tensor* x = win.get("x"), *xf = win.get("xf"), *post = win.get("post"), *y = win.get("y");
     if (!hc_pre(win, x, p + "hc_ffn", W(p + "ffn_norm.weight"), xf, post, err)) return false;
     if (is_dense(il)) {
+        c = build_begin();
         ggml_tensor* gu = ggml_mul_mat(c, W(p + "ffn_gate.weight"), xf);
         ggml_tensor* uu = ggml_mul_mat(c, W(p + "ffn_up.weight"), xf);
         ggml_tensor* hd = ggml_mul(c, ggml_silu(c, gu), uu);
         ggml_tensor* yv = ggml_mul_mat(c, W(p + "ffn_down.weight"), hd);
         ggml_tensor* hdv = ggml_view_2d(c, win.get("hd"), g.n_ff, T, win.get("hd")->nb[1], 0);
-        if (!compute(win, {ggml_cpy(c, hd, hdv), ggml_cpy(c, yv, y)}, err)) return false;
+        const bool ok = compute(win, {ggml_cpy(c, hd, hdv), ggml_cpy(c, yv, y)}, err);
+        build_end();
+        if (!ok) return false;
     } else {
         const int LAT = g.n_lat, FFE = g.n_ff_exp, NU = g.n_used, NE = g.n_expert;
         // G3: the router logits, the latent input, the shared expert's hidden rows
         {
+            c = build_begin();
             ggml_tensor* rl = ggml_mul_mat(c, W(p + "ffn_gate_inp.weight"), xf);
             ggml_tensor* lat = ggml_mul_mat(c, W(p + "ffn_routed_down.weight"), xf);
             ggml_tensor* sh = ggml_mul(c, ggml_silu(c, ggml_mul_mat(c, W(p + "ffn_gate_shexp.weight"), xf)),
                                        ggml_mul_mat(c, W(p + "ffn_up_shexp.weight"), xf));
             ggml_tensor* hdv = ggml_view_2d(c, win.get("hd"), FFE, T, win.get("hd")->nb[1], 0);
-            if (!compute(win,
-                         {ggml_cpy(c, rl, win.get("rl")), ggml_cpy(c, lat, win.get("lat")), ggml_cpy(c, sh, hdv)},
-                         err))
-                return false;
+            const bool ok = compute(
+                win, {ggml_cpy(c, rl, win.get("rl")), ggml_cpy(c, lat, win.get("lat")), ggml_cpy(c, sh, hdv)}, err);
+            build_end();
+            if (!ok) return false;
         }
         // the picks, this forward's own selection from the graph's logits
         std::vector<float> rlv((size_t) T * NE), biasv((size_t) NE);
@@ -746,7 +785,7 @@ bool Ggml::ffn(Win& win, int il, std::string& err) {
             }
             for (int j = 0; j < NU; ++j) {
                 float wgt = rw[(size_t) t][(size_t) j];
-                if (g.w_norm) wgt /= wsum;
+                if (g.w_norm) wgt /= std::max(wsum, 6.103515625e-5f);   // upstream's 2^-14 floor
                 wgt *= (float) g.w_scale;
                 rw[(size_t) t][(size_t) j] = wgt;
                 tr_ids.push_back((float) ids[(size_t) t][(size_t) j]);
@@ -760,6 +799,7 @@ bool Ggml::ffn(Win& win, int il, std::string& err) {
         }
         // G4: the routed experts in the latent space, the up projection, the shared expert
         {
+            c = build_begin();
             const float limit = (float) g.limit[(size_t) il];
             ggml_tensor* lat = win.get("lat"), *latout = win.get("latout");
             std::vector<ggml_tensor*> roots;
@@ -796,6 +836,7 @@ bool Ggml::ffn(Win& win, int il, std::string& err) {
                 err = "hy4-metal: ffn G4 failed";
                 return false;
             }
+            build_end();
         }
         trace_put("ffn_latout-" + ils, win.get("latout"));
     }
@@ -809,7 +850,7 @@ bool Ggml::head(Win& win, int T, int want, float* logits_out, std::string& err) 
     if (verbose_) std::fprintf(stderr, "[hy4-metal] head\n");
     const hy4::Geo& g = g_;
     const int E = g.n_embd, hc = g.hc;
-    ggml_context* c = win.ctx;
+    ggml_context* c = build_begin();
     ggml_tensor* x = win.get("x");
     ggml_tensor* fn = W("output_hc_fn.weight");
     std::vector<float> hv((size_t) hc + 1);
@@ -830,7 +871,9 @@ bool Ggml::head(Win& win, int T, int want, float* logits_out, std::string& err) 
     ggml_tensor* lg = ggml_mul_mat(c, ggml_reshape_2d(c, W("output.weight"), E, g.n_vocab), hnw);
     ggml_tensor* lgdst = ggml_view_2d(c, win.get("logits"), g.n_vocab, want, win.get("logits")->nb[1],
                                       (size_t) (T - want) * win.get("logits")->nb[1]);
-    if (!compute(win, {ggml_cpy(c, hn, win.get("hcur")), ggml_cpy(c, lg, lgdst)}, err)) return false;
+    const bool ok = compute(win, {ggml_cpy(c, hn, win.get("hcur")), ggml_cpy(c, lg, lgdst)}, err);
+    build_end();
+    if (!ok) return false;
     if (trace_) {
         trace_put("hcur", win.get("hcur"));
         if (all_logits_) trace_put("logits", win.get("logits"));

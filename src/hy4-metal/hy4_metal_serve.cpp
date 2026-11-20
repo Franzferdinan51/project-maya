@@ -287,7 +287,7 @@ struct Serve {
             ++produced;
             out("T " + std::to_string(y) + "\n");
             if (y == g.eos) {
-                finish = "eos";
+                finish = "stop";
                 break;
             }
             if (think_budget > 0 && think_end >= 0 && produced >= think_budget) force_think_end = true;

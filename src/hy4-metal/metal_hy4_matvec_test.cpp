@@ -1,7 +1,9 @@
 // src/hy4-metal/metal_hy4_matvec_test.cpp - the Hy4 Metal port's stage 2 gate:
-// the four weight formats of the Maya-S trunk - IQ2_XXS and IQ3_XXS (the routed
-// experts), Q6_K (attention + head), Q8_0 (the shared expert) - multiplied on the
-// Metal backend against the same bytes on the CPU backend.
+// the five weight formats of the Maya-S trunk - IQ2_XXS and IQ3_XXS (the routed
+// experts' gate/up), IQ2_S (the routed experts' down projections - the maya-s
+// recipes route ffn_down_exps to it in most MoE layers), Q6_K (attention +
+// head), Q8_0 (the shared expert) - multiplied on the Metal backend against the
+// same bytes on the CPU backend.
 //
 // The stage 2 inventory (port plan SS7's open question) came out in ggml's favour:
 // the ggml this tree already links for the GLM/MiniMax engines carries all four
@@ -150,6 +152,10 @@ int main() {
         if (matvec(cpu, gpu, t, 1024, 8)) return 1;   // the prompt shape
         if (matvec(cpu, gpu, t, 256, 8)) return 1;    // the decode shape (one block-row)
     }
+    // IQ2_S at the real down-expert shape: one expert's ffn_down_exps matvec is
+    // [n_lat 1536 x n_ff_exp 1536] over the SwiGLU hidden (Hy4-Flash geometry).
+    if (probe(cpu, gpu, GGML_TYPE_IQ2_S)) return 1;
+    if (matvec(cpu, gpu, GGML_TYPE_IQ2_S, 1536, 1536)) return 1;
     std::fprintf(stderr, "metal_hy4_matvec_test: PASS\n");
     return 0;
 }

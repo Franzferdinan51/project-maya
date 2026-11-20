@@ -486,7 +486,7 @@ private:
                 }
                 for (int j = 0; j < NU; ++j) {
                     float wgt = ws[(size_t) j];
-                    if (g.w_norm) wgt /= wsum;
+                    if (g.w_norm) wgt /= std::max(wsum, 6.103515625e-5f);   // upstream's 2^-14 floor
                     wgt *= (float) g.w_scale;
                     trace_ids.push_back((float) cand[(size_t) j].second);
                     trace_rw.push_back(wgt);

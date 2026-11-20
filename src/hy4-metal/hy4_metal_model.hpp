@@ -75,6 +75,7 @@ struct Weights {
         if (type == "IQ2_XXS") return GGML_TYPE_IQ2_XXS;
         if (type == "IQ3_XXS") return GGML_TYPE_IQ3_XXS;
         if (type == "IQ2_XS") return GGML_TYPE_IQ2_XS;
+        if (type == "IQ2_S") return GGML_TYPE_IQ2_S;
         if (type == "IQ3_S") return GGML_TYPE_IQ3_S;
         if (type == "IQ4_XS") return GGML_TYPE_IQ4_XS;
         if (type == "Q8_1") return GGML_TYPE_Q8_1;
