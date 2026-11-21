@@ -95,39 +95,110 @@ class Llama:
 
 
 class SegmentServer:
-    """Feeds a stream of generated token ids to serve, segment by segment.
-    Shared by both backends: 200008 opens the thinking segment, 200004
-    the text segment; any other special token closes/opens something we
-    do not serve (tool calls, the message end). Thinking and text ids
-    both go out: Maya's OutputParser opens in the reasoning state, so
-    the thinking ids are the request's reasoning (the Monitor's live
-    rates and phase read them too), and a literal </think> emitted once
-    when the text segment follows thinking is what closes it (the repo
-    frontend's InklingRewriter makes the same translation from
+    """Feeds a stream of generated token ids to serve.  Shared by both
+    backends.  Content ids of the thinking and text segments go out,
+    plus the end-of-sampling id (200006), the one id serve ends a
+    request on for this tokenizer; every other segment marker stays
+    here (they would leak into the answer as text, and the message
+    end would cut the request at the end of its thinking).  A tool
+    call's invoke_tool_json segment is translated into the <tool_call>
+    text serve's parser turns into structured calls.  Maya's
+    OutputParser opens in the reasoning state, so the thinking ids are
+    the request's reasoning (the Monitor's live rates and phase read
+    them too), and a literal </think> emitted once when the text
+    segment follows thinking is what closes it (the repo frontend's
+    InklingRewriter makes the same translation from
     <|content_text|>).
     """
 
-    def __init__(self, tokenize):
+    def __init__(self, tokenize, detokenize=None):
         self.tokenize = tokenize
+        self.detokenize = detokenize
         self.state = "pre"
         self.saw_thinking = False
         self.close_sent = False
         self.served = 0
+        self.name_buf = []      # plain ids in "other" state (a tool's name precedes its segment)
+        self.tool_buf = None    # plain ids inside an invoke_tool_json segment
+
+    def _emit_text(self, text: str) -> None:
+        for cid in self.tokenize(text):
+            emit(f"T {cid}")
+            self.served += 1
+
+    def _close_thinking(self) -> None:
+        if self.saw_thinking and not self.close_sent:
+            self._emit_text("</think>")
+            self.close_sent = True
+
+    def _flush_tool(self) -> None:
+        """A finished invoke_tool_json segment becomes the <tool_call> text
+        serve's parser builds structured calls from (Qwen's form).  The model
+        writes the call as: the tool's name as plain text, the segment open
+        (200049), then {"name": ..., "args": {...}} as JSON text."""
+        buf, self.tool_buf = self.tool_buf, None
+        if buf is None or self.detokenize is None:
+            return
+        try:
+            call = json.loads(self.detokenize(buf).strip())
+            name = str(call.get("name") or self.detokenize(self.name_buf).strip())
+            args = call.get("args") or {}
+            if not name or not isinstance(args, dict):
+                return
+
+            def esc(s) -> str:
+                return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+            parts = [f"<tool_call><function={esc(name)}>"]
+            for k, v in args.items():
+                val = v if isinstance(v, str) else json.dumps(v)
+                parts.append(f"<parameter={esc(k)}>{esc(val)}</parameter>")
+            parts.append("</function></tool_call>")
+            text = "".join(parts)
+        except Exception:  # noqa: BLE001 - an unparseable call is dropped, never mangled into the answer
+            return
+        self._close_thinking()
+        self.state = "text"
+        self._emit_text(text)
+
+    def flush(self) -> None:
+        self._flush_tool()
 
     def feed(self, tid: int) -> None:
-        if tid == 200008:
+        if tid == 200008:                       # <|content_thinking|>
+            self._flush_tool()
             self.state, self.saw_thinking = "thinking", True
-        elif tid == 200004:
-            if self.saw_thinking and not self.close_sent:
-                for cid in self.tokenize("</think>"):
-                    emit(f"T {cid}")
-                self.close_sent = True
+            self.name_buf = []
+        elif tid == 200004:                     # <|content_text|>
+            self._flush_tool()
+            self._close_thinking()
             self.state = "text"
-        elif tid >= 200000:
+            self.name_buf = []
+        elif tid == 200049:                     # <|content_invoke_tool_json|>
+            self.tool_buf = []
+            self.state = "tool"
+        elif tid == 200006:                     # <|content_model_end_sampling|>
+            self._flush_tool()
+            # Only the end of sampling crosses the pipe: it is the one id
+            # that always ends the model's turn, and serve ends the request
+            # on it (its stop_ids name it for this tokenizer).  The message
+            # end (200010) must NOT cross: a thinking segment is a message
+            # of its own, and serve would read its end as the turn's end
+            # and cut the request before the answer.  Dropping both made
+            # every request finish as "length".
+            emit(f"T {tid}")
+            self.served += 1
+        elif tid >= 200000:                     # any other marker: a segment boundary
+            self._flush_tool()
             self.state = "other"
+            self.name_buf = []
         elif self.state in ("thinking", "text"):
             emit(f"T {tid}")
             self.served += 1
+        elif self.state == "tool":
+            self.tool_buf.append(tid)
+        elif self.state == "other":
+            self.name_buf.append(tid)
 
 
 class Generation:
@@ -156,7 +227,7 @@ class Generation:
             for key in ("temperature", "top_p", "top_k", "seed"):
                 if key in sampling:
                     body[key] = sampling[key]
-            seg = SegmentServer(llama.tokenize)
+            seg = SegmentServer(llama.tokenize, llama.detokenize)
             final = {}
             with llama.post("/completion", body) as resp:
                 for line in resp:
@@ -171,6 +242,7 @@ class Generation:
                     if data.get("stop"):
                         final = data
                         break
+            seg.flush()
             timings = final.get("timings", {})
             generated = int(final.get("tokens_predicted", 0)) or seg.served
             prompt_tokens = int(timings.get("prompt_n", len(ids)))
@@ -304,7 +376,7 @@ class MlxGeneration:
             kwargs["top_k"] = sampling["top_k"]
         if image:
             kwargs["image"] = image
-        seg = SegmentServer(mlx.tokenize)
+        seg = SegmentServer(mlx.tokenize, mlx.detokenize)
         last = None
         t0 = time.time()
         stream = stream_generate(mlx.model, mlx.processor, prompt, **kwargs)
@@ -317,6 +389,7 @@ class MlxGeneration:
                 last = r
         finally:
             stream.close()
+        seg.flush()
         wall_ms = (time.time() - t0) * 1000
         if last is None:
             emit("ERR ik2 bridge: mlx produced no output")

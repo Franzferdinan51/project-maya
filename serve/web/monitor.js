@@ -78,11 +78,16 @@ function Throughput({m}) {
   // prefill: the engine's rate over the tokens it read (not the reused prefix): the peak of the reading this page saw
   // (prefillPeak), else live while a request runs, else the last request's final rate
   const pk = prefillPeak(m);
-  const prefill = pk && pk.rate != null ? pk.rate : live.state !== "idle" ? live.prefill_tok_s_mean
-    : last ? (last.prefill_tok_s != null ? last.prefill_tok_s
+  const lastPre = last ? (last.prefill_tok_s != null ? last.prefill_tok_s
               : last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null)
     : null;
-  const pwhat = live.state === "reading" ? "reading now" : pk && pk.label ? pk.label : gen ? "this request" : last ? "last request" : "waiting";
+  // (an engine that reports no prompt progress - the ik2 bridge - leaves the live rate null while it
+  //  generates: the tile then keeps the last request's rate, labelled as such, instead of a dash)
+  const prefill = pk && pk.rate != null ? pk.rate : live.state === "reading" ? live.prefill_tok_s_mean
+    : live.prefill_tok_s_mean != null ? live.prefill_tok_s_mean : lastPre;
+  const pwhat = live.state === "reading" ? "reading now" : pk && pk.label ? pk.label
+    : gen && live.prefill_tok_s_mean == null && lastPre != null ? "last request"
+    : gen ? "this request" : last ? "last request" : "waiting";
   const fresh = tn && tn.time && Date.now() / 1000 - tn.time <= 30;
   const ms = gen && tn && tn.ms_tok ? tn.ms_tok : speed ? 1000 / speed : null;
   const hit = fresh && tn.vram_hit != null ? 100 * tn.vram_hit : last && last.hit_rate != null ? 100 * last.hit_rate : null;
