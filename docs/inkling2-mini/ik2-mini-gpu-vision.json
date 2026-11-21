@@ -1,0 +1,14 @@
+{
+ "exe": "build/maya-ik2",
+ "args": ["--model", "models/Inkling-2-Mini-UD-Q4_K_XL.gguf", "--max-context", "262144"],
+ "env": {"IK2_KV": "fp8", "IK2_GATE_TILE": "64", "IK2_GATE_BF16": "1", "IK2_Q8_UNROLL": "1", "IK2_BATCH_PREFILL": "1"},
+ "tokenizer": "ik2/tokenizer",
+ "model_name": "inkling-2-mini",
+ "vision": {
+  "exe": "build-vision/bin/maya-vision",
+  "mmproj": "models/mmproj-BF16.gguf",
+  "model": "models/Inkling-2-Mini-UD-Q4_K_XL.gguf",
+  "gpu": true,
+  "resident": true
+ }
+}

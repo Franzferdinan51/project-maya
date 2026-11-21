@@ -190,6 +190,14 @@ class MaxTokens(unittest.TestCase):
         u = b.get("usage", {})
         return s, b, u.get("input_tokens"), u.get("output_tokens")
 
+    def test_inkling_accepts_the_last_context_position(self):
+        from unittest.mock import patch
+        with patch.object(self.engine, "info", {"engine_kind": "ik2"}, create=True):
+            status, _, prompt, _ = self.call("openai", max_tokens=1)
+            self.assertEqual(status, 200)
+            self.assertEqual(self.call("openai", max_tokens=CTX - prompt)[0], 200)
+            self.assertEqual(self.call("openai", max_tokens=CTX - prompt + 1)[0], 400)
+
     def test_unset_budget_is_the_rest_of_the_context(self):
         cases = {"openai": [{"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None},
                             {"max_completion_tokens": -1}, {"max_completion_tokens": None, "max_tokens": None}],
@@ -3019,6 +3027,24 @@ class EngineEndTests(unittest.TestCase):
         self.assertIn("a GPU took a fault inside a kernel", n)
         self.assertIn("the engine ends (exit 3)", n)
         self.assertNotIn("RAM", n)
+
+    def test_an_abort_names_its_failed_check_not_ram(self):
+        # #1007: a libstdc++ bounds check failed (SIGABRT, exit -6) and the note said RAM
+        line = ("/usr/include/c++/16.1.1/bits/stl_vector.h:1253: std::vector<_Tp, _Alloc>::reference std::vector<_Tp, "
+                "_Alloc>::operator[](size_type) [with _Tp = long unsigned int]: Assertion '__n < this->size()' failed.")
+        n = self.note("[maya] done: 86 tokens in 30 s (3.4 tok/s) (stop, cancel=False)\n"
+                      "[maya] reading the prompt: 90,890 tokens, 10 s so far\n" + line + "\n"
+                      "[maya] reading the prompt: 90,890 tokens, 20 s so far\n", returncode=-6)
+        self.assertIn("aborted (SIGABRT)", n)
+        self.assertIn("Its log line: " + line, n)
+        self.assertNotIn("out of RAM", n)
+        n = self.note("terminate called after throwing an instance of 'std::bad_alloc'\n  what():  std::bad_alloc\n",
+                      returncode=-6)
+        self.assertIn("what():  std::bad_alloc", n)   # (the last such line)
+        n = self.note("maya ds4 serve: prompt read: 38 tokens in 5.3 s\n", returncode=-6)
+        self.assertIn("aborted (SIGABRT)", n)
+        self.assertIn("The lines above in its log name it", n)
+        self.assertIn("out of RAM", self.note("maya ds4 serve: prompt read: 38 tokens in 5.3 s\n", returncode=-9))
 
     def test_end_ahead_of_done_marks_the_engine_ended_before_the_request_ends(self):
         import io

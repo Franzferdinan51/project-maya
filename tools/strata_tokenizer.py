@@ -15,6 +15,7 @@ emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import sys
@@ -42,6 +43,17 @@ def bytes_to_unicode() -> dict[int, str]:
 
 BYTE_TO_UNICODE = bytes_to_unicode()
 UNICODE_TO_BYTE = {v: k for k, v in BYTE_TO_UNICODE.items()}
+
+
+def _vocab_fingerprint(tokens, ids) -> str:
+    """A digest of the token table and its reverse map as they stand: the same on every call while they are
+    untouched, something else once memory corruption has scribbled either (see Tokenizer.corruption_note)."""
+    h = hashlib.sha1()
+    for t in tokens:
+        h.update(t.encode("utf-8", "surrogatepass"))
+        h.update(b"\0")
+    h.update(str(len(ids)).encode())
+    return h.hexdigest()[:16]
 
 # The `qwen35` pre-tokenizer, transcribed from the ORACLE rather than from the family resemblance:
 # `.ref/llama.cpp/src/llama-vocab.cpp` L396, `case LLAMA_VOCAB_PRE_TYPE_QWEN35`.  The commented-out line
@@ -137,6 +149,12 @@ class _IsolatedSplits:
         return pieces
 
 
+# Inkling 2's pre-tokenizer under the names its GGUFs carry: "gpt-4o" (the conversion as unsloth's UD-Q4_K_XL was
+# made), "inkling" (as their UD-Q3_K_XL was, later) and "inkling2" (llama.cpp master's: Inkling-2-Mini's files) - the
+# same split, the same vocabulary and merges
+O200K = ("gpt-4o", "inkling", "inkling2")
+
+
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
                  pre: str = "qwen35", special_ids: dict[str, int] | None = None):
@@ -144,17 +162,20 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax", "hy_v4"):
+        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax", "hy_v4") + O200K:
             raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax, "
-                             "hy_v4" % pre)
-        # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
-        self.ignore_merges = pre in ("glm4", "glm5")
+                             "hy_v4, gpt-4o, inkling, inkling2" % pre)
+        # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece.  `gpt-4o` (Inkling 2's: its
+        # tokenizer.json's one Split with GPT-4o's o200k regex - MINIMAX_PATTERN - and no normalizer, its BPE with
+        # ignore_merges; also named "inkling": O200K) the same
+        self.ignore_merges = pre in ("glm4", "glm5") + O200K
         self.token_types = token_types
         self.special_ids = special_ids or {}
         self.ids = {t: i for i, t in enumerate(tokens)}
         if len(self.ids) != len(tokens):
             raise ValueError("vocabulary has duplicate tokens: %d entries, %d unique"
                              % (len(tokens), len(self.ids)))
+        self._loaded_fingerprint = _vocab_fingerprint(self.tokens, self.ids)
         # Merge rules as (left, right) -> rank.  A merge list that is not a total order over its pairs, or one
         # naming a token that is not in the vocabulary, would make BPE silently produce different ids than the
         # model was trained with, so both are checked here rather than discovered as a bad answer later.
@@ -167,7 +188,7 @@ class Tokenizer:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
         self._re = (_IsolatedSplits(PRE_ISOLATED[pre]) if pre in PRE_ISOLATED else
-                    regex.compile(MINIMAX_PATTERN) if pre == "minimax" else
+                    regex.compile(MINIMAX_PATTERN) if pre in ("minimax",) + O200K else
                     regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN))
         self._nfc = pre == "minimax"
 
@@ -199,6 +220,17 @@ class Tokenizer:
         if not literals:
             return None
         return regex.compile("|".join(regex.escape(s) for s in sorted(literals, key=len, reverse=True)))
+
+    def corruption_note(self) -> str:
+        """An empty string when the token tables still match what __init__ loaded, else the words an error should carry.  The
+        tables are never written after load, so a difference is memory corruption in this process, not a bad file -
+        2026-11-16: a server's in-memory table grew NUL bytes and lost entries after days of uptime (the same files
+        encode fine in a fresh process), and the bare KeyErrors it raised read like a broken vocabulary.  The fix is
+        a restart, so say that rather than leave callers to suspect the model files."""
+        if _vocab_fingerprint(self.tokens, self.ids) == self._loaded_fingerprint:
+            return ""
+        return ("; the token table changed in memory after load (heap corruption in this process) - "
+                "restart the process")
 
     # -------------------------------------------------------------- constructors
     @classmethod
@@ -286,7 +318,8 @@ class Tokenizer:
                 for tok in self._bpe(mapped):
                     i = self.ids.get(tok)
                     if i is None:
-                        raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
+                        raise KeyError("BPE produced a token outside the vocabulary: %r%s"
+                                       % (tok, self.corruption_note()))
                     got.append(i)
                 ids = tuple(got)
             memo[piece] = ids
@@ -372,7 +405,8 @@ class Tokenizer:
         b = cache.get(i)
         if b is None:
             if i < 0 or i >= len(self.tokens):
-                raise IndexError("token id %d is outside the vocabulary (%d)" % (i, len(self.tokens)))
+                raise IndexError("token id %d is outside the vocabulary (%d)%s"
+                                 % (i, len(self.tokens), self.corruption_note()))
             alias = self.__dict__.get("aliases", {}).get(i)
             if alias is not None:
                 b = cache[i] = alias.encode("utf-8")
@@ -386,7 +420,8 @@ class Tokenizer:
             for ch in self.tokens[i]:
                 v = UNICODE_TO_BYTE.get(ch)
                 if v is None:
-                    raise KeyError("token %d contains a character outside the byte alphabet: %r" % (i, ch))
+                    raise KeyError("token %d contains a character outside the byte alphabet: %r%s"
+                                   % (i, ch, self.corruption_note()))
                 raw.append(v)
             b = cache[i] = bytes(raw)
         return b
@@ -396,8 +431,10 @@ class Tokenizer:
 
 
 # ------------------------------------------------------------------ the pack's tokenizer/ directory
-def extract(gguf_path, out_dir) -> dict:
-    """Write the tokenizer into `<out_dir>/tokenizer/` so the engine never opens the weight shards for it."""
+def extract(gguf_path, out_dir, chat_template=None) -> dict:
+    """Write the tokenizer into `<out_dir>/tokenizer/` so the engine never opens the weight shards for it.
+    `chat_template`: a template file to write in place of the GGUF's (Inkling 2: thinkingmachines' own,
+    tools/ik2/chat_template.jinja - the conversion's differs)."""
     out = pathlib.Path(out_dir) / "tokenizer"
     out.mkdir(parents=True, exist_ok=True)
     tk = Tokenizer.from_gguf(gguf_path)
@@ -411,8 +448,10 @@ def extract(gguf_path, out_dir) -> dict:
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
         "ignore_merges": tk.ignore_merges,
-        "pre_pattern": GLM_PATTERN if tk.ignore_merges else QWEN35_PATTERN,
-        "pre_pattern_source": (".ref/llama.cpp src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4; "
+        "pre_pattern": MINIMAX_PATTERN if tk.pre in ("minimax",) + O200K else
+                       GLM_PATTERN if tk.ignore_merges else QWEN35_PATTERN,
+        "pre_pattern_source": ("GPT-4o's o200k Split, as the model's tokenizer.json gives it" if tk.pre in O200K else
+                               ".ref/llama.cpp src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4; "
                                "glm4/glm5 set ignore_merges)" if tk.ignore_merges else
                                ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
     }
@@ -424,7 +463,8 @@ def extract(gguf_path, out_dir) -> dict:
     # the model's own chat template: fine-tunes change it (Swift 1.5 differs from Qwen3.8-Flash-Next's)
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     from gguf_reader import GGUFFile
-    tpl = GGUFFile(pathlib.Path(gguf_path)).metadata.get("tokenizer.chat_template")
+    tpl = pathlib.Path(chat_template).read_text(encoding="utf-8") if chat_template else \
+        GGUFFile(pathlib.Path(gguf_path)).metadata.get("tokenizer.chat_template")
     if tpl:
         (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
     return cfg
@@ -436,8 +476,9 @@ def main() -> int:
     ap.add_argument("--gguf", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--check", action="store_true", help="round-trip a corpus and report")
+    ap.add_argument("--chat-template", help="a chat template file to write in place of the GGUF's")
     args = ap.parse_args()
-    cfg = extract(args.gguf, args.out)
+    cfg = extract(args.gguf, args.out, args.chat_template)
     print("tokenizer/: vocab %d, merges %d, pre %s, specials %s"
           % (cfg["vocab_size"], cfg["n_merges"], cfg["pre"], cfg["special_ids"]))
     if args.check:
