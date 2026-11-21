@@ -7954,6 +7954,13 @@ def main() -> int:
                 svc.lookup = int(models.flag(args, "--suffix-draft", "3")) > 0
             except ValueError:
                 svc.lookup = True
+    if svc.model_dir is None and "--model" in args[:-1]:
+        # (a bridge config: no pack or GGUF file - the folder its --model names (a directory of
+        #  safetensors, or a model file's folder) is the model's folder)
+        mp = Path(args[args.index("--model") + 1]).resolve()
+        svc.model_dir = mp if mp.is_dir() else mp.parent
+        threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(svc.model_dir)),
+                         daemon=True).start()
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:

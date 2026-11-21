@@ -183,12 +183,30 @@ def trained_context(model_dir) -> int | None:
         from gguf_reader import GGUFFile                # (tools/, on the path above)
         shards = sorted(Path(model_dir).glob("*-00001-of-*.gguf")) or sorted(Path(model_dir).glob("*.gguf"))
         if not shards:
-            return None
+            return _config_json_context(model_dir)
         md = GGUFFile(shards[0]).metadata
         n = md.get(f"{md.get('general.architecture', '')}.context_length")
         return int(n) if isinstance(n, int) and n > 0 else None
     except Exception:  # noqa: BLE001 - a header it can't read: the fallback range
         return None
+
+def _config_json_context(model_dir) -> int | None:
+    """A safetensors model's trained context from its config.json (a bridge/MLX model dir has no GGUF
+    header to read): model_max_length, else a max_position_embeddings, at the top or one config down."""
+    try:
+        cfg = json.loads((Path(model_dir) / "config.json").read_text())
+    except Exception:  # noqa: BLE001 - no readable config.json: no trained context to report
+        return None
+    for sub in (cfg, cfg.get("text_config") or {}, cfg.get("language_config") or {},
+                cfg.get("mtp_config") or {}):
+        if not isinstance(sub, dict):
+            continue
+        for key in ("model_max_length", "max_position_embeddings", "max_seq_len"):
+            n = sub.get(key)
+            if isinstance(n, int) and n > 0:
+                return n
+    return None
+
 
 
 def trained_context_ds4(pack) -> int | None:
@@ -952,6 +970,9 @@ def missing(cfg: dict) -> str | None:
     if pack is None:   # (a Metal config: the --gguf file being on this PC is its model being on this PC)
         g = gguf_of(cfg)
         if not cfg.get("exe") or g is None:
+            m = flag(cfg.get("args") or [], "--model")   # (a bridge config: the model its --model names)
+            if cfg.get("exe") and m and Path(m).exists():
+                return None
             return "its engine or pack is not set"
         if not g.is_file():
             return f"its model files are not on this PC ({g.parent})"

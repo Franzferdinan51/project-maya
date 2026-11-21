@@ -95,14 +95,16 @@ class Llama:
 
 
 class SegmentServer:
-    """Feeds a stream of generated token ids to serve, serving only the
-    content_text segment. Shared by both backends: 200008 opens the
-    thinking segment, 200004 the text segment; any other special token
-    closes/opens something we do not serve (tool calls, the message
-    end). Only text-segment ids go out, preceded once by a literal
-    </think> when thinking came first: Maya's OutputParser opens in the
-    reasoning state and that text is what closes it (the repo frontend's
-    InklingRewriter makes the same translation from <|content_text|>).
+    """Feeds a stream of generated token ids to serve, segment by segment.
+    Shared by both backends: 200008 opens the thinking segment, 200004
+    the text segment; any other special token closes/opens something we
+    do not serve (tool calls, the message end). Thinking and text ids
+    both go out: Maya's OutputParser opens in the reasoning state, so
+    the thinking ids are the request's reasoning (the Monitor's live
+    rates and phase read them too), and a literal </think> emitted once
+    when the text segment follows thinking is what closes it (the repo
+    frontend's InklingRewriter makes the same translation from
+    <|content_text|>).
     """
 
     def __init__(self, tokenize):
@@ -123,7 +125,7 @@ class SegmentServer:
             self.state = "text"
         elif tid >= 200000:
             self.state = "other"
-        elif self.state == "text":
+        elif self.state in ("thinking", "text"):
             emit(f"T {tid}")
             self.served += 1
 
@@ -362,7 +364,8 @@ def main() -> int:
         print(f"ik2 bridge: {e}", file=sys.stderr, flush=True)
         return 1
     emit("NOTE ik2 bridge: Inkling 2 Mini via llama-server (ggml/Metal)")
-    emit("INFO engine=ik2-bridge-1.0")
+    emit("INFO engine=ik2-bridge-1.0"
+         + (" dspark=1" if opts.get("llama-spec-type") == "draft-dspark" else ""))
     emit(f"READY {ctx} stop")
     gen = Generation(llama)
     try:
@@ -387,11 +390,11 @@ def run_mlx(opts: dict, ctx: int) -> int:
         return 1
     emit("NOTE ik2 bridge: Inkling 2 Mini via MLX (DSpark)")
     if opts.get("mlx-vision") == "off":
-        emit("INFO engine=ik2-bridge-1.0 vision=off")
+        emit("INFO engine=ik2-bridge-1.0 vision=off dspark=1")
     else:
         # the MLX build carries the model's vision tower: serve resizes the pictures and sends
         # their pixels with GENI (serve/ik2_vision.py); the bridge runs the tower in-process.
-        emit("INFO engine=ik2-bridge-1.0 vision=ik2 vision_patch=20 vision_merge=2 "
+        emit("INFO engine=ik2-bridge-1.0 vision=ik2 dspark=1 vision_patch=20 vision_merge=2 "
              "image_token=200054 vision_min_pixels=1600 vision_max_pixels=4194304")
     emit(f"READY {ctx} stop")
     gen = MlxGeneration(mlx)
