@@ -31,6 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import maya_names  # noqa: E402  (tools/) a setting under either of its names
 import maya_quants  # noqa: E402  (tools/) the quants' names users see, and each config's family
+import ik2_fit as IK2F  # noqa: E402  (tools/) Inkling 2: its fit plans, contexts and KV bytes
 from serve import glm_dsa_product as G53  # noqa: E402  GLM-5.3 (744B, glm-dsa): what its engine serves today
 
 SWITCH_FILE = ".maya-switch.json"           # the server's note to maya.py: start this config next (a switch)
@@ -141,6 +142,13 @@ def family(cfg: dict) -> str:
     if _metal_mm3(cfg):   # (family_of knows the CUDA exe name, maya-mm3; the Metal MiniMax engine's is maya-metal-mm3)
         return "minimax"
     return maya_quants.family_of(cfg)
+
+
+def _ik2_mlx_images(cfg: dict) -> bool:
+    """The Mac ik2 bridge's MLX backend runs the model's vision tower in the engine (it advertises
+    INFO vision=ik2): pictures are on unless its --mlx-vision flag says off."""
+    args = cfg.get("args") or []
+    return flag(args, "--backend") == "mlx" and flag(args, "--mlx-vision") != "off"
 
 
 def gpus_of(cfg: dict) -> list:
@@ -408,7 +416,7 @@ def _choices(cfg: dict) -> dict:
         drafters = (["mtp"] if hy4_has_mtp(cfg) else []) + (["dfly2"] if hy4_has_dfly2(cfg) else [])
         return {"draft": (["auto"] if drafters else []) + drafters + ["none"], "images": hy4_has_vision(cfg)}
     if family(cfg) == "ik2":                           # (images: the setup's maya-vision entry, on or kept off; no drafting)
-        return {"draft": ["none"], "images": bool(cfg.get("vision") or cfg.get("vision_off")),
+        return {"draft": ["none"], "images": bool(cfg.get("vision") or cfg.get("vision_off")) or _ik2_mlx_images(cfg),
                 "kv": list(IK2F.KV_BYTES)}
     if family(cfg) == "qwen":                          # (images: the setup's maya-vision entry, on or kept off)
         return {"draft": ["mtp", "none"] if qwen_mtp(cfg) is not None else ["none"],
@@ -451,7 +459,7 @@ def settings_of(cfg: dict) -> dict:
         return out
     if family(cfg) == "ik2":                           # (maya-ik2's own defaults where the config names none)
         kv = str(env.pop("IK2_KV", "f16")).lower()     # (its cache: Settings' KV cache, not a variable of the page's)
-        out.update(images=bool(cfg.get("vision")),
+        out.update(images=bool(cfg.get("vision")) or _ik2_mlx_images(cfg),
                    kv="f16" if kv in ("f16", "fp16") else "fp8" if kv in ("fp8", "e4m3") else kv)
         return out
     if family(cfg) == "qwen":
@@ -708,7 +716,10 @@ def apply(cfg: dict, settings: dict) -> dict:
         kv = {"fp16": "f16", "e4m3": "fp8"}.get(kv, kv)
         if kv not in IK2F.KV_BYTES:
             raise ValueError("KV cache: FP8 or F16")
-        if s.get("images") and not out.get("vision"):
+        if flag(args, "--backend") == "mlx":
+            # (the Mac bridge's MLX backend runs the tower itself: Images is its --mlx-vision flag)
+            args = drop_flag(args, "--mlx-vision") if s.get("images") else set_flag(args, "--mlx-vision", "off")
+        elif s.get("images") and not out.get("vision"):
             if not out.get("vision_off"):
                 raise ValueError("Images: this model was set up without its image encoder (the setup adds it)")
             out["vision"] = out.pop("vision_off")

@@ -56,7 +56,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map, hy4_vision, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
+from serve import ds4_vision, gpu_map, hy4_vision, ik2_vision, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
 from serve import attach, mixed_gpus  # noqa: E402
 from serve import glm_link  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
 
@@ -3912,7 +3912,7 @@ class Service:
             # the engines' own vision towers (DeepSeek, MiniMax, Hy4) read pictures only: say so instead of dropping
             # the video (with a picture next to it) or failing on a missing video encoder (without one)
             raise ValueError(("Hy4-flash" if isinstance(self.vision, hy4_vision.Vision) else
-                              "MiniMax-M3.1" if isinstance(self.vision, mm3_vision.Vision) else "DeepSeek-V4.1-Flash")
+                              "Inkling 2 Mini" if isinstance(self.vision, ik2_vision.Vision) else "MiniMax-M3.1" if isinstance(self.vision, mm3_vision.Vision) else "DeepSeek-V4.1-Flash")
                              + " reads pictures, not videos")
         if images and isinstance(self.vision, ENGINE_VISION):
             # DeepSeek: the engine encodes the pictures itself; each placeholder the template wrote (user text's are
@@ -7845,6 +7845,13 @@ def main() -> int:
             # MiniMax-M3.1-Flash: the engine's own vision tower; the server resizes the pictures
             vision = mm3_vision.Vision(mm3_vision.Geometry.from_info(engine.info),
                                        Path(tempfile.mkdtemp(prefix="maya-mm3-pictures-")), Vision.load)
+            print(f"[maya] images: the model's vision tower runs in the engine, up to {vision.g.max_pixels} pixels "
+                  f"({vision.g.max_tokens} tokens) a picture", flush=True)
+        elif vision is None and not vcfg and engine.info.get("vision") == "ik2":
+            # Inkling 2 Mini (the ik2 bridge's MLX backend): the engine's own vision tower (the MLX build
+            # carries the model's encoder); the server resizes the pictures
+            vision = ik2_vision.Vision(ik2_vision.Geometry.from_info(engine.info),
+                                       Path(tempfile.mkdtemp(prefix="maya-ik2-pictures-")), Vision.load)
             print(f"[maya] images: the model's vision tower runs in the engine, up to {vision.g.max_pixels} pixels "
                   f"({vision.g.max_tokens} tokens) a picture", flush=True)
         elif vision is None and not vcfg and engine.info.get("vision") == "off":
