@@ -39,12 +39,13 @@ def emit(line: str) -> None:
 
 
 class Llama:
-    def __init__(self, bin_path: str, gguf: str, port: int, ctx: int, alias: str):
+    def __init__(self, bin_path: str, gguf: str, port: int, ctx: int, alias: str,
+                 extra: list | None = None):
         self.base = f"http://127.0.0.1:{port}"
         self.proc = subprocess.Popen(
             [bin_path, "-m", gguf, "--host", "127.0.0.1", "--port", str(port),
              "--ctx-size", str(ctx), "--n-gpu-layers", "999",
-             "--alias", alias, "--jinja"],
+             "--alias", alias, "--jinja"] + (extra or []),
             stdout=subprocess.DEVNULL, stderr=sys.stderr)
         deadline = time.time() + 240
         while time.time() < deadline:
@@ -170,10 +171,16 @@ def main() -> int:
     # engine's way (--model, --max-context); the bridge's are --gguf/--ctx
     ctx = int(opts.get("ctx") or opts.get("max-context", "32768"))
     gguf = opts.get("gguf") or opts.get("model")
+    # any --llama-<flag> <value> config arg is passed to llama-server as
+    # --<flag> <value> (speculative decoding, cache types, ...)
+    extra = []
+    for k, v in opts.items():
+        if k.startswith("llama-") and k not in ("llama-bin", "llama-port"):
+            extra += ["--" + k[len("llama-"):], v]
     try:
         llama = Llama(opts["llama-bin"], gguf,
                       int(opts.get("llama-port", "18085")), ctx,
-                      opts.get("alias", "inkling-2-mini"))
+                      opts.get("alias", "inkling-2-mini"), extra)
     except Exception as e:                                  # noqa: BLE001 - serve reads READY or dies
         print(f"ik2 bridge: {e}", file=sys.stderr, flush=True)
         return 1
@@ -186,7 +193,12 @@ def main() -> int:
             line = line.strip()
             if not line:
                 continue
-            if line.startswith("GEN "):
+            if line.startswith("GENI"):
+                # an image request: serve hands engines an embeddings file,
+                # which llama-server cannot consume (it encodes pixels
+                # itself). Fail the request cleanly instead of hanging it.
+                emit("ERR ik2 bridge: images are not supported through the bridge")
+            elif line.startswith("GEN "):
                 if gen.thread and gen.thread.is_alive():
                     gen.thread.join()
                 parts = line.split(" ")
