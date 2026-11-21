@@ -433,8 +433,10 @@ def _choices(cfg: dict) -> dict:
         # (auto: the engine measures once on this PC which decodes fastest - no drafting or a drafter the pack holds)
         drafters = (["mtp"] if hy4_has_mtp(cfg) else []) + (["dfly2"] if hy4_has_dfly2(cfg) else [])
         return {"draft": (["auto"] if drafters else []) + drafters + ["none"], "images": hy4_has_vision(cfg)}
-    if family(cfg) == "ik2":                           # (images: the setup's maya-vision entry, on or kept off; no drafting)
-        return {"draft": ["none"], "images": bool(cfg.get("vision") or cfg.get("vision_off")) or _ik2_mlx_images(cfg),
+    if family(cfg) == "ik2":                           # (images: the setup's maya-vision entry, on or kept off - or the
+        iargs = cfg.get("args") or []                  #  bridge's MLX vision; drafting: DSpark wherever a drafter runs)
+        idraft = ["dspark", "none"] if flag(iargs, "--backend") == "mlx" or flag(iargs, "--llama-spec-type") == "draft-dspark" else ["none"]
+        return {"draft": idraft, "images": bool(cfg.get("vision") or cfg.get("vision_off")) or _ik2_mlx_images(cfg),
                 "kv": list(IK2F.KV_BYTES)}
     if family(cfg) == "qwen":                          # (images: the setup's maya-vision entry, on or kept off)
         return {"draft": ["mtp", "none"] if qwen_mtp(cfg) is not None else ["none"],
@@ -478,7 +480,10 @@ def settings_of(cfg: dict) -> dict:
     if family(cfg) == "ik2":                           # (maya-ik2's own defaults where the config names none)
         kv = str(env.pop("IK2_KV", "f16")).lower()     # (its cache: Settings' KV cache, not a variable of the page's)
         out.update(images=bool(cfg.get("vision")) or _ik2_mlx_images(cfg),
-                   kv="f16" if kv in ("f16", "fp16") else "fp8" if kv in ("fp8", "e4m3") else kv)
+                   kv="f16" if kv in ("f16", "fp16") else "fp8" if kv in ("fp8", "e4m3") else kv,
+                   parallel=_int(flag(args, "--parallel"), 1),
+                   draft="dspark" if flag(args, "--llama-spec-type") == "draft-dspark"
+                   or (flag(args, "--backend") == "mlx" and _int(flag(args, "--mlx-draft-block"), 4) > 0) else "none")
         return out
     if family(cfg) == "qwen":
         ec, pf = flag(args, "--expert-cache", "auto"), flag(args, "--prefill", "auto")
@@ -734,6 +739,13 @@ def apply(cfg: dict, settings: dict) -> dict:
         kv = {"fp16": "f16", "e4m3": "fp8"}.get(kv, kv)
         if kv not in IK2F.KV_BYTES:
             raise ValueError("KV cache: FP8 or F16")
+        par = _num(s, "parallel", 1, 8, "Answers at once", none_ok=False)
+        args = set_flag(args, "--parallel", par) if par > 1 or "--parallel" in args else args
+        if flag(args, "--backend") == "mlx" and s.get("draft") is not None:
+            if s["draft"] not in can["draft"]:
+                raise ValueError("Drafting: DSpark or none")
+            cur = _int(flag(args, "--mlx-draft-block"), 4)
+            args = set_flag(args, "--mlx-draft-block", (cur if cur > 0 else 4) if s["draft"] == "dspark" else 0)
         if flag(args, "--backend") == "mlx":
             # (the Mac bridge's MLX backend runs the tower itself: Images is its --mlx-vision flag)
             args = drop_flag(args, "--mlx-vision") if s.get("images") else set_flag(args, "--mlx-vision", "off")
@@ -2033,10 +2045,9 @@ def hy4_room_due(cfg: dict) -> dict | None:
         return None
 
 
-IK2_KEYS = ("context", "images", "gpus", "env", "kv")
+IK2_KEYS = ("context", "images", "gpus", "env", "kv", "parallel", "draft")
 
 IK2_OFF = {"parallel": 1, "draft": "none"}
 
-IK2_NOT_YET = {"parallel": "Answers at once: Inkling 2 Mini answers one request at a time for now",
-               "draft": "Drafting: not offered in the Inkling 2 Mini preview - it decodes without drafting for now"}
+IK2_NOT_YET = {}        # (parallel and draft graduated: the bridge runs serve's multi protocol and loads its drafter by setting)
 

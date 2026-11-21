@@ -111,19 +111,23 @@ class SegmentServer:
     <|content_text|>).
     """
 
-    def __init__(self, tokenize, detokenize=None):
+    def __init__(self, tokenize, detokenize=None, out=None):
         self.tokenize = tokenize
         self.detokenize = detokenize
+        self.out = out or emit
         self.state = "pre"
         self.saw_thinking = False
         self.close_sent = False
         self.served = 0
         self.name_buf = []      # plain ids in "other" state (a tool's name precedes its segment)
         self.tool_buf = None    # plain ids inside an invoke_tool_json segment
+        self.think_buf = []     # plain ids inside the thinking segment (for the rescue scan)
+        self.served_answer = False  # any text id or native call served this turn
+        self.rescued = False
 
     def _emit_text(self, text: str) -> None:
         for cid in self.tokenize(text):
-            emit(f"T {cid}")
+            self.out(f"T {cid}")
             self.served += 1
 
     def _close_thinking(self) -> None:
@@ -159,10 +163,37 @@ class SegmentServer:
             return
         self._close_thinking()
         self.state = "text"
+        self.served_answer = True
         self._emit_text(text)
+
+    def _rescue_thinking_call(self) -> None:
+        """A turn that served only thinking sometimes carries its tool
+        call as raw <tool_call> text inside the thinking segment (the
+        model imitates the dialect instead of opening the invoke
+        segment).  Serve never scans reasoning for calls, so the client
+        sees an empty response and retries the same prompt forever.
+        When nothing else was served, re-emit any complete call blocks
+        as content, where the parser does scan."""
+        if self.rescued or self.served_answer or self.detokenize is None:
+            return
+        self.rescued = True
+        if not self.think_buf:
+            return
+        try:
+            text = self.detokenize(self.think_buf)
+        except Exception:  # noqa: BLE001 - a failed scan must not break the turn
+            return
+        blocks = re.findall(r"<tool_call>.*?</tool_call>", text, re.DOTALL)
+        if not blocks:
+            return
+        self._close_thinking()
+        self.state = "text"
+        self.served_answer = True
+        self._emit_text("".join(blocks))
 
     def flush(self) -> None:
         self._flush_tool()
+        self._rescue_thinking_call()
 
     def feed(self, tid: int) -> None:
         if tid == 200008:                       # <|content_thinking|>
@@ -179,6 +210,7 @@ class SegmentServer:
             self.state = "tool"
         elif tid == 200006:                     # <|content_model_end_sampling|>
             self._flush_tool()
+            self._rescue_thinking_call()
             # Only the end of sampling crosses the pipe: it is the one id
             # that always ends the model's turn, and serve ends the request
             # on it (its stop_ids name it for this tokenizer).  The message
@@ -186,14 +218,18 @@ class SegmentServer:
             # of its own, and serve would read its end as the turn's end
             # and cut the request before the answer.  Dropping both made
             # every request finish as "length".
-            emit(f"T {tid}")
+            self.out(f"T {tid}")
             self.served += 1
         elif tid >= 200000:                     # any other marker: a segment boundary
             self._flush_tool()
             self.state = "other"
             self.name_buf = []
         elif self.state in ("thinking", "text"):
-            emit(f"T {tid}")
+            if self.state == "thinking":
+                self.think_buf.append(tid)
+            else:
+                self.served_answer = True
+            self.out(f"T {tid}")
             self.served += 1
         elif self.state == "tool":
             self.tool_buf.append(tid)
@@ -262,7 +298,10 @@ class Mlx:
         from mlx_vlm import load
         from mlx_vlm.speculative.drafters import load_drafter
         self.model, self.processor = load(model_path)
-        self.draft, self.kind = load_drafter(model_path)
+        if draft_block > 0:
+            self.draft, self.kind = load_drafter(model_path)
+        else:                                   # Drafting off in the model's settings
+            self.draft, self.kind = None, None
         self.draft_block = draft_block
         tok = getattr(self.processor, "tokenizer", self.processor)
         self.tok = tok
@@ -318,6 +357,8 @@ def save_picture(w: int, h: int, rgb: bytes) -> str:
 
 
 class MlxGeneration:
+    multi_ok = True
+
     def __init__(self, mlx: Mlx):
         self.mlx = mlx
         self.stop = threading.Event()
@@ -336,13 +377,27 @@ class MlxGeneration:
                                        daemon=True)
         self.thread.start()
 
-    def _run(self, max_new: int, sampling: dict, ids: list) -> None:
-        try:
-            self._stream(max_new, sampling, self.mlx.detokenize(ids), len(ids))
-        except Exception as e:                              # noqa: BLE001 - reported to serve
-            emit(f"ERR ik2 bridge: {e}")
+    def run_rid(self, max_new: int, sampling: dict, ids: list, out, stop,
+                image_path: str | None = None) -> None:
+        """One request of serve's multi-conversation protocol: runs end to
+        end on the caller's thread, writes only through its rid-tagged
+        sink, and stops on its own event."""
+        if image_path is not None:
+            self._run_image(max_new, sampling, image_path, ids, out=out, stop=stop)
+        else:
+            self._run(max_new, sampling, ids, out=out, stop=stop)
 
-    def _run_image(self, max_new: int, sampling: dict, path: str, ids: list) -> None:
+    def _run(self, max_new: int, sampling: dict, ids: list, out=None, stop=None) -> None:
+        out = out or emit
+        try:
+            self._stream(max_new, sampling, self.mlx.detokenize(ids), len(ids),
+                         out=out, stop=stop)
+        except Exception as e:                              # noqa: BLE001 - reported to serve
+            out(f"ERR ik2 bridge: {e}")
+
+    def _run_image(self, max_new: int, sampling: dict, path: str, ids: list,
+                   out=None, stop=None) -> None:
+        out = out or emit
         tmp = []
         try:
             tmp = [save_picture(w, h, rgb) for w, h, rgb in read_pictures(path)]
@@ -351,9 +406,10 @@ class MlxGeneration:
             # picture's grid - collapse the run back to the templated form.
             prompt = self.mlx.detokenize(ids)
             prompt = re.sub(r"(<\|unused_200054\|>)(?:<\|unused_200054\|>)+", r"\1", prompt)
-            self._stream(max_new, sampling, prompt, len(ids), image=tmp)
+            self._stream(max_new, sampling, prompt, len(ids), image=tmp,
+                         out=out, stop=stop)
         except Exception as e:                              # noqa: BLE001 - reported to serve
-            emit(f"ERR ik2 bridge: {e}")
+            out(f"ERR ik2 bridge: {e}")
         finally:
             for name in tmp:
                 try:
@@ -362,12 +418,20 @@ class MlxGeneration:
                     pass
 
     def _stream(self, max_new: int, sampling: dict, prompt: str, n_ids: int,
-                image: list | None = None) -> None:
+                image: list | None = None, out=None, stop=None) -> None:
         from mlx_vlm import stream_generate
+        out = out or emit
+        stop = stop if stop is not None else self.stop
+        try:                                    # concurrent generations each decode on their own MLX stream
+            import mlx.core as mx
+            mx.set_default_stream(mx.new_stream())
+        except Exception:  # noqa: BLE001 - older MLX: the default stream carries it, as before
+            pass
         mlx = self.mlx
-        kwargs = {"max_tokens": max_new,
-                  "draft_model": mlx.draft, "draft_kind": mlx.kind,
-                  "draft_block_size": mlx.draft_block}
+        kwargs = {"max_tokens": max_new}
+        if mlx.draft is not None:
+            kwargs.update(draft_model=mlx.draft, draft_kind=mlx.kind,
+                          draft_block_size=mlx.draft_block)
         if "temperature" in sampling:
             kwargs["temp"] = sampling["temperature"]
         if "top_p" in sampling:
@@ -376,13 +440,13 @@ class MlxGeneration:
             kwargs["top_k"] = sampling["top_k"]
         if image:
             kwargs["image"] = image
-        seg = SegmentServer(mlx.tokenize, mlx.detokenize)
+        seg = SegmentServer(mlx.tokenize, mlx.detokenize, out)
         last = None
         t0 = time.time()
         stream = stream_generate(mlx.model, mlx.processor, prompt, **kwargs)
         try:
             for r in stream:
-                if self.stop.is_set():
+                if stop.is_set():
                     break
                 if r.token is not None:
                     seg.feed(r.token)
@@ -392,7 +456,7 @@ class MlxGeneration:
         seg.flush()
         wall_ms = (time.time() - t0) * 1000
         if last is None:
-            emit("ERR ik2 bridge: mlx produced no output")
+            out("ERR ik2 bridge: mlx produced no output")
             return
         generated = int(last.generation_tokens) or seg.served
         prompt_tokens = int(last.prompt_tokens) or n_ids
@@ -401,8 +465,8 @@ class MlxGeneration:
         decode_ms = (last.generation_tokens / last.generation_tps * 1000
                      if last.generation_tps else wall_ms)
         finish = "length" if last.finish_reason == "length" else "stop"
-        emit(f"DONE {generated} {prompt_tokens} "
-             f"{prompt_ms:.0f} {decode_ms:.0f} {finish}")
+        out(f"DONE {generated} {prompt_tokens} "
+            f"{prompt_ms:.0f} {decode_ms:.0f} {finish}")
 
 
 def main() -> int:
@@ -463,16 +527,17 @@ def run_mlx(opts: dict, ctx: int) -> int:
         return 1
     emit("NOTE ik2 bridge: Inkling 2 Mini via MLX (DSpark)")
     if opts.get("mlx-vision") == "off":
-        emit("INFO engine=ik2-bridge-1.0 vision=off dspark=1")
+        emit("INFO engine=ik2-bridge-1.0 vision=off" + (" dspark=1" if mlx.draft is not None else ""))
     else:
         # the MLX build carries the model's vision tower: serve resizes the pictures and sends
         # their pixels with GENI (serve/ik2_vision.py); the bridge runs the tower in-process.
-        emit("INFO engine=ik2-bridge-1.0 vision=ik2 dspark=1 vision_patch=20 vision_merge=2 "
+        emit("INFO engine=ik2-bridge-1.0 vision=ik2" + (" dspark=1" if mlx.draft is not None else "") + " vision_patch=20 vision_merge=2 "
              "image_token=200054 vision_min_pixels=1600 vision_max_pixels=4194304")
-    emit(f"READY {ctx} stop")
+    multi = max(1, min(8, int(opts.get("parallel", "1"))))
+    emit(f"READY {ctx} stop" + (f" multi={multi}" if multi > 1 else ""))
     gen = MlxGeneration(mlx)
     try:
-        serve_loop(gen)
+        serve_loop(gen, multi)
     finally:
         gen.stop.set()
     return 0
@@ -489,7 +554,40 @@ def _sampling_of(parts: list) -> dict:
     return sampling
 
 
-def serve_loop(gen) -> None:
+def _tagged(rid: int):
+    """The multi protocol's line writer for one request: its T / DONE / ERR
+    lines carry the rid serve routes on; anything else passes through."""
+    def out(line: str) -> None:
+        if line.startswith(("T ", "DONE ", "ERR ")):
+            kind, _, rest = line.partition(" ")
+            emit(f"{kind} {rid} {rest}")
+        else:
+            emit(line)
+    return out
+
+
+def _spawn(active: dict, multi: int, gen, max_new: int, sampling: dict,
+           ids: list, rid: int, image_path) -> None:
+    """Start one rid's generation on its own thread.  Serve caps the
+    in-flight count at the READY multi= it was promised; should more
+    arrive anyway, the oldest is joined first rather than overrun."""
+    for dead in [r for r, (_s, t) in active.items() if not t.is_alive()]:
+        del active[dead]
+    while len(active) >= max(1, multi):
+        _s, t = next(iter(active.values()))
+        t.join()
+        for dead in [r for r, (_s2, t2) in active.items() if not t2.is_alive()]:
+            del active[dead]
+    stop = threading.Event()
+    thread = threading.Thread(target=gen.run_rid,
+                              args=(max_new, sampling, ids, _tagged(rid), stop, image_path),
+                              daemon=True)
+    active[rid] = (stop, thread)
+    thread.start()
+
+
+def serve_loop(gen, multi: int = 1) -> None:
+    active: dict[int, tuple] = {}       # rid -> (stop event, thread); multi mode only
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -498,17 +596,23 @@ def serve_loop(gen) -> None:
             # an image request: GENI <max_new> [key=value ...] <pictures file> <token ids>.
             # Only a backend with start_image (the MLX one) can take it - serve sends the
             # resized pixels in the file; the llama backend fails it cleanly instead of hanging.
+            parts = line.split(" ")
+            ids = [int(t) for t in parts[-1].split(",") if t]
+            sampling = _sampling_of(parts[2:-2])
+            rid = sampling.pop("rid", None)
+            if rid is not None and getattr(gen, "multi_ok", False):
+                if not hasattr(gen, "start_image"):
+                    emit(f"ERR {rid} ik2 bridge: images are not supported through the bridge")
+                    continue
+                _spawn(active, multi, gen, int(parts[1]), sampling, ids, rid, parts[-2])
+                continue
             if gen.thread and gen.thread.is_alive():
                 gen.thread.join()
             if not hasattr(gen, "start_image"):
                 emit("ERR ik2 bridge: images are not supported through the bridge")
                 continue
-            parts = line.split(" ")
-            ids = [int(t) for t in parts[-1].split(",") if t]
-            gen.start_image(int(parts[1]), _sampling_of(parts[2:-2]), parts[-2], ids)
+            gen.start_image(int(parts[1]), sampling, parts[-2], ids)
         elif line.startswith("GEN "):
-            if gen.thread and gen.thread.is_alive():
-                gen.thread.join()
             parts = line.split(" ")
             max_new = int(parts[1])
             sampling = {}
@@ -519,12 +623,29 @@ def serve_loop(gen) -> None:
                 except ValueError:
                     pass
             ids = [int(t) for t in parts[-1].split(",") if t]
+            rid = sampling.pop("rid", None)
+            if rid is not None and getattr(gen, "multi_ok", False):
+                _spawn(active, multi, gen, max_new, sampling, ids, rid, None)
+                continue
+            if gen.thread and gen.thread.is_alive():
+                gen.thread.join()
             gen.start(max_new, sampling, ids)
+        elif line.startswith("STOP ") or line.startswith("PAUSE "):
+            try:
+                rid = int(line.split()[1])
+            except (IndexError, ValueError):
+                continue
+            if rid in active:
+                active[rid][0].set()
         elif line == "STOP":
             gen.stop.set()
+            for stop_ev, _t in active.values():
+                stop_ev.set()
         elif line == "QUIT":
+            for stop_ev, _t in active.values():
+                stop_ev.set()
             break
-        # anything else (WRAP, PAUSE, ...): not advertised in READY, ignored
+        # anything else (WRAP, ...): not advertised in READY, ignored
 
 
 if __name__ == "__main__":
