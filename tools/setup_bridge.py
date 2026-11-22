@@ -42,6 +42,24 @@ HY4_TRIAL_TIME = {2: "about a minute", 3: "one to two minutes"}
 HY4_LANE_TIME = "one minute"
 
 
+def measure_said(line: str) -> str:
+    """maya-hy4's "measuring this PC once" line in plain words, with roughly how long it takes on this kind of PC
+    (serve/server.py's narrate_start says the same): the drafting trial - each choice loaded and timed on a few short
+    answers - or the CPU lane's 4-bit copies and the prompt route."""
+    if "before the first answer: drafting" in line:
+        m = re.search(r"drafting \(([^:()]*):", line)
+        n = len(m.group(1).split(", ")) if m else 3
+        return (f"which drafting answers fastest: {n} choices, each loaded and timed on a few short answers - "
+                f"roughly {HY4_TRIAL_TIME.get(n, HY4_TRIAL_TIME[3])}")
+    return "the CPU lane's 4-bit copies and the prompt route - roughly " + HY4_LANE_TIME
+
+
+# (roughly how long maya-hy4's first-start measurements take - measured on a GPU holding the whole model and on GPUs
+#  with the CPU lane; serve/server.py's HY4_TRIAL_TIME / HY4_LANE_TIME are the same)
+HY4_TRIAL_TIME = {2: "about a minute", 3: "one to two minutes"}
+HY4_LANE_TIME = "one minute"
+
+
 def curl_meter(line: str):
     """(share done, what to show) from a line of curl's progress meter, or None.  Its columns: % Total, Total,
     % Received, Received, % Xferd, Xferd, Dload, Upload, Time Total, Spent, Left, Current - e.g.

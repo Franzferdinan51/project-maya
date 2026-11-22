@@ -781,7 +781,8 @@ QWEN_QUANTS = ("q5_k_m", QWEN_UD)
 # Hy4-Flash (v1.1.68): Tencent's tencent/Hy4-flash (hy_v4_flash, 220B with its n-gram tables: 42 layers and an MTP
 # block, MLA attention with a sliding window and 12 indexed layers, 512 experts, 16 a token, 4 hyper-connection streams,
 # Engram) on its own engine maya-hy4 (src/hy4; NVIDIA: CUDA, Linux and Windows, V100 on; AMD: HIP, Linux - a
-# unified-memory APU (Strix Halo / Gorgon Halo) or Radeon cards; no Mac engine yet),
+# unified-memory APU (Strix Halo / Gorgon Halo) or Radeon cards - and Windows, experimental (not run by us yet); no Mac
+# engine yet),
 # which reads GGUF sets in place (packed by tools/hy4/pack_gguf.py).  tools/hy4/download.json is the one table of its
 # files: Project Maya's own quants ("quants": which sizes are uploaded) and Tencent's own Q4_K_M from AngelSlim
 # ("others": pinned, sha256-checked - the one set with the MTP block, so the one that drafts: --mtp; run on RTX 30 /
@@ -792,9 +793,9 @@ QWEN_QUANTS = ("q5_k_m", QWEN_UD)
 # every set, from Maya's repo: downloaded once, hard-linked) is read from the SSD page by page, never loaded into RAM.
 # Pictures: the model's vision tower (the mmproj file beside the set - Maya's own Q8_0 one for every Maya size,
 # AngelSlim's BF16 for the Q4_K_M; not with --no-vision) runs in the engine a picture at a time: its weights stay in the
-# file, a picture's room (HY4_VISION_GIB; a smaller picture's where the VRAM holds no more - the engine says the size,
-# the server resizes to it) is kept free on the main GPU - where the model leaves none the setup turns pictures off
-# and says so.  It thinks at one level (high) or not at all (no_think); its sampling is its
+# file, and a picture's room (HY4_VISION_GIB while it is read) is lent by the engine's prompt buffers, idle then -
+# no VRAM is kept for pictures, so every card that runs the model reads them at full size (an 8 GB card's buffers at
+# its 256-token chunk: 1.0 GB).  It thinks at one level (high) or not at all (no_think); its sampling is its
 # generation_config.json's (maya_quants.MODEL_DEFAULTS["hy4"]); one request at a time.  Each Maya size in <models
 # folder>/<its full name> (a layout of it: <name>-8GB), its config maya-hy4-flash-maya-xs.json; the Q4_K_M in <models
 # folder>/Hy4-flash, its config maya-hy4-flash.json.
@@ -821,10 +822,19 @@ HY4_Q4_LONG_SHARE = 0.25                           # (the cache in 8-bit rows: a
 # (Maya's sizes draft with Tencent's MTP block from a file of its own - download.json's "mtp": the engine rounds its BF16
 #  matrices to Q8_0, HY4_MTP_VRAM of the file's bytes, always in VRAM, and keeps a prompt chunk of rows beside it)
 HY4_MTP_VRAM = 0.56
-HY4_VISION_GIB = 0.81                              # (the engine's room for its largest picture, 2048 x 2048: 828 MB of the main GPU)
-# (... and for the smallest picture budget it takes, a sixteenth of the largest: 512 x 512 - src/hy4/hy4_vision.cu's
-#  layout: the weights' two slots, the attention's scores, cuBLAS's workspace and the patches' rows)
-HY4_VISION_MIN_GIB = 0.21
+# (... and where the block does not fit, with the size's DFly2 drafter - its "drafter": its matrices as they are in the
+#  file, beside them its lists and rows, under HY4_DFLY2_EXTRA bytes)
+HY4_DFLY2_EXTRA = 32 << 20
+# (where both fit, which drafts is measured on the PC - speed_calibration_hy4: a short A/B, the faster kept unless
+#  within HY4_DRAFT_TIE, where this rule stays; until it runs, the rule: the faster for the size on the V100 measured
+#  (32 and 16 GB, server answers of code and chat, greedy and sampled): XS DFly2 (+10-20% over the block), S the block
+#  (+5-35% on chat), L a tie (DFly2 ahead on greedy code, the block on sampled chat: the block kept); M not measured)
+HY4_DRAFT_RULE = {"maya-xs": "dfly2", "maya-s": "mtp", "maya-m": "mtp", "maya-l": "mtp"}
+HY4_DRAFT_TIE = 0.02
+HY4_DRAFT_PROBE = {"mixed": True, "tokens": 512, "answer": 128, "warm": 32}
+HY4_VISION_GIB = 0.81                              # (the engine's room for its largest picture, 2048 x 2048: 828 MB of the main GPU while it is read)
+# (lent by the prompt buffers - src/hy4/hy4_model.cu's vis_encode: no VRAM of its own; the 8 GB layout's buffers at its
+#  256-token chunk come to 1013 MB on an RTX 3050 at 4K-32K, so the fit counts nothing for pictures)
 HY4_DEFAULT_CONTEXT = 65536
 # its cache a context token: the 13 layers that keep every position (the 12 indexed ones and the MTP block) - the latent
 # (512 + 64 rope, F16) and the indexer's pooled keys (128 F32 every 4 positions); the sliding-window layers keep a ring
@@ -842,12 +852,24 @@ HY4_STANDARD = "standard"                          # the layout a size's own "fi
 HY4_FIT_USED_CAP_GIB = 1.0
 HY4_FIT_DISPLAY_GIB = 0.4
 HY4_FIT_MARGIN_GIB = 0.25
+# what a CUDA start takes of a card beside the free VRAM the engine plans with (cudaMemGetInfo) - its context and the
+# driver's share - which nvidia-smi's free figure still holds under Linux, where the sums above were measured (0.57 GiB
+# on a V100 32 GB: a context 308 MiB, the driver 274); under Windows CUDA's own figure has it out already (the display
+# driver keeps it in its budget: a context shows as 68 MiB on an RTX 3050, whose engine draws its DFly2 line 0.48-0.53
+# GiB above CUDA's figure) - hy4_engine_room adds this much back, or what this PC shows of it where that is more: the
+# first guess only, until the engine's first start on the PC measures the figure for its card (HY4_ROOM_STORE)
+HY4_FIT_CUDA_OWN_GIB = 0.5
+# (Windows: CUDA's own share of each card in the setup's terms, as the engine measured it at its first start on this PC
+#  - hy4_room_measure - by PC, card and driver; the setup and the Models page count it from then on)
+HY4_ROOM_STORE = ROOT / "data" / "vram-room.json"
+HY4_KV_RESIDENT = 32768                            # (KV streaming: the global layers' newest positions kept in VRAM)
 # a small-card layout's prompt chunk doubled where it fits: the prompt scratch grows by about 0.9 GiB from 256 to 512
 # tokens (an 8 GB card at 4K: measured) - counted as 0.95, conservatively
 HY4_CHUNK_UP_GIB = 0.95
 # Inkling-2-Mini (an EXPERIMENTAL PREVIEW, PR #1095): thinkingmachines' looped 26B on its own engine maya-ik2 (src/ik2,
-# docs/INKLING2.md section 8) - NVIDIA only, Linux only, one GPU of 24 GB or more, RTX 30 / A100 and newer (the
-# engine's kernels: mma.sync m16n8k16, cp.async); every expert in VRAM (the resident token path).
+# docs/INKLING2.md section 8) - NVIDIA only, Linux only, V100 / RTX 20 and newer with 8 GB or more (the engine's
+# kernels per architecture: Volta's mma.m8n8k4, Turing's and Ampere's mma.sync); the experts the card does not hold
+# stay in RAM (about 13 GB of RAM with an 8 GB card; tools/ik2_fit.py); AMD: RDNA 3 / 3.5 / 4 or a Halo / APU with 24 GB.
 # Its file: unsloth's UD-Q4_K_XL (Unsloth's looped layout, which the engine reads) - tools/ik2/download.json, pinned
 # by size and sha256; the setup offers no drafter (the engine's --draft is by hand, docs/INKLING2.md).  Pictures: the
 # model's vision tower as unsloth's mmproj-BF16.gguf (download.json's "vision", beside the GGUF; not with --no-vision),
@@ -866,7 +888,8 @@ IK2_TOKENIZER_TOOLS = ("tools/strata_tokenizer.py", "tools/ik2/chat_template.jin
 IK2_DIR = "maya-ik2"                               # (in the model's folder: tokenizer/, sources.json)
 IK2_MODEL_NAME = "inkling-2-mini"
 IK2_MIN_CC = IK2F.MIN_CC
-FAMILIES = ("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
+IK2_PROFILE = ROOT / "data" / "expert-profile-ik2mini.bin"   # (the offload path's starting VRAM tier: maya-ik2's IK2_WARM)
+FAMILIES =("glm", "deepseek", "minimax", "qwen", "hy4", "ik2")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
 
@@ -1303,6 +1326,7 @@ def vs_2026(vcvars) -> bool:
 
 
 def check_hip_pc(a, installed=False, text_only=True) -> dict:
+    """a.gpus_before: the GPUs this model's config ran on - a setup again without --gpu / --gpus keeps them."""
     if not WIN and (not sys.platform.startswith("linux") or S.is_wsl()):
         fail("Maya's HIP backend runs on native Linux or Windows")
     vcvars = S.find_vcvars(cuda=False) if WIN else None
@@ -1329,7 +1353,11 @@ def check_hip_pc(a, installed=False, text_only=True) -> dict:
              f"check with {hipinfo}")
     elif WIN and len(found) > 1 and any(g.get("source") == "registry" for g in found):
         warn("these GPU numbers are Windows' order (ROCm's hipInfo was not found): HIP's own can differ")
-    if a.gpus:
+    kept = None if (a.gpus or a.gpu is not None) else gpus_before(getattr(a, "gpus_before", None), usable)
+    if kept:                                           # (a setup again: the GPUs its config ran on, said)
+        chosen = [next(g for g in usable if g["index"] == i) for i in kept]
+        ok("GPUs: " + ", ".join(str(i) for i in kept) + " - as set up before (--gpu / --gpus picks others)")
+    elif a.gpus:
         # two or more cards split the layers (each caches the experts of its own portion); the larger card goes first, as it
         # takes the bigger first portion - the order measured on an R9700 + RX 7900 XT
         try:
@@ -1438,6 +1466,7 @@ def check_hip_pc(a, installed=False, text_only=True) -> dict:
              "(https://github.com/mw00/project-maya/issues)")
     select_build_backend("hip")
     return {"backend": "hip", "gpus": chosen, "archs": sorted({g["arch"] for g in chosen}), "rocm": str(root),
+            "amd_found": usable,                       # (the build's archs: every installed model's GPUs - hip_archs_in_use)
             **({"rocm_bin": str(bindir)} if WIN else {})}
 
 
@@ -1549,10 +1578,32 @@ def cuda_lib_dirs(nvcc: str) -> list:
 
 
 # ------------------------------------------------------------------------------------------------ 1. the PC
-def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "") -> list:
-    """The GPUs the model runs on: --gpu / --gpus, else asked when several can share it (all of them recommended)."""
+def gpus_before(before, usable: list) -> list | None:
+    """The GPU numbers a config of this model ran on (its "gpu"), when every one of them is still here and usable -
+    a setup again offers them first (#1066: it took all the GPUs again, adding one the user had left out)."""
+    ids = before if isinstance(before, list) else [before] if isinstance(before, int) else []
+    ids = [i for i in ids if isinstance(i, int)]
+    byid = {g["index"]: g for g in usable}
+    if not ids or len(set(ids)) != len(ids) or any(i not in byid for i in ids):
+        return None
+    return ids
+
+
+def ik2_gpus_asked(a) -> int:
+    """How many GPUs --gpu / --gpus name (0: none named) - Inkling-2-Mini runs on one or two (three or more refused)."""
+    if getattr(a, "gpus", None):
+        return len({x.strip() for x in str(a.gpus).split(",") if x.strip()})
+    return 1 if getattr(a, "gpu", None) is not None else 0
+
+
+def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "", before=None) -> list:
+    """The GPUs the model runs on: --gpu / --gpus, else asked when several can share it (all of them recommended).
+    `before`: the GPUs this model's config ran on - a setup again keeps them (the default answer; --gpus picks
+    others)."""
     byid = {g["index"]: g for g in found}
     usable = [g for g in found if int(g["arch"]) >= min_cc]
+    kept = None if (a.gpus or a.gpu is not None) else \
+        gpus_before(getattr(a, "gpus_before", None) if before is None else before, usable)
     if a.gpus or a.gpu is not None:
         try:
             want = [int(x) for x in str(a.gpus).split(",") if x.strip()] if a.gpus else [a.gpu]
@@ -1571,26 +1622,62 @@ def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "") -> list:
              f"it needs an NVIDIA GPU of compute capability {min_cc / 10:.1f} or newer (" +
              ("V100 and newer; Pascal - Tesla P40 / P100, GTX 10 - is experimental)" if min_cc < 80 else
               "RTX 30 / A100 and newer)"))
+    if family == "ik2":
+        # (Inkling-2-Mini: one GPU, or two on Linux - the larger first, it holds the dense weights and the cache; the
+        #  second takes the experts the first does not hold.  Recommended: one where the largest holds every expert
+        #  at the smallest context - faster there, 2x V100 86.7 against ~74 tok/s - else the two largest)
+        big = sorted(usable, key=lambda g: (-round(g["vram_gb"]), g["index"]))
+        one = [byid[kept[0]]] if kept and len(kept) == 1 else big[:1]
+        if len(big) < 2 or WIN:
+            if len(usable) > 1:
+                ok(f"GPU: {gpu_label(one[0])} - {IK2_SHOWN} runs on one GPU here (--gpu N picks another)")
+            return one
+        two = [byid[i] for i in kept] if kept and len(kept) == 2 else big[:2]
+        p = IK2F.plan_two(two[0]["vram_gb"], two[1]["vram_gb"], IK2F.CONTEXTS[0])
+        opts = [one, two]
+        rec = 0 if p["gpus"] == 1 else 1
+        default = 1 if kept and len(kept) == 2 else 0 if kept else rec
+        labels = [f"{gpu_label(one[0])} only" + (" - it holds every expert" if IK2F.plan(one[0]["vram_gb"],
+                                                                                     IK2F.CONTEXTS[0])["resident"] else ""),
+                  f"{gpu_label(two[0])} + {gpu_label(two[1])} together - the second holds the experts the first does not"]
+        pick = choose("Which GPUs?", [f"{IK2_SHOWN} runs on one GPU, or on two: the first holds the dense weights, the "
+                                      "cache and every prompt,", "the second the experts the first does not (three or "
+                                      "more: not yet)."],
+                      [(lab, "recommended" if i == rec else None, None) for i, lab in enumerate(labels)], default,
+                      a.yes or a.check)
+        return opts[pick]
     best = sorted(usable, key=lambda g: (-round(g["vram_gb"]), g["index"]))
     # A card with under a quarter of the biggest one's VRAM (a 2 GB display card beside 32 GB ones) still gets whole
     # layers of the split and runs out of memory at the pack; the automatic pick leaves it out (--gpus still takes it).
     small = [g for g in best[1:] if g["vram_gb"] < SMALL_GPU_SHARE * best[0]["vram_gb"]]
     for g in small:
-        say(f"    {gpu_label(g)} is left out: too little VRAM beside the others for a part of the split "
-            f"(--gpus takes it anyway)")
+        if not kept or g["index"] not in kept:
+            say(f"    {gpu_label(g)} is left out: too little VRAM beside the others for a part of the split "
+                f"(--gpus takes it anyway)")
     best = [g for g in best if g not in small]
+    kept_gs = [byid[i] for i in kept] if kept else None
+
+    def label(gs):
+        if len(gs) > 2:
+            return (f"all {len(gs)}" if gs == best[:MAX_GPUS] else f"{len(gs)}") + " together: GPUs " + \
+                ", ".join(str(g["index"]) for g in gs) + f" ({sum(g['vram_gb'] for g in gs):.0f} GB of VRAM)"
+        if len(gs) == 2:
+            return f"{gpu_label(gs[0])} + {gpu_label(gs[1])} together"
+        return f"{gpu_label(gs[0])} only"
     if len(best) == 1:
+        if kept_gs and kept_gs != best:                # (chosen before with --gpus: still the answer)
+            ok("GPUs: " + label(kept_gs) + " - as set up before (--gpus picks others)")
+            return kept_gs
         return best
     opts = ([best[:MAX_GPUS]] if len(best) > 2 else []) + [best[:2], best[:1]]
-    labels = []
-    for gs in opts:
-        if len(gs) > 2:
-            labels.append(f"all {len(gs)} together: GPUs " + ", ".join(str(g["index"]) for g in gs) +
-                          f" ({sum(g['vram_gb'] for g in gs):.0f} GB of VRAM)")
-        elif len(gs) == 2:
-            labels.append(f"{gpu_label(gs[0])} + {gpu_label(gs[1])} together")
-        else:
-            labels.append(f"{gpu_label(gs[0])} only")
+    rec, default = 0, 0                                # (the recommended answer, and the one Enter / --yes takes)
+    if kept_gs:
+        at = next((i for i, gs in enumerate(opts) if [g["index"] for g in gs] == kept), None)
+        if at is None:                                 # (another set: offered first, the recommended one after it)
+            opts.insert(0, kept_gs)
+            at, rec = 0, 1
+        default = at
+    labels = [label(gs) + (" - as set up before" if kept_gs and i == default else "") for i, gs in enumerate(opts)]
     intro = (["MiniMax-M3.1-Flash runs best on all of them: the GPUs share the layers (or split them in groups where",
               "that measures faster), and the more VRAM, the fewer experts the CPU computes."]
              if family == "minimax" else
@@ -1604,7 +1691,7 @@ def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "") -> list:
               "of its", "own layers, so together they hold more of them (V100s: ~50 tok/s benchmark on two, ~24 "
               "on one)."])
     pick = choose("Which GPUs?", intro,
-                  [(label, "recommended" if i == 0 else None, None) for i, label in enumerate(labels)], 0,
+                  [(lab, "recommended" if i == rec else None, None) for i, lab in enumerate(labels)], default,
                   a.yes or a.check,
                   ["(--gpus picks any others, e.g. --gpus 0,2,5; a model with a draft block drafts tokens on two GPUs "
                    "or more)"] if len(best) > 2 and S.UI is None else [])   # (the plain setup's; not on the screen)
@@ -1642,7 +1729,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
              "Linux) - if it does not start or its answers look wrong, docs/AMD_MAYA.md says how to report it and "
              "what to use instead")
     if a.backend == "hip":
-        return check_hip_pc(a, text_only=not (mm3 or hy4))
+        return check_hip_pc(a, text_only=not (mm3 or hy4 or ik2))   # (Inkling 2: pictures on AMD too)
     if a.backend == "metal":
         if family != "glm":
             fail(f"Maya's setup runs GLM-5.3-Flash only on a Mac (not {ds4 and DS4 or mm3 and MM3 or hy4 and HY4 or QWEN_SHOWN})",
@@ -1669,7 +1756,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
              ("install the NVIDIA driver (https://www.nvidia.com/drivers)" if WIN else
               "install the NVIDIA driver (Ubuntu: sudo ubuntu-drivers install)") + f", restart, and run {ME} again")
     if ik2:                                            # (no card new or large enough: the one line, before the list)
-        why = IK2F.unsupported("cuda", False, 0, found)
+        why = IK2F.unsupported("cuda", False, 0, found, mem_gb()[0])
         if why:
             fail(why)
     say("  NVIDIA GPUs:")
@@ -1678,16 +1765,18 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
                                        "can be used (Pascal: experimental)" if int(g["arch"]) >= min_cc else
                                        f"too old (this model needs compute capability {min_cc / 10:.1f} or newer)"))
     chosen = choose_gpus(a, found, min_cc, family)
-    if ik2:                                            # (the card picked: 24 GB or more)
-        why = IK2F.unsupported("cuda", False, len(chosen), chosen)
+    if ik2:                                            # (the cards picked: 8 GB or more; two: the larger first)
+        why = IK2F.unsupported("cuda", False, len(chosen), chosen, mem_gb()[0])
         if why:
             fail(why)
+        chosen = sorted(chosen, key=lambda g: -float(g["vram_gb"] or 0))
     archs = sorted({int(g["arch"]) for g in chosen})
     vram = sum(g["vram_gb"] for g in chosen)
     ok("using " + " + ".join(gpu_label(g) for g in chosen) +
        ("" if len(chosen) < 2 else
         ": the equal GPUs among them share every layer (tensor parallel), else the layers are split across them"
-        if family == "hy4" else f": the model's layers are split across the {len(chosen)}"))
+        if family == "hy4" else ": the experts are split across the two (the first holds the rest)" if ik2 else
+        f": the model's layers are split across the {len(chosen)}"))
     if ik2 and any(g.get("unified_memory") for g in chosen):
         warn(f"{IK2_SHOWN} has not been run yet on a GPU whose memory is the system's RAM: untested here")
     elif any(g.get("unified_memory") for g in chosen):
@@ -2054,7 +2143,7 @@ def choose_family(a, prev: dict) -> str:
                       "and newer, Linux." if q4 else "")))
     else:
         keys = tuple(k for k in keys if k != "hy4")
-    # Inkling-2-Mini, after it: an experimental preview (PR #1095) - NVIDIA, Linux, one GPU of 24 GB or more
+    # Inkling-2-Mini, after it: an experimental preview (PR #1095) - Linux, one NVIDIA GPU of 8 GB or more or an AMD one of 24 GB
     rows.append((f"{IK2_SHOWN} (experimental)", None, ik2_about()))
     was53 = default == "glm" and bool(prev) and G53.config_is_glm_dsa(prev)
     pick = keys[choose("Model?", ["Which model to set up:"], rows, keys.index("glm53" if was53 else default), a.yes)]
@@ -2167,6 +2256,48 @@ def gpu_used_mib() -> dict:
         except ValueError:
             pass
     return used
+
+
+# (run by cuda_room_bytes in a process of its own - the setup itself never holds a CUDA context: each NVIDIA device's
+#  free VRAM as CUDA's driver says it with one context held - the engine's own reading at its start, cudaMemGetInfo -
+#  then with a second context beside it, and its total; {PCI bus id: [free, free with two, total]} in bytes)
+CUDA_ROOM_PROBE = r"""
+import ctypes, json, sys
+cu = ctypes.WinDLL("nvcuda.dll") if sys.platform == "win32" else ctypes.CDLL("libcuda.so.1")
+out = {}
+n = ctypes.c_int(0)
+if cu.cuInit(0) == 0 and cu.cuDeviceGetCount(ctypes.byref(n)) == 0:
+    for i in range(n.value):
+        dev, bus, p, c = ctypes.c_int(0), ctypes.create_string_buffer(32), ctypes.c_void_p(), ctypes.c_void_p()
+        if cu.cuDeviceGet(ctypes.byref(dev), i) or cu.cuDeviceGetPCIBusId(bus, 32, dev) or \
+                cu.cuDevicePrimaryCtxRetain(ctypes.byref(p), dev):
+            continue
+        one, two, tot = ctypes.c_size_t(0), ctypes.c_size_t(0), ctypes.c_size_t(0)
+        ok = cu.cuCtxSetCurrent(p) == 0 and cu.cuMemGetInfo_v2(ctypes.byref(one), ctypes.byref(tot)) == 0
+        if ok and cu.cuCtxCreate_v2(ctypes.byref(c), 0, dev) == 0:
+            ok = cu.cuMemGetInfo_v2(ctypes.byref(two), ctypes.byref(tot)) == 0
+            cu.cuCtxDestroy_v2(c)
+        else:
+            ok = False
+        cu.cuCtxSetCurrent(None)
+        cu.cuDevicePrimaryCtxRelease_v2(dev)
+        if ok:
+            out[bus.value.decode("ascii", "replace")] = [one.value, two.value, tot.value]
+print(json.dumps(out))
+"""
+
+
+def cuda_room_bytes() -> dict:
+    """{PCI id (setup.py's _pci_key form): (free, free with a second context, total) in bytes} - what CUDA's driver
+    says of each NVIDIA device's VRAM with a context held (CUDA_ROOM_PROBE, in a process of its own); {} where it
+    cannot be asked (no driver, a failing call, a timeout)."""
+    try:
+        txt = subprocess.run([sys.executable, "-I", "-c", CUDA_ROOM_PROBE], capture_output=True, text=True,
+                             timeout=60).stdout
+        got = json.loads(txt.strip().splitlines()[-1]) if txt.strip() else {}
+        return {S._pci_key(k): tuple(int(x) for x in v) for k, v in got.items() if len(v) == 3}
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, IndexError):
+        return {}
 
 
 def glm_fit_state_mib(ctx: int, kv: str | None = None) -> float:
@@ -2643,10 +2774,11 @@ def toolkit_root_defs(nvcc) -> list:
 
 
 def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, soft=False,
-                   target: str = "maya") -> dict | None:
-    """cmake configure + build of the `maya` target (DeepSeek: `maya-ds4`) in build/; the exact commands are
-    printed as they run.  soft: an update's rebuild (refresh_engine) - a failure stops with the reason and says that
-    the engine from before is not started (#805)."""
+                   target: str = "maya", also=()) -> dict | None:
+    """cmake configure + build of the `maya` target (DeepSeek: `maya-ds4`) in build/ - and of the targets in `also`
+    (--rebuild: every engine the PC uses) in the same build; the exact commands are printed as they run.  soft: an
+    update's rebuild (refresh_engine) - a failure stops with the reason and says that the engine from before is not
+    started (#805)."""
     def stop(what):
         msg = f"the engine build stopped while {what} (the reason is above)"
         hint = ("common causes: 'unsupported Microsoft Visual Studio version' - CUDA 12.x needs Visual Studio 2019 or "
@@ -2686,9 +2818,10 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
     env = dict(os.environ, CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES=",".join(str(i) for i in gpu_ids))
     # nvcc takes 2-4 GB per job on the big kernels: half the threads, and no more jobs than RAM / 4 GB
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
-    build = [cmake, "--build", str(BUILD), "--target", target, "-j", str(jobs)]
-    say("  Compiling the engine for " + ", ".join(f"sm_{x}" for x in archs) +
-        " (10-30 minutes the first time, a few minutes after an update) ...")
+    targets = [target] + [t for t in also if t != target]
+    build = [cmake, "--build", str(BUILD), "--target", *targets, "-j", str(jobs)]
+    say("  Compiling the engine" + ("s " + ", ".join(targets) if len(targets) > 1 else "") + " for " +
+        ", ".join(f"sm_{x}" for x in archs) + " (10-30 minutes the first time, a few minutes after an update) ...")
     stopped = cmake_steps(conf, build, env, "build-maya.bat", nvcc=nvcc)
     if stopped:
         return stop(stopped)
@@ -2697,9 +2830,10 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
     same = old.get("src") == src and old.get("archs") == archs and old.get("nvcc") == nvcc
     meta = {"src": src, "archs": archs, "gpu_ids": list(gpu_ids), "nvcc": nvcc, "host_compiler": host_compiler,
             "llama": str(llama), "lib_dirs": cuda_lib_dirs(nvcc), "date": time.strftime("%Y-%m-%d %H:%M"),
-            "targets": sorted({target} | (set(old.get("targets") or ["maya"]) if same else set()))}
+            "targets": sorted(set(targets) | (set(old.get("targets") or ["maya"]) if same else set()))}
     STAMP.write_text(json.dumps(meta, indent=1), encoding="utf-8")
-    ok(f"engine compiled: {exe_for_target(target)}")
+    ok(("engines compiled: " if len(targets) > 1 else "engine compiled: ") +
+       ", ".join(str(exe_for_target(t)) for t in targets))
     return meta
 
 
@@ -2862,11 +2996,24 @@ def copy_hip_dlls(bindir: Path, dest: Path) -> None:
                 warn(f"could not copy {dll.name} next to {dest} ({e})")
 
 
-def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str = "maya") -> dict | None:
+def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str = "maya", also=()) -> dict | None:
+    """The HIP build of `target` - and of the targets in `also` (--rebuild: every engine the PC uses) - in build-hip/,
+    for this setup's AMD GPUs and those every installed model of build-hip/ runs on (hip_archs_in_use: one binary
+    each for all of them, as the CUDA build); where this ROCm cannot compile for one of the others, this model's."""
     cmake = pick_cmake()
     if not cmake:
         fail("CMake 3.24 or newer is needed")
     root, clang, bindir, env = hip_toolchain(pc)
+    own = sorted(str(x) for x in pc["archs"])
+    archs = hip_archs_in_use(own, pc.get("amd_found"))
+    if archs != own and not hip_builds(root, env, clang, archs):
+        warn("another installed model runs on " + ", ".join(x for x in archs if x not in own) + f", which the ROCm in "
+             f"{root} does not compile for: the engine is compiled for this model's GPUs only")
+        archs = own
+    elif archs != own:
+        ok("also compiled for " + ", ".join(x for x in archs if x not in own) + " (the GPUs another installed model "
+           "runs on)")
+    pc = dict(pc, archs=archs)
     conf = [cmake]
     if WIN:
         # as tools\hip\build_maya_windows.bat, which built it on Windows (#54): ROCm's clang for the host code too, in
@@ -2890,9 +3037,11 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
     if not WIN and root == Path("/usr"):   # a distribution's ROCm: CMake's HIP check looks for hip-lang under this root
         conf.append(f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root.as_posix()}")
     jobs = max(1, min(4, (os.cpu_count() or 4) // 2))
-    say("  Compiling Maya for AMD " + ", ".join(pc["archs"]) + " ...")
+    targets = [target] + [t for t in also if t != target]
+    say("  Compiling Maya" + (" (" + ", ".join(targets) + ")" if len(targets) > 1 else "") + " for AMD " +
+        ", ".join(pc["archs"]) + " ...")
     vcvars = S.find_vcvars(cuda=False) if WIN else None
-    if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", target, "-j", str(jobs)], env,
+    if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", *targets, "-j", str(jobs)], env,
                    "build-maya-hip.bat", vcvars=vcvars):
         if soft:
             # (not the engine compiled before: it is from the older source, and this version's server and config
@@ -2912,9 +3061,10 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
     meta = {"backend": "hip", "src": src, "archs": pc["archs"], "rocm": str(root),
             "gpu_ids": [g["index"] for g in pc["gpus"]], "llama": str(llama),
             "lib_dirs": [str(bindir if WIN else root / "lib")], "date": time.strftime("%Y-%m-%d %H:%M"),
-            "targets": sorted({target} | (set(old.get("targets") or ["maya"]) if same else set()))}
+            "targets": sorted(set(targets) | (set(old.get("targets") or ["maya"]) if same else set()))}
     STAMP.write_text(json.dumps(meta, indent=1), encoding="utf-8")
-    ok(f"engine compiled: {exe_for_target(target)}")
+    ok(("engines compiled: " if len(targets) > 1 else "engine compiled: ") +
+       ", ".join(str(exe_for_target(t)) for t in targets))
     return meta
 
 
@@ -3057,22 +3207,40 @@ def build_step(a, pc, llama: Path, target: str = "maya") -> dict:
             ok(f"Metal engine already compiled: {exe}")
             return meta
         return compile_engine_metal(llama, src)
+    # --rebuild: every engine this PC uses, with the same compiler and GPUs (not only this model's - #1066)
+    every = engines_in_use(target) if a.rebuild else [target]
+    if len(every) > 1:
+        say("  --rebuild: compiling every engine this PC uses (" + ", ".join(every) + "), not only this model's")
     if pc.get("backend") == "hip":
+        # (compiled for this model's GPUs and the other installed models' already: nothing to do - hip_archs_in_use)
         if (exe.exists() and not a.rebuild and meta.get("backend") == "hip" and meta.get("src") == src
-                and meta.get("archs") == pc["archs"] and meta.get("rocm") == pc["rocm"]
+                and set(hip_archs_in_use(pc["archs"], pc.get("amd_found"))) <= set(meta.get("archs") or [])
+                and meta.get("rocm") == pc["rocm"]
                 and target in (meta.get("targets") or ["maya"])):
             ok(f"HIP engine already compiled: {exe}")
             return meta
-        return compile_engine_hip(pc, llama, src, target=target)
-    if (exe.exists() and not a.rebuild and meta.get("src") == src and set(pc["archs"]) <= set(meta.get("archs", []))
+        return compile_engine_hip(pc, llama, src, target=target, also=every[1:])
+    archs = archs_in_use(pc["archs"])                  # (the other installed models' cards too)
+    if (exe.exists() and not a.rebuild and meta.get("src") == src and set(archs) <= set(meta.get("archs", []))
             and target in (meta.get("targets") or ["maya"])
             and (not a.nvcc or a.nvcc == meta.get("nvcc"))
             and (not a.host_compiler or a.host_compiler == meta.get("host_compiler"))):
         ok(f"engine already compiled for " + ", ".join(f"sm_{x}" for x in meta["archs"]) + f": {exe}")
         return meta
-    nvcc, hc = toolchain_for(pc["archs"], a.nvcc, a.host_compiler)
+    nvcc, hc = toolchain_for(archs, a.nvcc, a.host_compiler)
+    if archs != sorted(int(x) for x in pc["archs"]) and not nvcc_builds(nvcc, archs):
+        # (no toolkit here compiles for this model's cards and another model's together: this model's, as before)
+        warn("another installed model runs on " + ", ".join(f"sm_{x}" for x in archs if x not in pc["archs"]) +
+             f", which {nvcc} does not compile for beside " + ", ".join(f"sm_{x}" for x in pc["archs"]) +
+             ": the engine is compiled for this model's GPUs only")
+        archs = sorted(int(x) for x in pc["archs"])
+        nvcc, hc = toolchain_for(archs, a.nvcc, a.host_compiler)
+    elif archs != sorted(int(x) for x in pc["archs"]):
+        ok("also compiled for " + ", ".join(f"sm_{x}" for x in archs if x not in pc["archs"]) +
+           " (the GPUs another installed model runs on)")
     pc["nvcc"] = nvcc or pc["nvcc"]
-    return compile_engine(pc["archs"], [g["index"] for g in pc["gpus"]], pc["nvcc"], hc, llama, src, target=target)
+    return compile_engine(archs, [g["index"] for g in pc["gpus"]], pc["nvcc"], hc, llama, src, target=target,
+                          also=every[1:])
 
 
 def mixed_builds(a, pc, llama: Path, target: str, quiet: bool = False) -> None:
@@ -3195,7 +3363,11 @@ def refresh_engine(cfg: dict) -> None:
              "not started",
              f"{ME} --setup --rebuild finds the compiler and compiles the engine again")
     gpu_ids = meta.get("gpu_ids") or (cfg.get("gpu") if isinstance(cfg.get("gpu"), list) else [0])
-    compile_engine(meta["archs"], gpu_ids, nvcc, meta.get("host_compiler"), llama, src, soft=True, target=target)
+    # (the cards this config runs on too: the last setup may have been another model's, on other GPUs - #1066)
+    archs, extra = meta["archs"], config_gpu_archs(cfg) - {int(x) for x in meta["archs"]}
+    if extra and nvcc_builds(nvcc, sorted({int(x) for x in meta["archs"]} | extra)):
+        archs = sorted({int(x) for x in meta["archs"]} | extra)
+    compile_engine(archs, gpu_ids, nvcc, meta.get("host_compiler"), llama, src, soft=True, target=target)
 
 
 # ------------------------------------------------------------------------------------------------ 5. the model
@@ -4178,17 +4350,48 @@ def _fetch_ablate_file(url: str, dst: Path, part: Path, model: str, repo: str, n
     return why
 
 
-def ablate_step(cfg_path: Path, key: str, models: Path) -> None:
+def had_ablation(cfg: dict) -> bool:
+    """Whether a config loads a refusal direction (its "ablate" record, or --ablate in its args)."""
+    return isinstance(cfg.get("ablate"), dict) or "--ablate" in [str(x) for x in cfg.get("args") or []]
+
+
+def ablate_step(cfg_path: Path, key: str, models: Path, a=None) -> None:
     """The config's refusal direction: the downloaded file recorded as cfg["ablate"] (its model and quant, a default
     set on the Models page kept) with --ablate FILE --ablate-default off in the engine's args.  A file named by hand
-    (outside the setup's folder) stays as it is; without a file the three flags go."""
+    (outside the setup's folder) stays as it is; without a file the three flags go.
+    A setup again over a config without a direction leaves it without (#1066: the user's config, not this model's
+    default for a new one) - unless that config's own setup found none to download (installer "ablate": "none": tried
+    again) or --ablation on asks for it; --ablation off takes it out.  The choice is recorded in installer "ablate"."""
     from serve import models as SM
     cfg = read_json(cfg_path)
-    old = cfg.get("ablate") if isinstance(cfg.get("ablate"), dict) else {}
+    before = config_before(cfg_path)                   # (None: a new config)
+    want = getattr(a, "ablation", None)
+    inst = cfg.setdefault("installer", {})
+
+    def without(why: str, mark: str) -> None:
+        cfg.pop("ablate", None)
+        cfg["args"] = SM.ablate_args(cfg, list(cfg.get("args") or []))
+        inst["ablate"] = mark
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+        ok(why)
+    if want == "off":
+        return without("refusal ablation: left out (--ablation off; --ablation on loads it again)", "off")
+    if want is None and before is not None and not had_ablation(before) and \
+            (before.get("installer") or {}).get("ablate") != "none":
+        return without("refusal ablation: the config before had none, so it stays without "
+                       f"({ME} --setup --ablation on loads the direction, off by default)", "off")
+    # (the config before's record: the Models page's default and scale, a file set by hand - the writers start anew)
+    old = cfg.get("ablate") if isinstance(cfg.get("ablate"), dict) else \
+        before.get("ablate") if before is not None and isinstance(before.get("ablate"), dict) else {}
     mine = models / ABLATE_DIR
     hand = old.get("file") and Path(str(old["file"])).expanduser().is_file() and \
         Path(str(old["file"])).expanduser().resolve().parent != mine.resolve()
     if hand:
+        if cfg.get("ablate") != old:                   # (the config before's: written back into the new one)
+            cfg["ablate"] = old
+            cfg["args"] = SM.ablate_args(cfg, list(cfg.get("args") or []))
+            inst["ablate"] = "loaded"
+            cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
         ok(f"refusal ablation: the direction file set by hand stays ({old['file']})")
         return
     p = fetch_ablate_direction(key, models)
@@ -4200,17 +4403,19 @@ def ablate_step(cfg_path: Path, key: str, models: Path) -> None:
         md = GR.GGUFFile(p).metadata
         cfg["ablate"] = {**kept, "file": str(p), "model": md.get("maya.ablate.model") or ABLATE_DIRECTIONS[key][0],
                          **({"fitted_on": md["maya.ablate.fitted_on"]} if md.get("maya.ablate.fitted_on") else {})}
+    inst["ablate"] = "none" if p is None else "loaded"   # (none: no direction to download - a setup again tries)
     cfg["args"] = SM.ablate_args(cfg, list(cfg.get("args") or []))
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
 
 
 def compile_vision(pc, meta, llama: Path, src: str) -> bool:
-    """maya-vision: llama.cpp's mtmd at the pinned commit with GLM-5.3-Flash's vision tower added
-    (tools/vision/glm5next_patch.py, idempotent), for the same GPUs and toolkit as the engine."""
+    """maya-vision: llama.cpp's mtmd at the pinned commit with GLM-5.3-Flash's and Inkling 2's vision towers added
+    (tools/vision/glm5next_patch.py, inkling2v_patch.py, idempotent), for the same GPUs and toolkit as the engine."""
     cmake = pick_cmake()
     if cmake is None:
         return False
     run([sys.executable, str(ROOT / "tools" / "vision" / "glm5next_patch.py"), str(llama)])
+    run([sys.executable, str(ROOT / "tools" / "vision" / "inkling2v_patch.py"), str(llama)])
     gen = re.search(r"^CMAKE_GENERATOR:INTERNAL=(.*)$", (VBUILD / "CMakeCache.txt").read_text(errors="replace"), re.M) \
         if (VBUILD / "CMakeCache.txt").exists() else None
     ninja = venv_tool("ninja") or shutil.which("ninja")
@@ -4415,6 +4620,33 @@ def glm_config_path(pc: dict, quant: str) -> Path:
     return ROOT / f"maya-{quant.lower()}{({'hip': '-hip', 'metal': '-metal'}.get(pc.get('backend'), ''))}.json"
 
 
+# the environment settings the GLM setup itself writes (or leaves out) by the PC and GPUs chosen - a setup again works
+# them out anew instead of keeping the config before's
+GLM_SETUP_ENV = ("MAYA_GLM_RESERVE_MB", "MAYA_GLM_RAM_HEADROOM_GB", "MAYA_GLM_SPLIT", "MAYA_GLM_MTP_DECODE",
+                 "MAYA_GLM_PARALLEL_LOAD", "MAYA_GLM_PREFILL_SUB", "MAYA_GLM_PREFILL_MB", "MAYA_HIPBLASLT_TUNING")
+
+# the server's own settings, set in a config by hand (or with --port / --host / --api-key at a setup): every model's
+# setup again keeps them from the config before (#1089: an update's setup turned "model_management": false back on)
+# - where it listens, its API key, the pages it lets in, the MCP servers, the model management, the web page (an
+# API-only server), the idle unload, the loop guard, the output limit fitted to the context
+SERVER_KEYS = ("host", "port", "api_key", "cors_origins", "mcp_servers", "model_management", "web_ui",
+               "idle_unload_s", "loop_guard", "fit_max_tokens")
+
+
+def keep_server_settings(cfg: dict, old: dict, a, extra: tuple = ()) -> list:
+    """The config before's SERVER_KEYS (and a family's own `extra` keys) into the new config `cfg`, except a --port /
+    --host / --api-key given now (it wins): the keys that differ from what this setup wrote."""
+    given = {"port": getattr(a, "port", None), "host": getattr(a, "host", None), "api_key": getattr(a, "api_key", None)}
+    kept = []
+    for k in SERVER_KEYS + tuple(extra):
+        if (old or {}).get(k) is None or given.get(k):
+            continue
+        if cfg.get(k) != old[k]:
+            kept.append(k)
+        cfg[k] = old[k]
+    return kept
+
+
 def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vision: dict | None,
                  choice: tuple | None = None, dflash: Path | None = None, gguf: Path | None = None) -> Path:
     step(8, "the configuration and the start script")
@@ -4563,7 +4795,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     cal = saved_calibration(cfg, any_context=True)     # tuned on this PC for this model (and context) before
     if cal is not None:
         tuned = CAL.apply(cfg.get("env") or {}, cal.get("settings") or {})
-        tuned.update(env)                              # (an --env given now wins)
+        tuned.update(forced)                           # (an --env given now wins)
         if tuned:
             cfg["env"] = tuned
         if cal.get("gpu_env"):                         # (where it was measured: stale_tuning at a start compares)
@@ -4574,7 +4806,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
             ok(f"(tuned at context {cal['context']}: {ME} --calibrate tunes this context too)")
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
-    ok(f"start script: {write_run_script(cfg_path, port)}")
+    ok(f"start script: {write_run_script(cfg_path, cfg['port'])}")
     return cfg_path
 
 
@@ -4604,6 +4836,25 @@ def set_arg(args: list, flag: str, value) -> None:
         args[args.index(flag) + 1] = str(value)
     else:
         args += [flag, str(value)]
+
+
+def set_vram_reserve(args: list, family: str, mib: int, backend: str | None = None) -> str | None:
+    """--vram-reserve-mib N (#1026) as the family's engine takes it, written into its arguments (`args` changed in
+    place): GLM-5.3-Flash's and Qwen's `maya` --vram-reserve-mib N (MiB), DeepSeek's maya-ds4 --reserve-mib N (MiB),
+    MiniMax's maya-mm3 --reserve-gb (GiB) and Hy4-Flash's maya-hy4 --reserve-gb (GB of 10^9 bytes).  The flag and
+    value written, for the setup's line; None where the engine has no such setting (Inkling, the Metal engine)."""
+    if family in ("glm", "qwen") and backend != "metal":
+        flag, value = "--vram-reserve-mib", str(mib)
+    elif family == "deepseek":
+        flag, value = "--reserve-mib", str(mib)
+    elif family == "minimax":
+        flag, value = "--reserve-gb", f"{mib / 1024:.3f}".rstrip("0").rstrip(".")
+    elif family == "hy4":
+        flag, value = "--reserve-gb", f"{mib * 1048576 / 1e9:.3f}".rstrip("0").rstrip(".")
+    else:
+        return None
+    set_arg(args, flag, value)
+    return f"{flag} {value}"
 
 
 def keep_args(old: list, new: list, flags: tuple) -> list:
@@ -5112,6 +5363,254 @@ def skip_start_calibrations(cfg_path: Path, cfg: dict, why: str) -> None:
                                                       for name, flag in todo))
 
 
+HY4_Q4X_ENV = "HY4_Q4X"                            # maya-hy4's 4-bit expert copies: 2 / unset measured, 1 on, 0 off
+
+
+def q4x_config_migrate(cfg_path: Path, cfg: dict) -> dict:
+    """A Hy4-Flash config whose env still carries the HY4_Q4X an earlier start's CPU lane check wrote (1.1.69 and
+    before, installer.q4x_calibration "on" / "off" - often measured on cold experts, so starts flipped): that value
+    dropped.  maya-hy4 now measures its 4-bit copies once its lane's experts are warm and remembers the verdict itself
+    (the data folder's hy4-cpu-lane.txt: a line a PC, model and lane-kernel build), so a start never loads the model
+    an extra time for it.  A value set by hand (no installer.q4x_calibration, or another value) stays."""
+    inst, env = cfg.get("installer") or {}, cfg.get("env") or {}
+    res = (inst.get("q4x_calibration") or {}).get("result")
+    if config_family(cfg) != "hy4" or res not in ("on", "off") or \
+            str(env.get(HY4_Q4X_ENV)) != ("1" if res == "on" else "0"):
+        return cfg
+    env.pop(HY4_Q4X_ENV, None)
+    inst.pop("q4x_calibration", None)
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    return read_json(cfg_path)
+
+
+def q4x_verdict(log_text: str) -> str | None:
+    """maya-hy4's own verdict on the 4-bit copies in its log (HY4_Q4X=2): "on", "off", "unmeasured" (copies made, the
+    answers too short for the timed turns), or None - no CPU lane of IQ2_XXS experts, nothing to decide."""
+    if "the 4-bit copies kept" in log_text:
+        return "on"
+    if ("the 4-bit copies dropped" in log_text or "the file's rows kept" in log_text
+            or "no 4-bit copies of its experts" in log_text):
+        return "off"
+    return "unmeasured" if "4-bit copies" in log_text else None
+
+
+Q4X_ANSWERS = 12                                   # (--speed-calibration's CPU lane check: answers at most for a verdict)
+Q4X_BUILD_WAIT_S = 120                             # (... and the wait for the copies, made between answers)
+ROUTE_PROMPTS = 12                                 # (... then long prompts at most for the prompt route's rates)
+
+
+def route_state(log_text: str) -> str | None:
+    """maya-hy4's prompt route in its log: "measuring" (its prompt chunks still take the GPU stream and the CPU lane in
+    turns), "measured", "pinned" / "remembered", or None - every routed expert in VRAM, no route to choose."""
+    if "prompt route: the CPU lane" in log_text:
+        return "measured"
+    if "prompt route: pinned" in log_text:
+        return "pinned"
+    if "prompt route: by the rates measured" in log_text:
+        return "remembered"
+    return "measuring" if "prompt route: measured on this PC" in log_text else None
+
+
+def hy4_first_start_said(cfg: dict) -> list:
+    """The start's lines on what Hy4-Flash's first start on a PC measures once before it is ready, and roughly how
+    long it takes (times as the engine's first starts took them: a GPU holding the whole model, GPUs with the CPU
+    lane; the server then says the time left at this PC's own pace)."""
+    if hy4_engine_drafting(cfg):
+        return ["The first start on this PC measures it once before it is ready: which drafting answers fastest here",
+                "(each choice loaded and timed on a few short answers - roughly one to two minutes), and where part of",
+                "the model runs on the CPU, its CPU lane and prompt route (about one minute more).  Later starts skip",
+                "that and are ready in well under a minute."]
+    return ["The first start on this PC measures it once before it is ready (where part of the model runs on the CPU:",
+            "its CPU lane and prompt route - about one minute more); later starts skip that."]
+
+
+def hy4_engine_drafting(cfg: dict) -> bool:
+    """A Hy4-Flash config whose engine picks its drafting itself (--drafting auto / on): no drafting, the MTP block or
+    the DFly2 drafter, whichever decodes fastest here - each loaded once with its own VRAM plan at the first start on
+    this PC, before it is ready, and remembered in the data folder (hy4-drafting.txt)."""
+    args = [str(x) for x in cfg.get("args") or []]
+    return config_family(cfg) == "hy4" and "--drafting" in args[:-1] and \
+        args[args.index("--drafting") + 1] in ("auto", "on")
+
+
+def draft_forget() -> None:
+    """--speed-calibration: maya-hy4's drafting measured on this PC (data/hy4-drafting.txt) is dropped, so the engine
+    measures it again - in the CPU lane check's run below, else at the next start (before it is ready)."""
+    path = ROOT / "data" / "hy4-drafting.txt"
+    try:
+        path.unlink()
+        ok("drafting (none, the MTP block or the DFly2 drafter, whichever decodes fastest here) is measured again")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        warn(f"{path} could not be removed ({e}): delete it by hand to measure the drafting again")
+
+
+def ik2_draft_forget() -> None:
+    """--speed-calibration: maya-ik2's drafting measured on this PC (data/ik2-drafting.txt, --drafting auto) is
+    dropped, so its next start measures it again before it is ready."""
+    path = ROOT / "data" / "ik2-drafting.txt"
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        warn(f"{path} could not be removed ({e}): delete it by hand to measure the drafting again")
+
+
+def route_forget() -> None:
+    """--speed-calibration: maya-hy4's prompt route rates measured on this PC are dropped (data/hy4-prompt-route.txt),
+    so the engine measures them again - in the CPU lane check's run below, else at the next start (before it is
+    ready, on this install's docs: serve/server.py's hy4_measure_ids)."""
+    path = ROOT / "data" / "hy4-prompt-route.txt"
+    try:
+        path.unlink()
+        ok("the prompt route's rates (GPU stream or CPU lane for a prompt's experts outside VRAM) are measured again")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        warn(f"{path} could not be removed ({e}): delete it by hand to measure the prompt route again")
+
+
+def hot_forget(cfg: dict) -> None:
+    """--speed-calibration: maya-hy4's HY4_HOT scores for this config's model (data/hy4-expert-hot-<model>.bin: which
+    experts a start places in VRAM, kept as they are between calibrations so that every start begins the same) are
+    dropped - the next run learns them again from its answers (the CPU lane check's run below, else the next start)."""
+    sys.path.insert(0, str(ROOT))
+    import serve.server as SV
+    path = ROOT / "data" / SV.hy4_hot_file(cfg).name
+    try:
+        path.unlink()
+        ok("the experts a start places in VRAM (HY4_HOT's scores) are learned again from the next answers")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        warn(f"{path} could not be removed ({e}): delete it by hand to learn the experts in VRAM again")
+
+
+def route_prompts(tdir: Path, n: int) -> list[str]:
+    """--speed-calibration's prompts for the prompt route's rates: long and each its own (no prefix the engine reuses),
+    from this install's docs - a few prompt chunks each."""
+    text = ""
+    for name in ("docs/SETTINGS.md", "README.md", "CHANGELOG.md"):
+        p = ROOT / name
+        if p.exists():
+            text += p.read_text(encoding="utf-8", errors="replace")
+    chat = bench_chat("hy4", tdir)
+    step = 6000
+    return [chat(f"Summarise this in three sentences:\n\n{text[i * step:(i + 1) * step]}") for i in range(n)
+            if len(text) >= (i + 1) * step]
+
+
+def q4x_calibration(cfg_path: Path, why: str = "") -> bool | None:
+    """maya-hy4's 4-bit copies of the CPU lane's most routed experts, measured again on this PC (--speed-calibration):
+    the engine's own check (HY4_Q4X=2 with HY4_Q4X_MEASURE=1 - a probe at its start, then, once the copies are made and
+    the lane's experts warm, the answers' lane calls timed in turns with and without them until two windows agree; the
+    same tokens either way, the copies giving the file's bits) over a warm-up answer and as many more as it takes (up
+    to Q4X_ANSWERS).  The engine remembers the verdict itself (the data folder's hy4-cpu-lane.txt), so the next starts
+    do not measure; installer.q4x_calibration keeps the result for the record (the config's env is left as it is).
+    True / False: on / off; None: nothing to decide here (no CPU lane, no IQ2_XXS experts) or not measured (said)."""
+    cfg = read_json(cfg_path)
+    tdir = Path(cfg.get("tokenizer") or "")
+    if not cfg.get("exe") or not cfg.get("tokenizer") or not (tdir / "chat_template.jinja").exists():
+        warn("the CPU lane check needs the config's engine and tokenizer (with its chat template): its 4-bit expert "
+             f"copies are measured at each start instead ({ME} --setup writes them again)")
+        return None
+    if busy_skip(cfg, why == "asked for", "the CPU lane check", "the GPU(s)",
+                 f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration"):
+        return None
+    sys.path.insert(0, str(ROOT))
+    sys.path.insert(0, str(ROOT / "tools"))
+    import serve.server as SV
+    import strata_tokenizer as ST
+    ids = ST.Tokenizer.from_dir(tdir).encode(bench_chat("hy4", tdir)(BENCH_TOPICS[0]), parse_special=True)
+    env = SV.child_env(cfg)
+    env[HY4_Q4X_ENV] = "2"
+    env["HY4_Q4X_MEASURE"] = "1"                       # (measured again: the verdict remembered before is not used)
+    env["HY4_ROUTE_MEASURE"] = "1"                     # (the prompt route's rates too, on long prompts after the answers)
+    say()
+    say(f"  Checking the CPU lane's 4-bit expert copies on this PC{f' ({why})' if why else ''}: a few answers, the model")
+    say("  loads once (a few minutes) ...")
+    log_path = ROOT / "maya-q4x-calibration.log"
+    done = False
+
+    def said() -> str:
+        return log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+    with open(log_path, "w", encoding="utf-8") as log:
+        try:
+            p = subprocess.Popen([cfg["exe"], "--serve"] + SV.engine_args(cfg), stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=log, text=True, env=env,
+                                 cwd=cfg.get("cwd") or str(ROOT), bufsize=1)
+        except OSError as e:
+            warn(f"the CPU lane check could not start the engine ({e}): its copies are measured at each start instead")
+            return None
+
+        def gen(n_new: int, prompt: list[int] | None = None) -> bool:
+            p.stdin.write(f"GEN {n_new} temperature=0 " + ",".join(map(str, prompt or ids)) + "\n")
+            p.stdin.flush()
+            for line in p.stdout:
+                if line.startswith(("DONE", "ERR")):
+                    return line.startswith("DONE")
+            return False
+
+        try:
+            for line in p.stdout:
+                if line.startswith("READY"):
+                    # (the warm-up answer gives the routing counts the copies are made by - between answers, so the
+                    #  engine is left idle until it times them - then answers until its verdict: the one-token calls
+                    #  timed in turns with and without them, window by window, until two agree)
+                    done = gen(64)
+                    for _ in range(Q4X_BUILD_WAIT_S // 5):
+                        if not done or q4x_verdict(said()) != "unmeasured" or "timing the answers" in said():
+                            break
+                        time.sleep(5)
+                    for _ in range(Q4X_ANSWERS):
+                        if not done or q4x_verdict(said()) != "unmeasured":
+                            break
+                        done = gen(256)
+                        time.sleep(2)                  # (the verdict's line reaches the log)
+                    # (the prompt route's rates: long prompts, each read in chunks whose CPU lane layers take the GPU
+                    #  stream and the lane in turns, until two windows of times agree)
+                    tok = ST.Tokenizer.from_dir(tdir)
+                    for text in route_prompts(tdir, ROUTE_PROMPTS):
+                        if not done or route_state(said()) != "measuring":
+                            break
+                        done = gen(1, tok.encode(text, parse_special=True))
+                        time.sleep(1)
+                    break
+            p.stdin.write("QUIT\n")
+            p.stdin.flush()
+            p.wait(timeout=120)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            p.kill()
+    verdict = q4x_verdict(log_path.read_text(encoding="utf-8", errors="replace"))
+    if m := re.search(r"INFO drafting: (.+?) - the fastest on this PC \(measured (now|[0-9-]+)", said()):
+        ok(f"drafting: {m.group(1)} - whichever of no drafting, the MTP block and the DFly2 drafter decodes fastest on "
+           "this PC, each with its own VRAM plan (measured once, remembered: the next starts use it)")
+    rs = route_state(said())
+    if rs == "measured":
+        ok("the prompt route's rates (GPU stream or CPU lane for a prompt's experts outside VRAM) measured on this PC: "
+           "the same prompt now takes the same route at every start")
+    elif rs == "measuring":
+        warn("the prompt route's rates did not settle in this check: the engine measures them at the next start, "
+             "before it is ready, and remembers them")
+    if not done or verdict == "unmeasured":
+        warn(f"the CPU lane check did not finish ({log_path.name} says why): the engine measures its copies at the "
+             f"next start instead, once its experts are warm, and remembers it ({ME} --speed-calibration tries again)")
+        cfg.setdefault("installer", {})["q4x_calibration"] = {"result": "unmeasured", "date": time.strftime("%Y-%m-%d")}
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+        return None
+    # (the verdict is the engine's to remember - per PC, model and lane kernels; the config only records it)
+    cfg.setdefault("installer", {})["q4x_calibration"] = {"result": verdict or "n/a", "date": time.strftime("%Y-%m-%d")}
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    if verdict is None:
+        ok("CPU lane check: nothing to decide on this PC (no CPU lane of IQ2_XXS experts)")
+        return None
+    ok(f"the CPU lane's 4-bit expert copies: {'ON - faster' if verdict == 'on' else 'off - not faster'} on this PC "
+       "(the same answers either way)")
+    return verdict == "on"
+
+
 def needs_speed_calibration(cfg: dict) -> bool:
     """A config that drafts with DFlash2 but has no speed calibration yet (set up before there was one, or its
     calibration could not run then - the GPUs were busy): its next start measures first.  Not with --parallel above 1:
@@ -5126,7 +5625,7 @@ def needs_speed_calibration(cfg: dict) -> bool:
         return hy4_both_drafters(cfg) and not hy4_engine_drafting(cfg) and \
             (cfg.get("installer") or {}).get("drafting") == "on" and \
             "speed_calibration" not in (cfg.get("installer") or {})
-    if config_family(cfg) in ("qwen", "ik2"):         # (Inkling 2: the setup offers no drafter)
+    if config_family(cfg) in ("qwen", "ik2"):         # (Inkling 2: --drafting auto, measured by its engine)
         return False
     if config_family(cfg) in ("deepseek", "minimax"):  # (their DSpark drafter: measured once too)
         return CDS.has_drafter(cfg) and "speed_calibration" not in (cfg.get("installer") or {}) and             not (config_family(cfg) == "minimax" and parallel_of(cfg) > 1)   # (maya-mm3 --parallel: no drafting)
@@ -5149,6 +5648,16 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
         return False
     if config_family(cfg) == "qwen":                   # (CYBER-FROST: its MTP drafter or none)
         return bool(qwen_draft_calibration(cfg_path) is not None)
+    if config_family(cfg) == "ik2":                    # (Inkling 2: --drafting auto measures at the engine's start)
+        args = cfg.get("args") or []
+        if "--drafting" in args[:-1] and args[args.index("--drafting") + 1] == "auto":
+            ik2_draft_forget()
+            ok(f"{IK2_SHOWN}: its drafting is measured again at the next start (the engine times no drafting, the "
+               "prompt lookup and the drafter once, before its first answer)")
+            return True
+        ok(f"{IK2_SHOWN}: no speed calibration - drafting is set by hand (--drafting on|off); {ME} --setup "
+           "--drafting measure lets the engine measure it")
+        return False
     if config_family(cfg) == "hy4":
         route_forget()                                 # (the prompt route's rates: measured again too)
         hot_forget(cfg)                                # (... and the experts a start places in VRAM: learned again)
@@ -5244,6 +5753,73 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
            "Maya " + ("decodes without drafting" if one else "drafts with the MTP block"))
         say(f"       (saved in {cfg_path.name}; to draft with DFlash2 anyway: {ME} --setup --draft dflash2 "
             "--no-speed-calibration)")
+    return True
+
+
+def hy4_both_drafters(cfg: dict) -> bool:
+    """A Maya size of Hy4-Flash set up where its MTP block and its DFly2 drafter both fit (installer.draft_choice
+    "auto": both in the pack, one GPU): which of the two drafts is the speed calibration's to measure."""
+    inst = cfg.get("installer") or {}
+    return config_family(cfg) == "hy4" and Q.config_key(cfg) != HY4_Q4 and inst.get("draft_choice") == "auto" and \
+        bool(inst.get("draft_block")) and bool(inst.get("dfly2")) and len(cfg.get("gpu") or [0]) < 2
+
+
+def hy4_with_drafter(cfg: dict, drafter: str) -> dict:
+    """A copy of a Hy4-Flash config that drafts with `drafter` ("mtp": --mtp, "dfly2": --dfly2) - the other's flag
+    out."""
+    out = json.loads(json.dumps(cfg))
+    args = [x for x in (out.get("args") or []) if x not in ("--mtp", "--dfly2")]
+    out["args"] = args + ["--dfly2" if drafter == "dfly2" else "--mtp"]
+    out.setdefault("installer", {})["drafter"] = drafter
+    return out
+
+
+def speed_calibration_hy4(cfg_path: Path, cfg: dict, why: str = "") -> bool:
+    """A Maya size of Hy4-Flash where both drafters fit: its sustained decode speed with the MTP block and with the
+    DFly2 drafter (both write only tokens the model checks: the same answers), a short probe each as
+    tools/calibrate_draft.py measures (HY4_DRAFT_PROBE: code, an explanation, plain text, thinking).  The faster is
+    kept; within HY4_DRAFT_TIE the size's rule (HY4_DRAFT_RULE) stays.  False: not measured (nothing changed)."""
+    if busy_skip(cfg, why == "asked for", "the speed calibration", "the GPU",
+                 f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration"):
+        return False
+    quant = Q.config_key(cfg)
+    rule = HY4_DRAFT_RULE.get(quant, "mtp")
+    mtp, dfly = hy4_with_drafter(cfg, "mtp"), hy4_with_drafter(cfg, "dfly2")
+    say()
+    say("  Speed calibration: the MTP block or the DFly2 drafter?" + (f" ({why})" if why else ""))
+    say("  Both fit on this GPU and the model checks every drafted token; which drafts faster depends on how much of")
+    say(f"  the model the GPU holds beside it. Maya loads the model twice (the MTP block, then DFly2); each time it "
+        f"writes about {HY4_DRAFT_PROBE['tokens']} tokens of")
+    say("  short answers (code, an explanation, plain text, thinking) after a warm-up, and the speeds are compared.")
+    say("  The PC is busy meanwhile.")
+    log = cfg.get("log")
+    since = os.path.getsize(log) if log and os.path.isfile(log) else 0
+    now = (cfg.get("installer") or {}).get("drafter") or ("dfly2" if "--dfly2" in (cfg.get("args") or []) else "mtp")
+    try:
+        res = CD.run(mtp, dfly, say=say, other_label="the MTP block", draft_label="DFly2", size=HY4_DRAFT_PROBE)
+    except Exception as e:                             # never stops a setup or a start: the config stays as it was
+        warn(f"the speed calibration did not finish ({e}): nothing changed - Maya keeps "
+             f"{'DFly2' if now == 'dfly2' else 'the MTP block'}; {ME} --speed-calibration tries again")
+        why_not = CAL.engine_error(log, since)
+        if why_not:
+            say(f"       the engine said: {why_not}")
+        cfg.setdefault("installer", {})["speed_calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"),
+                                                                "failed": str(e)[:300]}
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+        return False
+    o, d = res["other"]["tok_s"], res["dflash2"]["tok_s"]
+    tie = abs(d - o) <= HY4_DRAFT_TIE * max(o, d)
+    keep = rule if tie else "dfly2" if d > o else "mtp"
+    out = mtp if keep == "mtp" else dfly
+    out.setdefault("installer", {})["speed_calibration"] = {
+        "date": time.strftime("%Y-%m-%d %H:%M"), "version": maya_version(), "mtp_tok_s": o, "dfly2_tok_s": d,
+        "tokens": [res["other"]["tokens"], res["dflash2"]["tokens"]], "kept": keep}
+    cfg_path.write_text(json.dumps(N.env_out(out), indent=1), encoding="utf-8")
+    say()
+    ok(f"speed calibration: {d:.1f} tokens/s with DFly2 against {o:.1f} with the MTP block - Maya drafts with " +
+       ("DFly2" if keep == "dfly2" else "the MTP block") + (" (a tie: this size's default)" if tie else ""))
+    say(f"       (saved in {cfg_path.name}; {ME} --speed-calibration measures again, --setup --drafting mtp|dfly2 "
+        "picks one by hand)")
     return True
 
 
@@ -5697,7 +6273,7 @@ def drafting_choice(a, drafter: str, minutes: str) -> str:
     measuring - "on" (draft with it) or "off".  --drafting, or --no-speed-calibration (= on), else asked; --yes
     measures."""
     if getattr(a, "drafting", None):
-        return a.drafting
+        return "on" if a.drafting in ("mtp", "dfly2") else a.drafting   # (Hy4-Flash's drafter by name: elsewhere on)
     if getattr(a, "no_speed_calibration", False):
         return "on"
     say()
@@ -5782,9 +6358,11 @@ def server_command(cfg_path: Path, a) -> tuple:
     args = cfg.get("args") or []
     ds4 = config_family(cfg) == "deepseek"
     metal = cfg.get("backend") == "metal"
-    flag = ("--gguf" if metal else "--glm-pack") if config_family(cfg) == "glm" else "--pack"   # (maya-ds4 and maya-mm3: --pack)
+    ik2 = config_family(cfg) == "ik2"                  # (maya-ik2 reads its GGUF itself: --model, no pack)
+    flag = ("--gguf" if metal else "--glm-pack") if config_family(cfg) == "glm" else "--model" if ik2 else "--pack"   # (maya-ds4 and maya-mm3: --pack)
     pack = Path(args[args.index(flag) + 1]) if flag in args[:-1] else None       # (Metal: the first GGUF file)
-    for p, what in ((Path(cfg.get("exe", "")), "the engine"), (pack, "the model's GGUF file" if metal else "the pack"),
+    for p, what in ((Path(cfg.get("exe", "")), "the engine"),
+                    (pack, "the model's GGUF file" if metal or ik2 else "the pack"),
                     (Path(cfg.get("tokenizer", "")) / "vocab.json", "the tokenizer")):
         if p is None or not p.exists():
             fail(f"{cfg_path.name}: {what} is missing ({p})", f"run {ME} --setup to repair it")
@@ -5802,7 +6380,7 @@ def server_command(cfg_path: Path, a) -> tuple:
         for s in shard_set(pack):
             if not s.exists():
                 fail(f"{cfg_path.name}: the model's file {s.name} is missing ({s.parent})", f"run {ME} --setup to repair it")
-    src = None if metal else pack_source(pack)
+    src = None if metal or ik2 else pack_source(pack)
     if src is not None and src != EXL3_GGUF and all(s.exists() for s in shard_set(pack.parent / src)):
         why = pack_stale(pack, shard_set(pack.parent / src))
         if why is not None:
@@ -5831,7 +6409,8 @@ def server_command(cfg_path: Path, a) -> tuple:
         cfg = read_json(cfg_path)
         args = cfg.get("args") or []
     if not unattended and needs_speed_calibration(cfg):     # a drafter set up without its speed calibration: measured once
-        drafter = {"deepseek": "DeepSeek's DSpark drafter", "minimax": "MiniMax's DSpark drafter"}.get(
+        drafter = {"deepseek": "DeepSeek's DSpark drafter", "minimax": "MiniMax's DSpark drafter",
+                   "hy4": "the MTP block or the DFly2 drafter"}.get(
             config_family(cfg), "DFlash2")
         if speed_calibration(cfg_path, f"once, for a setup that drafts with {drafter}"):
             cfg = read_json(cfg_path)
@@ -5840,6 +6419,10 @@ def server_command(cfg_path: Path, a) -> tuple:
         if link_calibration(cfg_path, "once, for this PC"):
             cfg = read_json(cfg_path)
             args = cfg.get("args") or []
+    # Hy4-Flash's 4-bit expert copies: measured by the engine once its experts are warm, remembered per PC (no start of
+    # its own for it any more); a verdict an earlier start's check wrote into the config is dropped for the engine's
+    cfg = q4x_config_migrate(cfg_path, cfg)
+    args = cfg.get("args") or []
     port = a.port or cfg.get("port") or 8080
     host = a.host or cfg.get("host") or "127.0.0.1"
     key = a.api_key or cfg.get("api_key")
@@ -5851,7 +6434,9 @@ def server_command(cfg_path: Path, a) -> tuple:
         cmd += ["--api-key", a.api_key]
     if a.gpus or a.gpu is not None:                    # this start only, on these cards
         cmd += ["--gpu", str(a.gpus or a.gpu)]
-    if WIN or sys.platform == "darwin" or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+    from serve.server import web_ui_setting            # ("web_ui": false: an API-only server, no page to open - #1089)
+    web = web_ui_setting(cfg)
+    if web and (WIN or sys.platform == "darwin" or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         cmd.append("--open")                           # a desktop: the browser opens when the model is ready
     here = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     ctx = args[args.index("--max-context") + 1] if "--max-context" in args[:-1] else None
@@ -5870,7 +6455,7 @@ def server_command(cfg_path: Path, a) -> tuple:
     say()
     say("  " + "-" * 100)
     say(f"  Starting {info['label'] or cfg.get('model_name', MODEL_NAME)} ({cfg_path.name}).")
-    say(f"  Dashboard:        http://{here}:{port}/")
+    say(f"  Dashboard:        http://{here}:{port}/" if web else "  Dashboard:        off (\"web_ui\": false: the API only)")
     say(f"  API (OpenAI):     http://{here}:{port}/v1        (any model name; the API key: "
         + ("the one you set)" if key else "any)"))
     say(f"  API (Anthropic):  http://{here}:{port}/v1/messages")
@@ -6041,7 +6626,9 @@ REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm st
                           r"^ds4: (?!copying experts |experts \d+ / |loading \d)|^ds4 (?:slots|cache):|^maya-ds4:|"
                           r"^(?:prompt|decode): \d+ tokens in |^decode per token:|^decode (?:reads|left out)|^dspark|"
                           # maya-mm3's: where the model went (its --serve start) and each answer's prompt / decode speed
-                          r"^maya-mm3:|^maya mm3 serve: (?:prompt|DSpark) |^maya-hy4:",
+                          r"^maya-mm3:|^maya mm3 serve: (?:prompt|DSpark) |^maya-hy4:|"
+                          # the Monitor's GPU readings: a reading that failed, a reader that stopped and why
+                          r"^\[maya\] (?:a GPU reading failed|the GPU readings)",
                           re.I)
 STAT_DECODE = re.compile(r"glm stat: decode ([\d.]+) ms/tok")
 
@@ -6058,6 +6645,16 @@ def speed_lines(text) -> list:
             x = "glm stat (prompt only): prompt " + x.split("| prompt ", 1)[1]
         picked.append(x.strip())
     return picked
+
+
+def gpu_readings_report() -> str:
+    """--report: what the dashboard's Monitor reads on each NVIDIA GPU (serve/telemetry.py's NVML reader, a process of
+    its own): each card's readings given or not, any that failed with its error - never an error of the report's own."""
+    try:
+        from serve import telemetry as TM
+        return TM.readings_report()
+    except Exception as e:  # noqa: BLE001 - the report goes on without this part
+        return f"not read ({type(e).__name__}: {e})"
 
 
 def hip_gpu_report(rocm: Path, bindir=None) -> str:
@@ -6158,6 +6755,7 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
         add("GPUs", S.out(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,driver_version,"
                                          "pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max,power.limit,"
                                          "temperature.gpu", "--format=csv"]) or "nvidia-smi did not answer")
+        add("GPU readings (the Monitor's NVML reader, read now)", gpu_readings_report())
     cpu, avx2, avx512 = S.cpu_info()
     total, avail = mem_gb()
     pf = S.page_file_gb()
@@ -6185,6 +6783,16 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
             images = "off" if "--vision" in args[:-1] and args[args.index("--vision") + 1] == "off" else "on"
         elif config_family(cfg) == "minimax":   # (maya-mm3's too: --vision on when the pack has it, left out without)
             images = "on" if flag_value(args, "--vision") == "on" else "off"
+        elif config_family(cfg) == "hy4":       # (maya-hy4's: on whenever its pack has the tower, unless --vision off -
+            # the tower in RAM, on the GPU a picture at a time: the config has no "vision" entry of its own)
+            images = "off (--vision off)" if flag_value(args, "--vision") == "off" else \
+                "on (read a picture at a time)" if pack is not None and hy4_pack_has_vision(pack) else \
+                "off (no vision tower in the pack)" if pack is not None and (pack / "hy4.txt").exists() else \
+                "? (the pack is not here to look in)"
+        elif config_family(cfg) == "ik2":       # (maya-ik2: pictures through maya-vision's Inkling 2 tower, read a
+            #  request's pictures at a time - on the GPU where its free VRAM holds the encoder, else on the CPU)
+            images = "on (read a request's pictures at a time)" if cfg.get("vision") else \
+                "off (Images on the Models page)" if cfg.get("vision_off") else "off (set up without the image encoder)"
         else:
             images = "on" if cfg.get("vision") else "off"
         where = ""
@@ -6253,6 +6861,12 @@ def bench_chat(family: str, tokenizer_dir: Path):
             fail(f"the model's chat template is missing ({path})", f"run {ME} --setup --repack to build the pack again")
         tpl = ChatTemplate(path)
         return lambda q: tpl.render([{"role": "user", "content": q}], enable_thinking=False)
+    if family == "ik2":        # (Inkling 2: its template at the lowest effort, the answer's text segment opened -
+        from serve.frontend import ChatTemplate   #  the server's thinking off)
+        path = Path(tokenizer_dir) / "chat_template.jinja"
+        tpl = ChatTemplate(path if path.exists() else ROOT / "tools" / "ik2" / "chat_template.jinja")
+        return lambda q: tpl.render([{"role": "user", "content": q}], reasoning_effort="none",
+                                    enable_thinking=False) + "<|message_model|><|content_text|>"
     if family == "qwen":       # (Qwen's turns, the think block closed: the answer itself)
         return "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".format
     return "[gMASK]<sop><|user|>\n{}<|assistant|>\n</think>".format
@@ -6432,7 +7046,109 @@ def setup_screen(a, asks: bool = True) -> bool:
     return True
 
 
+# the installed configs as they were when this setup run began ({resolved path: text}): ablate_step reads the config
+# before from it, and set_up keeps a copy of each config the run changed next to it (keep_config_backups)
+SETUP_BEFORE: dict = {}
+# what a setup run may change in a config's installer record without a copy kept: when it was written, the record of
+# the refusal-direction choice (the choice itself shows in the args)
+CONFIG_VOLATILE = ("written", "ablate")
+
+
+def args_map(args) -> dict:
+    """An engine argument list as {flag: value, or True for a flag without one} (order and paths left as they are)."""
+    out, args = {}, [str(x) for x in args or []]
+    for i, x in enumerate(args):
+        if x.startswith("--"):
+            out[x] = args[i + 1] if i + 1 < len(args) and not args[i + 1].startswith("--") else True
+    return out
+
+
+def config_changes(old: dict, new: dict) -> list:
+    """What a setup run changed in a config, in words: GPUs, engine arguments, environment, other settings (its
+    installer record's date left out) - [] when nothing that matters changed."""
+    lines = []
+    if old.get("gpu") != new.get("gpu"):
+        lines.append(f"GPUs {old.get('gpu')} -> {new.get('gpu')}")
+    oa, na = args_map(old.get("args")), args_map(new.get("args"))
+    short = lambda v: "" if v is True else f" {v}" if len(str(v)) <= 40 else " ..." + str(v)[-30:]   # noqa: E731
+    lines += [f"{f} added" for f in na if f not in oa]
+    lines += [f"{f} removed" for f in oa if f not in na]
+    lines += [f"{f}{short(oa[f])} ->{short(na[f])}" for f in na if f in oa and na[f] != oa[f]]
+    oe, ne = old.get("env") or {}, new.get("env") or {}
+    lines += [f"env {k} added" for k in ne if k not in oe] + [f"env {k} removed" for k in oe if k not in ne]
+    lines += [f"env {k}={oe[k]} -> {ne[k]}" for k in ne if k in oe and str(ne[k]) != str(oe[k])]
+    for k in sorted(set(old) | set(new)):
+        if k in ("gpu", "args", "env"):
+            continue
+        ov, nv = old.get(k), new.get(k)
+        if k == "installer":
+            ov = {x: y for x, y in (ov or {}).items() if x not in CONFIG_VOLATILE}
+            nv = {x: y for x, y in (nv or {}).items() if x not in CONFIG_VOLATILE}
+        if ov != nv:
+            lines.append(f"{k} " + ("added" if ov is None else "removed" if nv is None else "changed"))
+    return lines
+
+
+def keep_config_backups(before: dict) -> list:
+    """After a setup run: each installed config it changed gets the text it had before kept next to it, as
+    <config>.json.bak-<date> (not a config the start or the Models page lists), and the changes are said.  The
+    backups made."""
+    made = []
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for p, text in before.items():
+        path = Path(p)
+        try:
+            now = path.read_text(encoding="utf-8-sig")
+        except OSError:
+            continue
+        if now == text:
+            continue
+        try:
+            changes = config_changes(json.loads(text), json.loads(now))
+        except ValueError:
+            changes = ["rewritten"]
+        if not changes:
+            continue
+        bak = path.with_name(f"{path.name}.bak-{stamp}")
+        try:
+            bak.write_text(text, encoding="utf-8")
+        except OSError as e:
+            warn(f"{path.name}: changed by this setup, but the copy of the config before could not be written ({e})")
+            continue
+        made.append(bak)
+        ok(f"{path.name}: changed by this setup (" + "; ".join(changes[:8]) +
+           (f"; {len(changes) - 8} more" if len(changes) > 8 else "") + f") - the config before is kept as {bak.name}")
+    return made
+
+
+def config_before(cfg_path: Path) -> dict | None:
+    """The config at cfg_path as it was when this setup run began, or None (a new one, or not a setup run)."""
+    text = SETUP_BEFORE.get(str(Path(cfg_path).resolve()))
+    try:
+        return json.loads(text) if text is not None else None
+    except ValueError:
+        return None
+
+
 def set_up(a, prev: dict) -> Path | None:
+    """The setup (_set_up): the installed configs read first, and each one the run changed keeps a copy of what it had
+    before next to it, said on the screen (#1066: a setup again rewrote a config - --ablate added, a GPU added)."""
+    global SETUP_BEFORE
+    before = {}
+    for p in configs():
+        try:
+            before[str(p.resolve())] = p.read_text(encoding="utf-8-sig")
+        except OSError:
+            pass
+    SETUP_BEFORE = before
+    try:
+        return _set_up(a, prev)
+    finally:
+        SETUP_BEFORE = {}
+        keep_config_backups(before)
+
+
+def _set_up(a, prev: dict) -> Path | None:
     """Steps 1-8, then the tuning: the config written, or None when the model was not downloaded.  `prev`: the
     config of the setup before (its answers are the defaults).  The model comes first: GLM-5.3-Flash or DeepSeek-V4.1-
     Flash-1017 (set_up_ds4), each then with the answers of its own setup before."""
@@ -6522,7 +7238,7 @@ def set_up(a, prev: dict) -> Path | None:
         vision = vision_step(a, pc, meta, llama, d, quant)  # 7
     cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice, dflash, shards[0] if metal else None)   # 8
     if not metal:                                      # (the Mac engine does not project a direction)
-        ablate_step(cfg_path, "glm-dsa" if dsa else "glm", models)
+        ablate_step(cfg_path, "glm-dsa" if dsa else "glm", models, a)
     if dflash is not None and metal:                   # (the speed calibration is CUDA's: on a Mac the choice is yours)
         ok("DFlash2 drafts on this Mac, not measured against the MTP block (the model checks both): "
            f"{ME} --setup --draft mtp goes back")
@@ -7540,11 +8256,7 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": dict(DS4_SAMPLING), "reasoning_effort": DS4_EFFORT,   # (the model's own, every setup)
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
-    for k in ("host", "api_key", "cors_origins", "mcp_servers", "fast_prefill", "mixed_gpus", "mixed_exe", "mixed_gpu",
-              "mixed_mode"):
-        if old.get(k) is not None:
-            cfg[k] = old[k]
-            kept.append(k)
+    kept += keep_server_settings(cfg, old, a, ("fast_prefill", "mixed_gpus", "mixed_exe", "mixed_gpu", "mixed_mode"))
     set_fast_prefill(cfg, getattr(a, "fast_prefill", None))
     set_mixed_gpus(cfg, getattr(a, "mixed_gpus", None))
     if hip and os.name != "nt" and "mixed_gpus" not in cfg and getattr(a, "mixed_gpus", None) is None and nvidia_beside():
@@ -7585,7 +8297,7 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
                 ok(f"(tuned at context {cal['context']}: {ME} --calibrate tunes this context too)")
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
-    ok(f"start script: {write_run_script(cfg_path, port)}")
+    ok(f"start script: {write_run_script(cfg_path, cfg['port'])}")
     if ds4_seed_profile(cfg):
         ok("expert profile: the pack starts from DeepSeek's shipped one (the most-routed experts placed in VRAM and "
            "read ahead first); the engine adds what this PC routes to it")
@@ -7603,6 +8315,7 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
     gguf = quant not in DS4_EXL3
+    a.gpus_before = prev.get("gpu")                    # (the GPU question's default: this config's GPUs)
     pc = check_pc(a, "deepseek", gguf, quant)          # 1
     step(2, "your choices")                            # 2
     ok(f"files: {Q.shown('deepseek', quant)}" + (" (Maya's quant)" if quant in DS4_MAYA else
@@ -7699,7 +8412,7 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     if gguf:                                           # (an earlier layout's copy of the shared tables: one copy, #777)
         ds4_table_dupes(pack, d)
     cfg_path = write_config_ds4(a, pc, meta, pack, ctx, models, d, quant, vision)   # 8
-    ablate_step(cfg_path, "deepseek", models)
+    ablate_step(cfg_path, "deepseek", models, a)
     if (drafter or not gguf) and CDS.has_drafter(read_json(cfg_path)):
         how = drafting_choice(a, "The DSpark drafter", "10-30")
         if how != "measure":
@@ -8158,7 +8871,10 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         set_arg(args, "--vision", "off")
     elif mm3_pack_has_vision(pack):
         set_arg(args, "--vision", "on")
-    if hip and "--reserve-gb" not in args[:-1]:   # (as DeepSeek's on AMD: the desktop's allocations beside the engine)
+    if getattr(a, "vram_reserve_mib", None) is not None:   # (#1026) given now: written, and a later setup keeps it
+        put = set_vram_reserve(args, "minimax", a.vram_reserve_mib)
+        ok(f"VRAM kept free on each GPU: {a.vram_reserve_mib} MiB (--vram-reserve-mib: {put})")
+    elif hip and "--reserve-gb" not in args[:-1]:   # (as DeepSeek's on AMD: the desktop's allocations beside the engine)
         mib = hip_reserve_mib(pc["gpus"])
         set_arg(args, "--reserve-gb", f"{mib / 1024:.1f}")
         ok(f"VRAM kept free on each GPU: {mib / 1024:.1f} GB (the desktop and other programs on an AMD GPU allocate "
@@ -8170,10 +8886,7 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            "sampling": folder_sampling(d, MM3_SAMPLING) if own else dict(MM3_SAMPLING),
            "reasoning_effort": MM3_EFFORT,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
-    for k in ("host", "api_key", "cors_origins", "mcp_servers"):
-        if old.get(k) is not None:
-            cfg[k] = old[k]
-            kept.append(k)
+    kept += keep_server_settings(cfg, old, a)
     env = {**(old.get("env") or {}), **parse_env(a.env)}
     if env:
         cfg["env"] = env
@@ -8190,7 +8903,7 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
                         "written": time.strftime("%Y-%m-%d %H:%M")}
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
-    ok(f"start script: {write_run_script(cfg_path, port)}")
+    ok(f"start script: {write_run_script(cfg_path, cfg['port'])}")
     if moved:   # (this quant's config under the name before: its dashboard settings come along, the old files go)
         shared = legacy.with_suffix(".shared-settings.json")
         if shared.exists() and not cfg_path.with_suffix(".shared-settings.json").exists():
@@ -8222,6 +8935,7 @@ def set_up_mm3(a, prev: dict) -> Path | None:
     gguf = quant != "exl3"
     own = mm3_own_dir(a, quant)                        # --model-dir: an EXL3 folder of your own, not the pinned download
     need = mm3_memory_gb(quant, own)
+    a.gpus_before = prev.get("gpu")                    # (the GPU question's default: this config's GPUs)
     pc = check_pc(a, "minimax", gguf=gguf)             # 1
     total, _ = mem_gb()
     vram = sum(g["vram_gb"] for g in pc["gpus"])
@@ -8266,7 +8980,7 @@ def set_up_mm3(a, prev: dict) -> Path | None:
     else:
         ok("no vision tower in this pack: text only")
     cfg_path = write_config_mm3(a, pc, meta, pack, ctx, models, d, quant, bool(own))   # 8
-    ablate_step(cfg_path, "minimax", models)
+    ablate_step(cfg_path, "minimax", models, a)
     if S.UI is not None:                               # 9: how this PC reads prompts fastest, measured
         S.UI.step(9, "prefill calibration")
     prefill_calibration(cfg_path, "once, for this setup")
@@ -8463,6 +9177,64 @@ def hy4_cache_bytes(ctx: int, chunk: int, q8: bool = False, resident: int = 0) -
     return 29 * ring * row + 13 * (rows + (ctx // 4 + 1) * 128 * pool + ring * 2 * 128 * pool) + ring * 3072 * 4 + pick
 
 
+def hy4_stream_ram_gib(ctx: int, q8: bool = False) -> float:
+    """KV streaming's RAM (GiB, pinned): every position's latent row of the 13 global layers."""
+    return 13 * ctx * (HY4_KV_Q8_ROW if q8 else 576 * 2) / 2**30
+
+
+def hy4_stream_need_gib(plan: dict, ctx: int, q8: bool = False, resident: int | None = None) -> float:
+    """hy4_fit_need_gib with KV streaming: less the global layers' rows that leave the VRAM."""
+    chunk = int(plan.get("chunk") or 1024)
+    res = HY4_KV_RESIDENT if resident is None else resident
+    return hy4_fit_need_gib(plan, ctx, q8) - \
+        (hy4_cache_bytes(ctx, chunk, q8) - hy4_cache_bytes(ctx, chunk, q8, res)) / 2**30
+
+
+def hy4_stream_rows(plan: dict, ctx: int, usable: float, ram_gib: float | None, kv: str | None = None) -> tuple | None:
+    """A context that fits the VRAM only with KV streaming, as the engine's --kv-streaming auto takes it:
+    (rows, ring) - "f16" then "q8", with the ring of HY4_KV_RESIDENT positions and then a prompt chunk's - where the
+    RAM left for the rows (ram_gib) holds them; None: no RAM figure given, or it fits neither way.  kv "f16" / "q8":
+    those rows only (the engine's --kv f16 / q8)."""
+    if ram_gib is None:
+        return None
+    for res in (HY4_KV_RESIDENT, 1):
+        for q8 in ((kv == "q8",) if kv in ("f16", "q8") else (False, True)):
+            if hy4_stream_need_gib(plan, ctx, q8, res) <= usable:
+                # (the engine stops at the first that fits the VRAM: the RAM must hold that one's rows)
+                return ("q8" if q8 else "f16", res) if hy4_stream_ram_gib(ctx, q8) <= ram_gib else None
+    return None
+
+
+def hy4_ram_for_rows(q: dict, usable: float, ram_gb: float | None) -> float | None:
+    """The RAM (GiB) KV streaming's rows may take on this PC: its RAM less the system's headroom (8 GiB or a tenth)
+    and the size's experts outside the VRAM (the CPU lane reads them from the file cache); None: no RAM figure."""
+    if not ram_gb:
+        return None
+    return float(ram_gb) - max(8.0, 0.1 * float(ram_gb)) - max(0.0, float(q.get("memory_gb") or 0) - usable)
+
+
+def hy4_config_stream(quant: str, layout: str, ctx: int, usable: float, ram_gib: float | None,
+                      chunk: int | None = None, reserve_gb: float | None = None, mtp: bool = False,
+                      kv: str | None = None) -> tuple | None:
+    """hy4_stream_rows for a size already set up, counted as hy4_config_need_gib counts it (the Models page's
+    serve/models.py hy4_room): (rows, positions kept in VRAM, VRAM GiB) where the context fits its cards only with KV
+    streaming and the RAM left for the rows (ram_gib: hy4_ram_for_rows) holds them; kv "f16" / "q8": the config's own
+    rows only."""
+    if ram_gib is None:
+        return None
+    plan = (hy4_layouts(hy4_quant_table(quant)).get(layout or HY4_STANDARD) or {}).get("plan") or {}
+    ch = int(chunk or plan.get("chunk") or 1024)
+    for res in (HY4_KV_RESIDENT, 1):
+        for q8 in ((kv == "q8",) if kv in ("f16", "q8") else (False, True)):
+            base = hy4_config_need_gib(quant, layout, ctx, chunk=chunk, reserve_gb=reserve_gb, q8=q8, mtp=mtp)
+            if base is None:
+                return None
+            need = base - (hy4_cache_bytes(ctx, ch, q8) - hy4_cache_bytes(ctx, ch, q8, res)) / 2**30
+            if need <= usable:
+                return ("q8" if q8 else "f16", max(res, ch), need) if hy4_stream_ram_gib(ctx, q8) <= ram_gib else None
+    return None
+
+
 def hy4_need_gib(plan: dict, ctx: int, q8: bool = False) -> float:
     """The VRAM (GiB, its reserve included) maya-hy4 needs at a context for everything that is not a routed expert -
     these parts have no RAM fallback.  From the plan's table ("need_gib", by context); a context it does not list:
@@ -8612,6 +9384,226 @@ def hy4_usable_gib(gpus: list, used: dict | None = None) -> float:
     if not used:
         return max(total - (HY4_FIT_DISPLAY_GIB if gpus else 0.0), 0.0)
     return max(total - sum(min(float(used.get(g.get("index"), 0)) / 1024.0, HY4_FIT_USED_CAP_GIB) for g in gpus), 0.0)
+
+
+def hy4_engine_room(pc: dict, probe=None, saved: dict | None = None) -> dict:
+    """Windows: each chosen NVIDIA card's VRAM as the engine's CUDA gets it, measured now, kept on the card as
+    "engine_room_gb" (hy4_usable_gib counts no more than that there); {index: GiB} of what was measured.  Windows
+    keeps part of every card from the programs on it (the display driver's budget), which nvidia-smi does not show:
+    an RTX 3050 8 GB with 0.1 GB in use gave CUDA 7.0 GB free - the engine plans with that figure (cudaMemGetInfo at
+    its start), the setup's own sums with the card's total less what is in use.  So the room is that figure in the
+    setup's terms: CUDA's free VRAM with a context held, plus what CUDA itself takes beside it - a context (the free
+    VRAM with a second one beside it, the difference) and the part of the card the driver keeps from CUDA
+    (nvidia-smi's total less CUDA's) - CUDA's own share as the setup's sums count it.  Windows keeps that share out
+    of sight in its budget, so the engine measures it at its first start on this PC (hy4_room_measure: the engine's
+    --room-report, kept in HY4_ROOM_STORE for this PC, card and driver) and the room counts that figure from then on
+    ("engine_room_how": "measured"); until then the larger of what this PC shows of it and HY4_FIT_CUDA_OWN_GIB, the
+    first guess ("estimated").  "cuda_free_gb": CUDA's own reading (the config keeps it: the Models page counts a
+    figure measured later with it).  On Linux the measured part alone is nvidia-smi's total less its used (nothing
+    else is kept there), so only Windows is measured.  Not measured: another OS, AMD, a unified-memory GPU, a card a
+    Maya engine holds now (its own VRAM would be counted as kept: the reading as before), no answer from the driver.
+    Several cards: each one's share from their record together where a start on all of them measured it
+    (hy4_room_set_key - a split's or a tensor-parallel group's plan is not one card's), else each card's own.
+    probe: the readings (tests; else cuda_room_bytes); saved: HY4_ROOM_STORE's records (tests; else read)."""
+    gpus = (pc or {}).get("gpus") or []
+    if not WIN or (pc or {}).get("backend", "cuda") != "cuda" or not gpus or hy4_amd(gpus) or \
+            any(g.get("unified_memory") for g in gpus):
+        return {}
+    cards = [g for g in gpus if g.get("pci") and g.get("vram_gb")]   # (CUDA's devices are matched by PCI bus)
+    busy = maya_engine_mib() if cards else {}
+    cards = [g for g in cards if g.get("index") not in busy]
+    got = (cuda_room_bytes() if probe is None else probe) if cards else {}
+    saved = hy4_room_load() if saved is None else saved
+    # (several cards: their record together where one start on all of them measured it - hy4_room_measure_set)
+    together = ((saved.get(hy4_room_set_key(cards)) or {}).get("cards") or {}) \
+        if len(cards) > 1 and len(cards) == len(gpus) else {}
+    out = {}
+    for g in cards:
+        r = got.get(S._pci_key(str(g["pci"])))
+        if r:
+            one, two, tot = (float(x) / 2**30 for x in r)
+            rec = saved.get(hy4_room_key(g)) or {}
+            mine = together.get(S._pci_key(str(g["pci"])))
+            if isinstance(mine, (int, float)):
+                own, how = float(mine), "measured"
+            elif isinstance(rec.get("own_gib"), (int, float)):
+                own, how = float(rec["own_gib"]), "measured"
+            else:
+                own = max(max(one - two, 0.0) + max(float(g["vram_gb"]) - tot, 0.0), HY4_FIT_CUDA_OWN_GIB)
+                how = "estimated"
+            g["engine_room_gb"] = out[g["index"]] = one + own
+            g["engine_room_how"], g["cuda_free_gb"] = how, one
+    return out
+
+
+def hy4_room_key(g: dict) -> str:
+    """What a card's measured share (HY4_ROOM_STORE) holds for: this PC, the card (its name, PCI place and VRAM) and
+    its driver - a new driver or another card in the slot is measured again."""
+    return "|".join([platform.node() or "?", str(g.get("name") or "?"), S._pci_key(str(g.get("pci") or "?")),
+                     f"{float(g.get('vram_gb') or 0):.2f}", str(g.get("driver") or "?")])
+
+
+def hy4_room_load() -> dict:
+    """HY4_ROOM_STORE's records ({hy4_room_key: {"own_gib": ..., ...}}); {} where there are none."""
+    try:
+        got = json.loads(HY4_ROOM_STORE.read_text(encoding="utf-8"))
+        return got if isinstance(got, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def hy4_room_due(cfg: dict, gpus: list | None = None, saved: dict | None = None, probe=None) -> dict | None:
+    """The server's, just before it starts Hy4-Flash's engine: the card to measure CUDA's own share on at this start
+    (the engine's --room-report, then hy4_room_measure) - Windows, an NVIDIA card, the config on one GPU, no record
+    of it for this PC, card and driver yet - with what the setup's CUDA probe sees of it now, before the engine holds
+    it ("cuda_probe": cuda_room_bytes' reading; Windows' figure for another program drops as the engine fills the
+    card); None otherwise, or where the probe has no reading.  The config on several GPUs (a layer split or tensor
+    parallel): {"name", "cards": each card so} where these cards have no record together yet (hy4_room_set_key;
+    each card is measured in it: hy4_room_measure_set).  gpus, probe: setup.py's list and the readings (tests; else
+    read)."""
+    if not WIN or (cfg.get("backend") or "cuda") != "cuda" or             Path(str(cfg.get("exe") or "")).stem.lower() != "maya-hy4":
+        return None
+    sel = cfg.get("gpu")                               # (one card, several, or "0,2" - serve's gpu_list)
+    sel = [] if sel is None or sel == "" else list(sel) if isinstance(sel, (list, tuple)) else str(sel).split(",")
+    sel = [int(str(x).strip()) for x in sel if str(x).strip() != ""]
+    if not sel:
+        return None
+    found = {g["index"]: g for g in ((S.gpus() if gpus is None else gpus) or [])}
+    cards = [found.get(i) for i in sel]
+    if any(not g or not g.get("pci") or not g.get("vram_gb") or g.get("unified_memory") for g in cards):
+        return None
+    saved = hy4_room_load() if saved is None else saved
+    if (hy4_room_key(cards[0]) if len(cards) == 1 else hy4_room_set_key(cards)) in saved:
+        return None
+    probe = cuda_room_bytes() if probe is None else probe
+    out = []
+    for g in cards:
+        r = probe.get(S._pci_key(str(g["pci"])))
+        if not r:
+            return None
+        out.append(dict(g, cuda_probe=[int(x) for x in r]))
+    return out[0] if len(out) == 1 else {"name": f"{len(out)} cards", "cards": out}
+
+
+def hy4_room_set_key(cards: list) -> str:
+    """What the measured shares of several cards in one start (HY4_ROOM_STORE) hold for: this PC and the cards (each
+    one's name, PCI place, VRAM and driver, as hy4_room_key) - another card in the set, or a driver, is measured
+    again; a start on one of them alone has its own record (hy4_room_key)."""
+    return "|".join([platform.node() or "?", "set"]) + "|" + "+".join(sorted(hy4_room_key(g).split("|", 1)[1]
+                                                                              for g in cards))
+
+
+def hy4_room_store(key: str, rec: dict, same) -> dict | None:
+    """rec kept in HY4_ROOM_STORE under key - a record same(key) says is the same cards' under another driver gone."""
+    store = {k: v for k, v in hy4_room_load().items() if not same(k)}
+    store[key] = rec
+    try:
+        HY4_ROOM_STORE.parent.mkdir(parents=True, exist_ok=True)
+        HY4_ROOM_STORE.write_text(json.dumps(store, indent=1) + "\n", encoding="utf-8")
+    except OSError:
+        return None
+    return rec
+
+
+def hy4_room_need(cfg: dict, info: dict) -> tuple:
+    """(the setup's sums for the start the engine reported on - hy4_config_need_gib with the cache's rows and the
+    drafters' room the engine took, no margin -, its context, size, layout); need None where there are none."""
+    args, inst = [str(x) for x in cfg.get("args") or []], cfg.get("installer") or {}
+
+    def arg(k: str):
+        return args[args.index(k) + 1] if k in args[:-1] else None
+    quant, layout = inst.get("hy4_quant") or "", inst.get("layout") or HY4_STANDARD
+    ctx = int(arg("--max-context") or 0)
+    need = hy4_config_need_gib(quant, layout, ctx, chunk=int(arg("--chunk")) if arg("--chunk") else None,
+                               reserve_gb=float(arg("--reserve-gb")) if arg("--reserve-gb") else None,
+                               q8=info.get("room_rows") == "q8",
+                               mtp=bool(int(info.get("room_mtp") or 0)) if "room_mtp" in info else "--mtp" in args,
+                               dfly2=bool(int(info.get("room_drafter") or 0)), margin=False) if ctx else None
+    return need, ctx, quant, layout
+
+
+def hy4_room_measure(cfg: dict, card: dict, info: dict, probe=None, save: bool = True) -> dict | None:
+    """After the engine started with --room-report on `card` (hy4_room_due): CUDA's own share on it as this PC shows
+    it, kept in HY4_ROOM_STORE.  The engine says how much free VRAM CUDA gave it (free) and how much less of it its
+    start's choices hold with (slack: the cache's rows, the drafter's room, the pictures, that it starts - its own
+    plan, so exactly what decides).  In the setup's terms that start takes the setup's sums for it (need:
+    hy4_config_need_gib with the rows and the drafter the engine took, no margin) and had `slack` more: room = need +
+    slack, against what the setup's CUDA probe saw of the card just before the start (card["cuda_probe"]:
+    hy4_room_due's, else probe's - free with a context held) - the
+    share is room - probe.  Not kept: a start that streams its cache (other sums), a figure out of all reason
+    (beyond -1 / +2 GiB), no reading.  The record, or None."""
+    if card.get("cards"):
+        return hy4_room_measure_set(cfg, card["cards"], info, probe, save)
+    try:
+        gpus = str(info.get("room_gpus") or "")
+        mine = S._pci_key(str(card.get("pci") or ""))
+        got = next((p.split(",") for p in gpus.split(";")
+                    if len(p.split(",")) == 3 and S._pci_key(p.split(",")[0]) == mine), None)
+        if got is None or int(info.get("room_streamed") or 0):
+            return None
+        free, slack = float(got[1]) / 2**30, float(got[2]) / 2**30
+        need, ctx, quant, layout = hy4_room_need(cfg, info)
+        r = card.get("cuda_probe") or (probe or {}).get(mine)
+        if need is None or not r:
+            return None
+        seen = float(r[0]) / 2**30
+        own = need + slack - seen
+        if not -1.0 <= own <= 2.0:
+            return None
+    except (TypeError, ValueError, IndexError, KeyError, AttributeError):
+        return None
+    rec = {"own_gib": round(own, 3), "probe_free_gib": round(seen, 3), "engine_free_gib": round(free, 3),
+           "slack_gib": round(slack, 3), "need_gib": round(need, 3), "context": ctx, "rows": info.get("room_rows"),
+           "drafter": bool(int(info.get("room_drafter") or 0)), "quant": quant, "layout": layout,
+           "measured": time.strftime("%Y-%m-%d %H:%M:%S")}
+    if save:
+        key = hy4_room_key(card)                       # (this card's figure under another driver: gone)
+        return hy4_room_store(key, rec, lambda k: k.split("|")[:3] == key.split("|")[:3])
+    return rec
+
+
+def hy4_room_measure_set(cfg: dict, cards: list, info: dict, probe=None, save: bool = True) -> dict | None:
+    """hy4_room_measure for a start on several cards (a layer split or tensor parallel): the setup's sums for it are
+    one figure for the cards together (need: hy4_usable_gib adds the cards' rooms), and the engine says how much less
+    free on every card at once what the setup claims of the start holds with (room_joint: that it fits, the cache's
+    rows, the drafters, the pictures, KV streaming - not tensor parallel against a layer split, which the sums do
+    not count; each card's own figure counts the others' spare too where a layer split moves layers to a card with
+    room).  So the cards' shares together are need + n * joint
+    less what the probe saw of them, each card's in proportion to what the start takes on it (its probe less joint):
+    a tensor-parallel group's cache on every member, a split's layers by the cards' room.  Kept as one record for
+    these cards (hy4_room_set_key: "cards", each one's share by PCI place) - a start on one of them alone has its own.
+    Not kept: as hy4_room_measure's, or a share beyond -2 / +2 GiB on a card."""
+    try:
+        if int(info.get("room_streamed") or 0) or "room_joint" not in info:
+            return None
+        joint = float(info["room_joint"]) / 2**30
+        need, ctx, quant, layout = hy4_room_need(cfg, info)
+        seen = []
+        for g in cards:
+            r = g.get("cuda_probe") or (probe or {}).get(S._pci_key(str(g.get("pci") or "")))
+            if not r:
+                return None
+            seen.append(float(r[0]) / 2**30)
+        takes = [x - joint for x in seen]
+        if need is None or min(takes) <= 0:
+            return None
+        own = [t * (need / sum(takes) - 1.0) for t in takes]
+        if not all(-2.0 <= x <= 2.0 for x in own):
+            return None
+    except (TypeError, ValueError, IndexError, KeyError, AttributeError, ZeroDivisionError):
+        return None
+    rec = {"cards": {S._pci_key(str(g["pci"])): round(x, 3) for g, x in zip(cards, own)},
+           "probe_free_gib": [round(x, 3) for x in seen], "joint_gib": round(joint, 3), "need_gib": round(need, 3),
+           "context": ctx, "rows": info.get("room_rows"), "tp": int(info.get("room_tp") or 0),
+           "drafter": bool(int(info.get("room_drafter") or 0)), "mtp": bool(int(info.get("room_mtp") or 0)),
+           "quant": quant, "layout": layout, "measured": time.strftime("%Y-%m-%d %H:%M:%S")}
+    if save:
+        key = hy4_room_set_key(cards)                  # (these cards' figures under other drivers: gone)
+
+        def bare(k: str) -> list:                      # (a set key's cards without their drivers)
+            return sorted("|".join(c.split("|")[:3]) for c in "|".join(k.split("|")[2:]).split("+"))
+        return hy4_room_store(key, rec, lambda k: k.split("|")[:2] == key.split("|")[:2] and bare(k) == bare(key))
+    return rec
 
 
 def maya_engine_mib() -> dict:
@@ -9045,6 +10037,139 @@ def hy4_mtp_step(a, d: Path, quant: str, models: Path | None = None) -> Path | N
     return f
 
 
+def hy4_dfly2_entry(quant: str) -> dict | None:
+    """A Maya size's DFly2 drafter - its size entry's "drafter" in download.json: Tencent's draft layers in a GGUF
+    named .dfly2 on the Hub, kept under that name (the pack finds it in the model's folder) - as a MODELS entry
+    (offer_download's form), from Maya's repo at the table's commit.  None: the size has none (Tencent's own Q4_K_M
+    drafts with its MTP block)."""
+    if quant == HY4_Q4:
+        return None
+    man = read_json(HY4_MANIFEST)
+    src = hy4_quant_table(quant).get("drafter") or {}
+    if not src or not man.get("repo"):
+        return None
+    path, (size, sha) = next(iter(src.items()))
+    name, folder = Path(path).name, Path(path).parent.as_posix()
+    return {"about": f"{HY4}'s DFly2 drafter for {Q.shown('hy4', quant)}; {man.get('license', 'Tencent Hy License')}",
+            "format": "hy4-gguf", "repo": man["repo"], "revision": man.get("revision") or "main",
+            "folder": "" if folder == "." else folder, "files": {name: size}, "sha256": {name: sha},
+            "download_gb": size / 1e9, "name": name, "published": bool(man.get("revision"))}
+
+
+def hy4_dfly2_gib(quant: str) -> float:
+    """The VRAM (GiB) a size's DFly2 drafter takes on the main GPU, as the engine counts it (src/hy4/hy4_plan.hpp's
+    dfly_bytes): its matrices as they are in the file, its small scratch and lists (HY4_DFLY2_EXTRA).  0 where the size
+    has none."""
+    e = hy4_dfly2_entry(quant)
+    return 0.0 if e is None else (e["files"][e["name"]] + HY4_DFLY2_EXTRA) / 2**30
+
+
+def hy4_drafter_need_gib(plan: dict, fit: dict, drafter: float) -> float:
+    """The VRAM (GiB) a start hy4_fit worked out on a layout's plan needs with a drafter of `drafter` GiB beside it (the
+    DFly2 drafter: hy4_dfly2_gib): the fit's own figure ("need", with the cache's rows it chose), a prompt chunk it
+    doubled (HY4_CHUNK_UP_GIB), the drafter's room, and HY4_FIT_MARGIN_GIB where the fit's figure is one measured on a
+    card (a start with the drafter beside it never was; a context the plan does not list carries the margin already).
+    The engine loads the drafter only where its room changes nothing but the experts' places - the cache's rows, the
+    prompt chunk, KV streaming (src/hy4 load()): with this figure free it does, with less it decodes without drafts.
+    "room_measured" (hy4_fit's: every card's room counts CUDA's own share as the engine measured it on this PC -
+    hy4_engine_room): the sums without HY4_FIT_MARGIN_GIB, neither this one nor a context's the plan does not list -
+    the margin stands for sums never set against an engine, and that start set them against this PC's; a claim the
+    engine then finds no room for costs a start without drafts, never a start (the contexts and the rows that fit keep
+    their margins).  Measured on an RTX 3050 8 GB: so the setup claims the drafter at 4K and 5K, not at 6K and 8K,
+    and finds it room at 8K beside 8-bit rows - each as its engine then does."""
+    listed = plan.get("need_gib_q8" if fit.get("kv") == "q8" else "need_gib") or {}
+    up = HY4_CHUNK_UP_GIB if int(fit.get("chunk") or 0) > int(plan.get("chunk") or 0) > 0 else 0.0
+    if fit.get("room_measured") and not fit.get("kv_streaming"):
+        own = 0.0 if str(fit.get("context")) in listed else HY4_FIT_MARGIN_GIB   # (hy4_fit_need_gib's, taken out)
+        return float(fit.get("need") or 0) - own + up + drafter
+    margin = HY4_FIT_MARGIN_GIB if str(fit.get("context")) in listed else 0.0
+    return float(fit.get("need") or 0) + up + drafter + margin
+
+
+def hy4_dfly2_need_gib(quant: str, fit: dict) -> float:
+    """hy4_drafter_need_gib for a size's DFly2 drafter beside the start hy4_fit worked out for it (fit["layout"])."""
+    plan = (hy4_layouts(hy4_quant_table(quant)).get(fit.get("layout") or HY4_STANDARD) or {}).get("plan") or {}
+    return hy4_drafter_need_gib(plan, fit, hy4_dfly2_gib(quant))
+
+
+def hy4_mtp_need_gib(quant: str, fit: dict) -> float:
+    """hy4_drafter_need_gib for the MTP block (hy4_mtp_gib at the fit's prompt chunk) beside the start hy4_fit worked
+    out for a size - the engine counts the block's room as the DFly2 drafter's (with drafting on and off; where it
+    would change the cache's rows or KV streaming, the block is not loaded).  With both drafters in
+    a pack the engine counts the larger room once (one drafter at a time): the block's."""
+    plan = (hy4_layouts(hy4_quant_table(quant)).get(fit.get("layout") or HY4_STANDARD) or {}).get("plan") or {}
+    return hy4_drafter_need_gib(plan, fit, hy4_mtp_gib(int(fit.get("chunk") or plan.get("chunk") or 1024)))
+
+
+def hy4_fast_drafting_fit(quant: str, gpus: list, fit: dict, used: dict | None = None,
+                          ram_gb: float | None = None) -> dict | None:
+    """The setup's opt-in faster drafting (--fast-drafting on) for the start hy4_fit worked out (fit): the same
+    context and layout with the latent cache in 8-bit rows (the engine's --kv q8, "--kv q8" in "args";
+    "fast_drafting": True) where those rows are what gives the size's DFly2 drafter its room - on one GPU, where the
+    start as worked out drafts with nothing: its rows F16 in VRAM (no KV streaming), no room for the drafter beside
+    them nor for the MTP block, and with 8-bit rows the drafter's room as the engine counts it
+    (hy4_dfly2_need_gib).  "f16_room": True where these sums find the drafter room beside the F16 rows too (the
+    default then claims it; the engine, which counts its own free VRAM at every start, may still find none there -
+    its start line says so - so the faster start is taken there only when asked by
+    name).  Decided by this PC's own figures (its cards' free VRAM, the size's plan), no card named.  The 8-bit rows
+    round the cache, so the answers are worded slightly differently from the default's (F16) - only when asked;
+    within that start drafting on and off give the same tokens (the drafter's room is counted either way).  None: no
+    such trade here."""
+    if quant == HY4_Q4 or len(gpus or []) != 1 or "error" in fit or fit.get("kv") != "f16" or \
+            fit.get("kv_streaming") or hy4_dfly2_entry(quant) is None:
+        return None
+    usable = float(fit.get("usable") or 0)
+    if fit.get("layout") == HY4_STANDARD and hy4_mtp_entry() is not None and \
+            float(fit.get("need") or 0) + hy4_mtp_gib(int(fit.get("chunk") or 1024)) <= usable:
+        return None                                    # (the MTP block fits: the default drafts with it)
+    f8 = hy4_fit(hy4_quant_table(quant), gpus, fit["context"], used=used, layout=fit.get("layout"),
+                 pictures=bool(fit.get("vision", True)), ram_gb=ram_gb, drafter=hy4_dfly2_gib(quant), kv="q8")
+    if "error" in f8 or f8.get("kv") != "q8" or f8.get("kv_streaming") or hy4_dfly2_need_gib(quant, f8) > f8["usable"]:
+        return None
+    room = hy4_dfly2_need_gib(quant, fit) <= usable
+    if room and fit.get("layout") == HY4_STANDARD:
+        return None                                    # (the standard layout: its room comes from the experts' VRAM)
+    return {**f8, "fast_drafting": True, "f16_room": room}
+
+
+def hy4_pack_dfly2_file(pack: Path) -> str | None:
+    """The name of the DFly2 drafter's file a pack reads (hy4.txt has dfly_layers; tensors.txt's `file` line of the
+    file that is no trunk shard, MTP block or mmproj), or None."""
+    try:
+        if not any(ln.split()[:1] == ["dfly_layers"] for ln in (pack / "hy4.txt").read_text(encoding="utf-8").splitlines()):
+            return None
+        with (pack / "tensors.txt").open(encoding="utf-8") as f:
+            for ln in f:
+                if not ln.startswith("file "):
+                    break
+                n = Path(ln.split(None, 2)[2].strip()).name
+                if n.endswith(".dfly2") or "drafter" in n.lower():
+                    return n
+    except (OSError, IndexError):
+        pass
+    return None
+
+
+def hy4_dfly2_step(a, d: Path, quant: str, models: Path | None = None) -> Path | None:
+    """A Maya size's DFly2 drafter file in d, or None (no drafts: said in step 7).  A file the folder has is taken;
+    else it is hard-linked from another folder of this size here (its other layout's), else downloaded (asked like
+    the model).  Checked against its sha256 (once, then remembered)."""
+    e = hy4_dfly2_entry(quant)
+    if e is None:
+        return None
+    f = d / e["name"]
+    if file_incomplete(e, f) and models is not None:
+        link_published(f, e["files"][f.name], e["sha256"][f.name], hy4_places(models, f.name))
+    if file_incomplete(e, f) and e["published"]:
+        offer_download(a, f"{HY4}'s DFly2 drafter for this size ({e['download_gb']:.1f} GB)", d, [f], e)
+    if file_incomplete(e, f):
+        return None
+    if not sha256_checked(f, e["sha256"][f.name]):
+        fail(f"{f}: the sha256 does not match the published one - the file is damaged (its size is right)",
+             f"delete it and run {ME} --setup again")
+    return f
+
+
 def hy4_pack_step(a, d: Path, files: list, vis: Path | None = None, mtp: Path | None = None,
                   dfly: Path | None = None) -> Path:
     """tools/hy4/pack_gguf.py's pack in <model>/maya-hy4: the geometry, where every tensor sits in the two GGUF files
@@ -9119,6 +10244,9 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     kept = keep_args(old.get("args") or [], args, ("--tp", "--main-gpu", "--cpu-threads", "--profile", "--draft",
                                                    "--draft-floor") +
                      (("--chunk", "--reserve-gb", "--vram-experts") if standard else ()))
+    if getattr(a, "vram_reserve_mib", None) is not None:   # (#1026) given now: written, and a later setup keeps it
+        put = set_vram_reserve(args, "hy4", a.vram_reserve_mib)
+        ok(f"VRAM kept free on each GPU: {a.vram_reserve_mib} MiB (--vram-reserve-mib: {put})")
     inst = {"family": "hy4", "hy4_quant": quant, "quant": HY4_QUANTS.get(quant, HY4), "layout": fit["layout"],
             "drafting": "on" if drafting else "off"}
     if quant != HY4_Q4 and hy4_pack_mtp_file(pack):    # (a Maya size with the draft block: "off" is then a choice)
@@ -9160,6 +10288,21 @@ def write_config_hy4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     ok(f"config: {cfg_path}")
     ok(f"start script: {write_run_script(cfg_path, cfg['port'])}")
     return cfg_path
+
+
+def hy4_smaller_fit(quant: str, gpus: list, pictures: bool = True) -> tuple[str, str] | None:
+    """Where `quant` does not fit these cards even at its smallest context: the largest smaller Maya size that does
+    (hy4_fit) and that the setup offers - its files published, the layout it takes there too: (key, layout), or None.
+    Another set of files (Tencent's Q4_K_M): any Maya size."""
+    keys = list(HY4_QUANTS)
+    for k in reversed(keys[:keys.index(quant)] if quant in keys else keys):
+        q = hy4_quant_table(k)
+        if not hy4_layouts(q) or not hy4_published(k):
+            continue
+        f = hy4_fit(q, gpus, pictures=pictures)
+        if "error" not in f and hy4_published(k, f["layout"]):
+            return k, f["layout"]
+    return None
 
 
 def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None) -> dict:
@@ -9232,6 +10375,59 @@ def hy4_fit_step(a, pc: dict, quant: str, prev_ctx: int | None = None, have=None
     if fit["context"] > HY4_TESTED_CONTEXT:
         warn(f"past {context_label(HY4_TESTED_CONTEXT)} the engine has not been run end to end yet")
     return fit
+
+
+HY4_FAST_DRAFTING_SAID = "faster drafting, slightly different wording than the default"
+
+
+def hy4_fast_drafting_step(a, pc: dict, quant: str, fit: dict, before: bool = False) -> tuple:
+    """Step 2's faster drafting for a Maya size (hy4_fast_drafting_fit: the cache in 8-bit rows where that gives the
+    DFly2 drafter its room): (the start the setup goes on with, the faster one where it applies here but was not
+    taken - step 5's drafting line names it - else None).  --fast-drafting on: the faster where it applies (else
+    said why not; the default); off: the default; not given: the config before's choice (before) where it still
+    applies, else asked where the setup's sums give the drafter no room beside the F16 rows - the default first
+    (--yes: the default).  Never the default by itself: its answers are not the default's."""
+    want, how = getattr(a, "fast_drafting", None), getattr(a, "drafting", None)
+    if how in ("off", "mtp"):
+        if want == "on":
+            warn(f"faster drafting: not set up with --drafting {how} - it is for the DFly2 drafter; the cache's rows "
+                 "stay the default's")
+        return fit, None
+    fast = hy4_fast_drafting_fit(quant, pc["gpus"], fit, ram_gb=mem_gb()[0])
+    if fast is None:
+        if want == "on" or (want is None and before):
+            usable = float(fit.get("usable") or 0)
+            why = (f"the DFly2 drafter runs on one GPU for now (this PC: {len(pc['gpus'])})" if len(pc["gpus"]) != 1
+                   else "this size has no DFly2 drafter" if hy4_dfly2_entry(quant) is None
+                   else "at this context the cache is in 8-bit rows by default already" if fit.get("kv") == "q8"
+                   else "at this context the cache's older rows live in RAM" if fit.get("kv_streaming")
+                   else "the MTP block drafts here, with the default's answers"
+                   if fit.get("layout") == HY4_STANDARD and hy4_mtp_entry() is not None and
+                   float(fit.get("need") or 0) + hy4_mtp_gib(int(fit.get("chunk") or 1024)) <= usable
+                   else f"even with the cache in 8-bit rows the DFly2 drafter has no room at this context "
+                        f"({usable:.1f} GB free)")
+            (warn if want == "on" else ok)(f"faster drafting: not set up - {why}; the default start")
+        return fit, None
+    if want is None and not before and fast["f16_room"]:
+        return fit, None                               # (the default claims the drafter: nothing asked, nothing said)
+    if want is None and not before:
+        rows = [("Default: the cache in F16 rows, no drafting at this context", "recommended",
+                 "The answers as Maya's default writes them."),
+                ("Faster drafting: the cache in 8-bit rows, so the DFly2 drafter fits", None,
+                 f"Decoding is faster; {HY4_FAST_DRAFTING_SAID}.")]
+        pick = choose("Faster drafting?",
+                      [f"At a context of {context_label(fit['context'])} the DFly2 drafter has no room on this card beside "
+                       "the cache's F16 rows.", "With the cache in 8-bit rows it fits: faster drafting, slightly "
+                       "different wording than the default."], rows, 0, a.yes or getattr(a, "check", False))
+        want = "on" if pick == 1 else "off"
+    if want == "off":                                  # (not asked for by name: step 5 names the faster one)
+        return fit, (fast if getattr(a, "fast_drafting", None) is None else None)
+    ok("faster drafting: on" + (" (as set up before)" if getattr(a, "fast_drafting", None) is None else "") +
+       f" - the cache in 8-bit rows at this context, so the DFly2 drafter fits" +
+       (" also where the engine finds no room for it beside F16 rows (its start line says which)"
+        if fast["f16_room"] else "") +
+       f": {HY4_FAST_DRAFTING_SAID} (F16 rows; {ME} --setup --fast-drafting off sets the default up again)")
+    return fast, None
 
 
 def set_up_hy4(a, prev: dict) -> Path | None:
@@ -9674,6 +10870,9 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
         args.append("--vision")
     kept = keep_args(old.get("args") or [], args, ("--mtp-max-t", "--kv", "--vram-reserve-mib", "--pool-workers",
                                                    "--experts-from-gguf", "--ple-io"))
+    if getattr(a, "vram_reserve_mib", None) is not None:   # (#1026) given now: written, and a later setup keeps it
+        put = set_vram_reserve(args, "qwen", a.vram_reserve_mib)
+        ok(f"VRAM kept free beside the expert cache: {a.vram_reserve_mib} MiB ({put})")
     inst = {"family": "qwen", "quant": QWEN_UD_DIR if quant == QWEN_UD else QWEN, "qwen_quant": quant}
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup: its card's)
     cfg = {"exe": str(EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
@@ -9683,10 +10882,7 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
            "sampling": sampling, "reasoning_effort": effort,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port,
            **({"vision": vision} if vision else {})}
-    for k in ("host", "api_key", "cors_origins", "mcp_servers", "layer_split"):
-        if old.get(k) is not None:
-            cfg[k] = old[k]
-            kept.append(k)
+    kept += keep_server_settings(cfg, old, a, ("layer_split",))
     env = {**(old.get("env") or {}), **parse_env(a.env)}
     if env:
         cfg["env"] = env
@@ -9877,6 +11073,7 @@ def set_up_qwen(a, prev: dict) -> Path | None:
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
     m = qwen_entry(quant)
+    a.gpus_before = prev.get("gpu")                    # (the GPU question's default: this config's GPUs)
     pc = check_pc(a, "qwen")                           # 1
     total, _ = mem_gb()
     vram = sum(g["vram_gb"] for g in pc["gpus"])
@@ -9916,1099 +11113,7 @@ def set_up_qwen(a, prev: dict) -> Path | None:
     return cfg_path
 
 
-def set_up_and_serve(a, prev: dict) -> tuple | None:
-    """On the setup's screen: the setup, then Maya running on the same screen - its server's output there, Ctrl+C
-    stops it.  (The config, the server's exit code or None when it was not started), or None when the model was not
-    downloaded."""
-    cfg_path = set_up(a, prev)
-    if cfg_path is None or a.no_start:
-        return cfg_path and (cfg_path, None)
-    return cfg_path, serve_on_screen(cfg_path, a)
-
-
-# ------------------------------------------------------------------------------------------------ main
-def maya_version() -> str:
-    return (HERE / "VERSION").read_text(encoding="utf-8").strip() if (HERE / "VERSION").exists() else "?"
-
-
-def model_option(a) -> str | None:
-    """--model as typed -> what the setup reads (in place): a.model a GLM download (a MODELS key), DS4 or MM3, and a
-    DeepSeek / MiniMax / Hy4-Flash quant's files as --ds4-quant / --mm3-quant / --hy4-quant.  It takes a setup id (glm-maya-s, deepseek-maya-xs,
-    minimax-maya-xs ...), a quant's full name (MiniMax-M3.1-Flash-Maya-XS) or any name it took before (Maya-S24,
-    EXL3-3.05bpw, DeepSeek-V4.1-Flash-1017 ...; --mm3-quant gguf-xs as maya-xs).  The error for a name it does not
-    know, or for a quant --ds4-quant / --mm3-quant names otherwise; else None."""
-    if getattr(a, "mm3_quant", None):
-        a.mm3_quant = Q.MM3_QUANT_ALIASES.get(a.mm3_quant, a.mm3_quant)
-    if not a.model:
-        return None
-    hit = Q.resolve(a.model, list(glm_downloads()))   # (GLM-5.3's downloads included)
-    if hit is None:
-        return (f"--model {a.model}: not a model Maya knows - one of " + ", ".join(i for _, _, _, i in Q.QUANTS) +
-                f", {DS4}, {MM3}, {HY4}, cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN} (experimental), or a GLM-5.3-Flash download: " + ", ".join(MODELS))
-    family, key = hit
-    if family == "glm":
-        a.model = key
-        return None
-    if family == "qwen":                                 # (CYBER-FROST's GGUF, or unsloth's UD-IQ2_XS: --qwen-quant)
-        given = getattr(a, "qwen_quant", None)
-        if key is not None and given and given != key:
-            return (f"--model {a.model} is {Q.shown(family, key)}, but --qwen-quant says {given}: give one of them")
-        a.model = QWEN
-        if key is not None:
-            a.qwen_quant = key
-        return None
-    if family == "ik2":                                  # (Inkling-2-Mini: its one file set, unsloth's UD-Q4_K_XL)
-        a.model = IK2
-        return None
-    a.model, flag = {"deepseek": (DS4, "ds4_quant"), "hy4": (HY4, "hy4_quant")}.get(family, (MM3, "mm3_quant"))
-    if key is not None:
-        given = getattr(a, flag, None)
-        if given and given != key:
-            return (f"--model {Q.setup_id(family, key)} is {Q.shown(family, key)}, but --{flag.replace('_', '-')} "
-                    f"says {given}: give one of them")
-        setattr(a, flag, key)
-    return None
-
-
-def hy4_engine_room(pc: dict, probe=None, saved: dict | None = None) -> dict:
-    """Windows: each chosen NVIDIA card's VRAM as the engine's CUDA gets it, measured now, kept on the card as
-    "engine_room_gb" (hy4_usable_gib counts no more than that there); {index: GiB} of what was measured.  Windows
-    keeps part of every card from the programs on it (the display driver's budget), which nvidia-smi does not show:
-    an RTX 3050 8 GB with 0.1 GB in use gave CUDA 7.0 GB free - the engine plans with that figure (cudaMemGetInfo at
-    its start), the setup's own sums with the card's total less what is in use.  So the room is that figure in the
-    setup's terms: CUDA's free VRAM with a context held, plus what CUDA itself takes beside it - a context (the free
-    VRAM with a second one beside it, the difference) and the part of the card the driver keeps from CUDA
-    (nvidia-smi's total less CUDA's) - CUDA's own share as the setup's sums count it.  Windows keeps that share out
-    of sight in its budget, so the engine measures it at its first start on this PC (hy4_room_measure: the engine's
-    --room-report, kept in HY4_ROOM_STORE for this PC, card and driver) and the room counts that figure from then on
-    ("engine_room_how": "measured"); until then the larger of what this PC shows of it and HY4_FIT_CUDA_OWN_GIB, the
-    first guess ("estimated").  "cuda_free_gb": CUDA's own reading (the config keeps it: the Models page counts a
-    figure measured later with it).  On Linux the measured part alone is nvidia-smi's total less its used (nothing
-    else is kept there), so only Windows is measured.  Not measured: another OS, AMD, a unified-memory GPU, a card a
-    Maya engine holds now (its own VRAM would be counted as kept: the reading as before), no answer from the driver.
-    Several cards: each one's share from their record together where a start on all of them measured it
-    (hy4_room_set_key - a split's or a tensor-parallel group's plan is not one card's), else each card's own.
-    probe: the readings (tests; else cuda_room_bytes); saved: HY4_ROOM_STORE's records (tests; else read)."""
-    gpus = (pc or {}).get("gpus") or []
-    if not WIN or (pc or {}).get("backend", "cuda") != "cuda" or not gpus or hy4_amd(gpus) or \
-            any(g.get("unified_memory") for g in gpus):
-        return {}
-    cards = [g for g in gpus if g.get("pci") and g.get("vram_gb")]   # (CUDA's devices are matched by PCI bus)
-    busy = maya_engine_mib() if cards else {}
-    cards = [g for g in cards if g.get("index") not in busy]
-    got = (cuda_room_bytes() if probe is None else probe) if cards else {}
-    saved = hy4_room_load() if saved is None else saved
-    # (several cards: their record together where one start on all of them measured it - hy4_room_measure_set)
-    together = ((saved.get(hy4_room_set_key(cards)) or {}).get("cards") or {}) \
-        if len(cards) > 1 and len(cards) == len(gpus) else {}
-    out = {}
-    for g in cards:
-        r = got.get(S._pci_key(str(g["pci"])))
-        if r:
-            one, two, tot = (float(x) / 2**30 for x in r)
-            rec = saved.get(hy4_room_key(g)) or {}
-            mine = together.get(S._pci_key(str(g["pci"])))
-            if isinstance(mine, (int, float)):
-                own, how = float(mine), "measured"
-            elif isinstance(rec.get("own_gib"), (int, float)):
-                own, how = float(rec["own_gib"]), "measured"
-            else:
-                own = max(max(one - two, 0.0) + max(float(g["vram_gb"]) - tot, 0.0), HY4_FIT_CUDA_OWN_GIB)
-                how = "estimated"
-            g["engine_room_gb"] = out[g["index"]] = one + own
-            g["engine_room_how"], g["cuda_free_gb"] = how, one
-    return out
-
-
-def hy4_room_due(cfg: dict, gpus: list | None = None, saved: dict | None = None, probe=None) -> dict | None:
-    """The server's, just before it starts Hy4-Flash's engine: the card to measure CUDA's own share on at this start
-    (the engine's --room-report, then hy4_room_measure) - Windows, an NVIDIA card, the config on one GPU, no record
-    of it for this PC, card and driver yet - with what the setup's CUDA probe sees of it now, before the engine holds
-    it ("cuda_probe": cuda_room_bytes' reading; Windows' figure for another program drops as the engine fills the
-    card); None otherwise, or where the probe has no reading.  The config on several GPUs (a layer split or tensor
-    parallel): {"name", "cards": each card so} where these cards have no record together yet (hy4_room_set_key;
-    each card is measured in it: hy4_room_measure_set).  gpus, probe: setup.py's list and the readings (tests; else
-    read)."""
-    if not WIN or (cfg.get("backend") or "cuda") != "cuda" or             Path(str(cfg.get("exe") or "")).stem.lower() != "maya-hy4":
-        return None
-    sel = cfg.get("gpu")                               # (one card, several, or "0,2" - serve's gpu_list)
-    sel = [] if sel is None or sel == "" else list(sel) if isinstance(sel, (list, tuple)) else str(sel).split(",")
-    sel = [int(str(x).strip()) for x in sel if str(x).strip() != ""]
-    if not sel:
-        return None
-    found = {g["index"]: g for g in ((S.gpus() if gpus is None else gpus) or [])}
-    cards = [found.get(i) for i in sel]
-    if any(not g or not g.get("pci") or not g.get("vram_gb") or g.get("unified_memory") for g in cards):
-        return None
-    saved = hy4_room_load() if saved is None else saved
-    if (hy4_room_key(cards[0]) if len(cards) == 1 else hy4_room_set_key(cards)) in saved:
-        return None
-    probe = cuda_room_bytes() if probe is None else probe
-    out = []
-    for g in cards:
-        r = probe.get(S._pci_key(str(g["pci"])))
-        if not r:
-            return None
-        out.append(dict(g, cuda_probe=[int(x) for x in r]))
-    return out[0] if len(out) == 1 else {"name": f"{len(out)} cards", "cards": out}
-
-
-def hy4_room_measure(cfg: dict, card: dict, info: dict, probe=None, save: bool = True) -> dict | None:
-    """After the engine started with --room-report on `card` (hy4_room_due): CUDA's own share on it as this PC shows
-    it, kept in HY4_ROOM_STORE.  The engine says how much free VRAM CUDA gave it (free) and how much less of it its
-    start's choices hold with (slack: the cache's rows, the drafter's room, the pictures, that it starts - its own
-    plan, so exactly what decides).  In the setup's terms that start takes the setup's sums for it (need:
-    hy4_config_need_gib with the rows and the drafter the engine took, no margin) and had `slack` more: room = need +
-    slack, against what the setup's CUDA probe saw of the card just before the start (card["cuda_probe"]:
-    hy4_room_due's, else probe's - free with a context held) - the
-    share is room - probe.  Not kept: a start that streams its cache (other sums), a figure out of all reason
-    (beyond -1 / +2 GiB), no reading.  The record, or None."""
-    if card.get("cards"):
-        return hy4_room_measure_set(cfg, card["cards"], info, probe, save)
-    try:
-        gpus = str(info.get("room_gpus") or "")
-        mine = S._pci_key(str(card.get("pci") or ""))
-        got = next((p.split(",") for p in gpus.split(";")
-                    if len(p.split(",")) == 3 and S._pci_key(p.split(",")[0]) == mine), None)
-        if got is None or int(info.get("room_streamed") or 0):
-            return None
-        free, slack = float(got[1]) / 2**30, float(got[2]) / 2**30
-        need, ctx, quant, layout = hy4_room_need(cfg, info)
-        r = card.get("cuda_probe") or (probe or {}).get(mine)
-        if need is None or not r:
-            return None
-        seen = float(r[0]) / 2**30
-        own = need + slack - seen
-        if not -1.0 <= own <= 2.0:
-            return None
-    except (TypeError, ValueError, IndexError, KeyError, AttributeError):
-        return None
-    rec = {"own_gib": round(own, 3), "probe_free_gib": round(seen, 3), "engine_free_gib": round(free, 3),
-           "slack_gib": round(slack, 3), "need_gib": round(need, 3), "context": ctx, "rows": info.get("room_rows"),
-           "drafter": bool(int(info.get("room_drafter") or 0)), "quant": quant, "layout": layout,
-           "measured": time.strftime("%Y-%m-%d %H:%M:%S")}
-    if save:
-        key = hy4_room_key(card)                       # (this card's figure under another driver: gone)
-        return hy4_room_store(key, rec, lambda k: k.split("|")[:3] == key.split("|")[:3])
-    return rec
-
-
-def hy4_dfly2_need_gib(quant: str, fit: dict) -> float:
-    """hy4_drafter_need_gib for a size's DFly2 drafter beside the start hy4_fit worked out for it (fit["layout"])."""
-    plan = (hy4_layouts(hy4_quant_table(quant)).get(fit.get("layout") or HY4_STANDARD) or {}).get("plan") or {}
-    return hy4_drafter_need_gib(plan, fit, hy4_dfly2_gib(quant))
-
-
-def hy4_dfly2_gib(quant: str) -> float:
-    """The VRAM (GiB) a size's DFly2 drafter takes on the main GPU, as the engine counts it (src/hy4/hy4_plan.hpp's
-    dfly_bytes): its matrices as they are in the file, its small scratch and lists (HY4_DFLY2_EXTRA).  0 where the size
-    has none."""
-    e = hy4_dfly2_entry(quant)
-    return 0.0 if e is None else (e["files"][e["name"]] + HY4_DFLY2_EXTRA) / 2**30
-
-
-def q4x_verdict(log_text: str) -> str | None:
-    """maya-hy4's own verdict on the 4-bit copies in its log (HY4_Q4X=2): "on", "off", "unmeasured" (copies made, the
-    answers too short for the timed turns), or None - no CPU lane of IQ2_XXS experts, nothing to decide."""
-    if "the 4-bit copies kept" in log_text:
-        return "on"
-    if ("the 4-bit copies dropped" in log_text or "the file's rows kept" in log_text
-            or "no 4-bit copies of its experts" in log_text):
-        return "off"
-    return "unmeasured" if "4-bit copies" in log_text else None
-
-
-def q4x_calibration(cfg_path: Path, why: str = "") -> bool | None:
-    """maya-hy4's 4-bit copies of the CPU lane's most routed experts, measured again on this PC (--speed-calibration):
-    the engine's own check (HY4_Q4X=2 with HY4_Q4X_MEASURE=1 - a probe at its start, then, once the copies are made and
-    the lane's experts warm, the answers' lane calls timed in turns with and without them until two windows agree; the
-    same tokens either way, the copies giving the file's bits) over a warm-up answer and as many more as it takes (up
-    to Q4X_ANSWERS).  The engine remembers the verdict itself (the data folder's hy4-cpu-lane.txt), so the next starts
-    do not measure; installer.q4x_calibration keeps the result for the record (the config's env is left as it is).
-    True / False: on / off; None: nothing to decide here (no CPU lane, no IQ2_XXS experts) or not measured (said)."""
-    cfg = read_json(cfg_path)
-    tdir = Path(cfg.get("tokenizer") or "")
-    if not cfg.get("exe") or not cfg.get("tokenizer") or not (tdir / "chat_template.jinja").exists():
-        warn("the CPU lane check needs the config's engine and tokenizer (with its chat template): its 4-bit expert "
-             f"copies are measured at each start instead ({ME} --setup writes them again)")
-        return None
-    if busy_skip(cfg, why == "asked for", "the CPU lane check", "the GPU(s)",
-                 f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration"):
-        return None
-    sys.path.insert(0, str(ROOT))
-    sys.path.insert(0, str(ROOT / "tools"))
-    import serve.server as SV
-    import strata_tokenizer as ST
-    ids = ST.Tokenizer.from_dir(tdir).encode(bench_chat("hy4", tdir)(BENCH_TOPICS[0]), parse_special=True)
-    env = SV.child_env(cfg)
-    env[HY4_Q4X_ENV] = "2"
-    env["HY4_Q4X_MEASURE"] = "1"                       # (measured again: the verdict remembered before is not used)
-    env["HY4_ROUTE_MEASURE"] = "1"                     # (the prompt route's rates too, on long prompts after the answers)
-    say()
-    say(f"  Checking the CPU lane's 4-bit expert copies on this PC{f' ({why})' if why else ''}: a few answers, the model")
-    say("  loads once (a few minutes) ...")
-    log_path = ROOT / "maya-q4x-calibration.log"
-    done = False
-
-    def said() -> str:
-        return log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
-    with open(log_path, "w", encoding="utf-8") as log:
-        try:
-            p = subprocess.Popen([cfg["exe"], "--serve"] + SV.engine_args(cfg), stdin=subprocess.PIPE,
-                                 stdout=subprocess.PIPE, stderr=log, text=True, env=env,
-                                 cwd=cfg.get("cwd") or str(ROOT), bufsize=1)
-        except OSError as e:
-            warn(f"the CPU lane check could not start the engine ({e}): its copies are measured at each start instead")
-            return None
-
-        def gen(n_new: int, prompt: list[int] | None = None) -> bool:
-            p.stdin.write(f"GEN {n_new} temperature=0 " + ",".join(map(str, prompt or ids)) + "\n")
-            p.stdin.flush()
-            for line in p.stdout:
-                if line.startswith(("DONE", "ERR")):
-                    return line.startswith("DONE")
-            return False
-
-        try:
-            for line in p.stdout:
-                if line.startswith("READY"):
-                    # (the warm-up answer gives the routing counts the copies are made by - between answers, so the
-                    #  engine is left idle until it times them - then answers until its verdict: the one-token calls
-                    #  timed in turns with and without them, window by window, until two agree)
-                    done = gen(64)
-                    for _ in range(Q4X_BUILD_WAIT_S // 5):
-                        if not done or q4x_verdict(said()) != "unmeasured" or "timing the answers" in said():
-                            break
-                        time.sleep(5)
-                    for _ in range(Q4X_ANSWERS):
-                        if not done or q4x_verdict(said()) != "unmeasured":
-                            break
-                        done = gen(256)
-                        time.sleep(2)                  # (the verdict's line reaches the log)
-                    # (the prompt route's rates: long prompts, each read in chunks whose CPU lane layers take the GPU
-                    #  stream and the lane in turns, until two windows of times agree)
-                    tok = ST.Tokenizer.from_dir(tdir)
-                    for text in route_prompts(tdir, ROUTE_PROMPTS):
-                        if not done or route_state(said()) != "measuring":
-                            break
-                        done = gen(1, tok.encode(text, parse_special=True))
-                        time.sleep(1)
-                    break
-            p.stdin.write("QUIT\n")
-            p.stdin.flush()
-            p.wait(timeout=120)
-        except (OSError, ValueError, subprocess.TimeoutExpired):
-            p.kill()
-    verdict = q4x_verdict(log_path.read_text(encoding="utf-8", errors="replace"))
-    if m := re.search(r"INFO drafting: (.+?) - the fastest on this PC \(measured (now|[0-9-]+)", said()):
-        ok(f"drafting: {m.group(1)} - whichever of no drafting, the MTP block and the DFly2 drafter decodes fastest on "
-           "this PC, each with its own VRAM plan (measured once, remembered: the next starts use it)")
-    rs = route_state(said())
-    if rs == "measured":
-        ok("the prompt route's rates (GPU stream or CPU lane for a prompt's experts outside VRAM) measured on this PC: "
-           "the same prompt now takes the same route at every start")
-    elif rs == "measuring":
-        warn("the prompt route's rates did not settle in this check: the engine measures them at the next start, "
-             "before it is ready, and remembers them")
-    if not done or verdict == "unmeasured":
-        warn(f"the CPU lane check did not finish ({log_path.name} says why): the engine measures its copies at the "
-             f"next start instead, once its experts are warm, and remembers it ({ME} --speed-calibration tries again)")
-        cfg.setdefault("installer", {})["q4x_calibration"] = {"result": "unmeasured", "date": time.strftime("%Y-%m-%d")}
-        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
-        return None
-    # (the verdict is the engine's to remember - per PC, model and lane kernels; the config only records it)
-    cfg.setdefault("installer", {})["q4x_calibration"] = {"result": verdict or "n/a", "date": time.strftime("%Y-%m-%d")}
-    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
-    if verdict is None:
-        ok("CPU lane check: nothing to decide on this PC (no CPU lane of IQ2_XXS experts)")
-        return None
-    ok(f"the CPU lane's 4-bit expert copies: {'ON - faster' if verdict == 'on' else 'off - not faster'} on this PC "
-       "(the same answers either way)")
-    return verdict == "on"
-
-
-HY4_DFLY2_EXTRA = 32 << 20
-
-HY4_DRAFT_RULE = {"maya-xs": "dfly2", "maya-s": "mtp", "maya-m": "mtp", "maya-l": "mtp"}
-
-HY4_DRAFT_TIE = 0.02
-
-HY4_DRAFT_PROBE = {"mixed": True, "tokens": 512, "answer": 128, "warm": 32}
-
-HY4_FIT_CUDA_OWN_GIB = 0.5
-
-HY4_ROOM_STORE = ROOT / "data" / "vram-room.json"
-
-HY4_KV_RESIDENT = 32768                            # (KV streaming: the global layers' newest positions kept in VRAM)
-
-HY4_Q4X_ENV = "HY4_Q4X"                            # maya-hy4's 4-bit expert copies: 2 / unset measured, 1 on, 0 off
-
-Q4X_ANSWERS = 12                                   # (--speed-calibration's CPU lane check: answers at most for a verdict)
-
-Q4X_BUILD_WAIT_S = 120                             # (... and the wait for the copies, made between answers)
-
-HY4_FAST_DRAFTING_SAID = "faster drafting, slightly different wording than the default"
-
-def q4x_config_migrate(cfg_path: Path, cfg: dict) -> dict:
-    """A Hy4-Flash config whose env still carries the HY4_Q4X an earlier start's CPU lane check wrote (1.1.69 and
-    before, installer.q4x_calibration "on" / "off" - often measured on cold experts, so starts flipped): that value
-    dropped.  maya-hy4 now measures its 4-bit copies once its lane's experts are warm and remembers the verdict itself
-    (the data folder's hy4-cpu-lane.txt: a line a PC, model and lane-kernel build), so a start never loads the model
-    an extra time for it.  A value set by hand (no installer.q4x_calibration, or another value) stays."""
-    inst, env = cfg.get("installer") or {}, cfg.get("env") or {}
-    res = (inst.get("q4x_calibration") or {}).get("result")
-    if config_family(cfg) != "hy4" or res not in ("on", "off") or \
-            str(env.get(HY4_Q4X_ENV)) != ("1" if res == "on" else "0"):
-        return cfg
-    env.pop(HY4_Q4X_ENV, None)
-    inst.pop("q4x_calibration", None)
-    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
-    return read_json(cfg_path)
-
-
-def hy4_first_start_said(cfg: dict) -> list:
-    """The start's lines on what Hy4-Flash's first start on a PC measures once before it is ready, and roughly how
-    long it takes (times as the engine's first starts took them: a GPU holding the whole model, GPUs with the CPU
-    lane; the server then says the time left at this PC's own pace)."""
-    if hy4_engine_drafting(cfg):
-        return ["The first start on this PC measures it once before it is ready: which drafting answers fastest here",
-                "(each choice loaded and timed on a few short answers - roughly one to two minutes), and where part of",
-                "the model runs on the CPU, its CPU lane and prompt route (about one minute more).  Later starts skip",
-                "that and are ready in well under a minute."]
-    return ["The first start on this PC measures it once before it is ready (where part of the model runs on the CPU:",
-            "its CPU lane and prompt route - about one minute more); later starts skip that."]
-
-
-def hy4_engine_drafting(cfg: dict) -> bool:
-    """A Hy4-Flash config whose engine picks its drafting itself (--drafting auto / on): no drafting, the MTP block or
-    the DFly2 drafter, whichever decodes fastest here - each loaded once with its own VRAM plan at the first start on
-    this PC, before it is ready, and remembered in the data folder (hy4-drafting.txt)."""
-    args = [str(x) for x in cfg.get("args") or []]
-    return config_family(cfg) == "hy4" and "--drafting" in args[:-1] and \
-        args[args.index("--drafting") + 1] in ("auto", "on")
-
-
-def hy4_both_drafters(cfg: dict) -> bool:
-    """A Maya size of Hy4-Flash set up where its MTP block and its DFly2 drafter both fit (installer.draft_choice
-    "auto": both in the pack, one GPU): which of the two drafts is the speed calibration's to measure."""
-    inst = cfg.get("installer") or {}
-    return config_family(cfg) == "hy4" and Q.config_key(cfg) != HY4_Q4 and inst.get("draft_choice") == "auto" and \
-        bool(inst.get("draft_block")) and bool(inst.get("dfly2")) and len(cfg.get("gpu") or [0]) < 2
-
-
-def hy4_with_drafter(cfg: dict, drafter: str) -> dict:
-    """A copy of a Hy4-Flash config that drafts with `drafter` ("mtp": --mtp, "dfly2": --dfly2) - the other's flag
-    out."""
-    out = json.loads(json.dumps(cfg))
-    args = [x for x in (out.get("args") or []) if x not in ("--mtp", "--dfly2")]
-    out["args"] = args + ["--dfly2" if drafter == "dfly2" else "--mtp"]
-    out.setdefault("installer", {})["drafter"] = drafter
-    return out
-
-
-def speed_calibration_hy4(cfg_path: Path, cfg: dict, why: str = "") -> bool:
-    """A Maya size of Hy4-Flash where both drafters fit: its sustained decode speed with the MTP block and with the
-    DFly2 drafter (both write only tokens the model checks: the same answers), a short probe each as
-    tools/calibrate_draft.py measures (HY4_DRAFT_PROBE: code, an explanation, plain text, thinking).  The faster is
-    kept; within HY4_DRAFT_TIE the size's rule (HY4_DRAFT_RULE) stays.  False: not measured (nothing changed)."""
-    if busy_skip(cfg, why == "asked for", "the speed calibration", "the GPU",
-                 f" (a model server still running?) - it runs at the next start, or: {ME} --speed-calibration"):
-        return False
-    quant = Q.config_key(cfg)
-    rule = HY4_DRAFT_RULE.get(quant, "mtp")
-    mtp, dfly = hy4_with_drafter(cfg, "mtp"), hy4_with_drafter(cfg, "dfly2")
-    say()
-    say("  Speed calibration: the MTP block or the DFly2 drafter?" + (f" ({why})" if why else ""))
-    say("  Both fit on this GPU and the model checks every drafted token; which drafts faster depends on how much of")
-    say(f"  the model the GPU holds beside it. Maya loads the model twice (the MTP block, then DFly2); each time it "
-        f"writes about {HY4_DRAFT_PROBE['tokens']} tokens of")
-    say("  short answers (code, an explanation, plain text, thinking) after a warm-up, and the speeds are compared.")
-    say("  The PC is busy meanwhile.")
-    log = cfg.get("log")
-    since = os.path.getsize(log) if log and os.path.isfile(log) else 0
-    now = (cfg.get("installer") or {}).get("drafter") or ("dfly2" if "--dfly2" in (cfg.get("args") or []) else "mtp")
-    try:
-        res = CD.run(mtp, dfly, say=say, other_label="the MTP block", draft_label="DFly2", size=HY4_DRAFT_PROBE)
-    except Exception as e:                             # never stops a setup or a start: the config stays as it was
-        warn(f"the speed calibration did not finish ({e}): nothing changed - Maya keeps "
-             f"{'DFly2' if now == 'dfly2' else 'the MTP block'}; {ME} --speed-calibration tries again")
-        why_not = CAL.engine_error(log, since)
-        if why_not:
-            say(f"       the engine said: {why_not}")
-        cfg.setdefault("installer", {})["speed_calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"),
-                                                                "failed": str(e)[:300]}
-        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
-        return False
-    o, d = res["other"]["tok_s"], res["dflash2"]["tok_s"]
-    tie = abs(d - o) <= HY4_DRAFT_TIE * max(o, d)
-    keep = rule if tie else "dfly2" if d > o else "mtp"
-    out = mtp if keep == "mtp" else dfly
-    out.setdefault("installer", {})["speed_calibration"] = {
-        "date": time.strftime("%Y-%m-%d %H:%M"), "version": maya_version(), "mtp_tok_s": o, "dfly2_tok_s": d,
-        "tokens": [res["other"]["tokens"], res["dflash2"]["tokens"]], "kept": keep}
-    cfg_path.write_text(json.dumps(N.env_out(out), indent=1), encoding="utf-8")
-    say()
-    ok(f"speed calibration: {d:.1f} tokens/s with DFly2 against {o:.1f} with the MTP block - Maya drafts with " +
-       ("DFly2" if keep == "dfly2" else "the MTP block") + (" (a tie: this size's default)" if tie else ""))
-    say(f"       (saved in {cfg_path.name}; {ME} --speed-calibration measures again, --setup --drafting mtp|dfly2 "
-        "picks one by hand)")
-    return True
-
-
-def hy4_stream_ram_gib(ctx: int, q8: bool = False) -> float:
-    """KV streaming's RAM (GiB, pinned): every position's latent row of the 13 global layers."""
-    return 13 * ctx * (HY4_KV_Q8_ROW if q8 else 576 * 2) / 2**30
-
-
-def hy4_stream_need_gib(plan: dict, ctx: int, q8: bool = False, resident: int | None = None) -> float:
-    """hy4_fit_need_gib with KV streaming: less the global layers' rows that leave the VRAM."""
-    chunk = int(plan.get("chunk") or 1024)
-    res = HY4_KV_RESIDENT if resident is None else resident
-    return hy4_fit_need_gib(plan, ctx, q8) - \
-        (hy4_cache_bytes(ctx, chunk, q8) - hy4_cache_bytes(ctx, chunk, q8, res)) / 2**30
-
-
-def hy4_stream_rows(plan: dict, ctx: int, usable: float, ram_gib: float | None, kv: str | None = None) -> tuple | None:
-    """A context that fits the VRAM only with KV streaming, as the engine's --kv-streaming auto takes it:
-    (rows, ring) - "f16" then "q8", with the ring of HY4_KV_RESIDENT positions and then a prompt chunk's - where the
-    RAM left for the rows (ram_gib) holds them; None: no RAM figure given, or it fits neither way.  kv "f16" / "q8":
-    those rows only (the engine's --kv f16 / q8)."""
-    if ram_gib is None:
-        return None
-    for res in (HY4_KV_RESIDENT, 1):
-        for q8 in ((kv == "q8",) if kv in ("f16", "q8") else (False, True)):
-            if hy4_stream_need_gib(plan, ctx, q8, res) <= usable:
-                # (the engine stops at the first that fits the VRAM: the RAM must hold that one's rows)
-                return ("q8" if q8 else "f16", res) if hy4_stream_ram_gib(ctx, q8) <= ram_gib else None
-    return None
-
-
-def hy4_ram_for_rows(q: dict, usable: float, ram_gb: float | None) -> float | None:
-    """The RAM (GiB) KV streaming's rows may take on this PC: its RAM less the system's headroom (8 GiB or a tenth)
-    and the size's experts outside the VRAM (the CPU lane reads them from the file cache); None: no RAM figure."""
-    if not ram_gb:
-        return None
-    return float(ram_gb) - max(8.0, 0.1 * float(ram_gb)) - max(0.0, float(q.get("memory_gb") or 0) - usable)
-
-
-def hy4_config_stream(quant: str, layout: str, ctx: int, usable: float, ram_gib: float | None,
-                      chunk: int | None = None, reserve_gb: float | None = None, mtp: bool = False,
-                      kv: str | None = None) -> tuple | None:
-    """hy4_stream_rows for a size already set up, counted as hy4_config_need_gib counts it (the Models page's
-    serve/models.py hy4_room): (rows, positions kept in VRAM, VRAM GiB) where the context fits its cards only with KV
-    streaming and the RAM left for the rows (ram_gib: hy4_ram_for_rows) holds them; kv "f16" / "q8": the config's own
-    rows only."""
-    if ram_gib is None:
-        return None
-    plan = (hy4_layouts(hy4_quant_table(quant)).get(layout or HY4_STANDARD) or {}).get("plan") or {}
-    ch = int(chunk or plan.get("chunk") or 1024)
-    for res in (HY4_KV_RESIDENT, 1):
-        for q8 in ((kv == "q8",) if kv in ("f16", "q8") else (False, True)):
-            base = hy4_config_need_gib(quant, layout, ctx, chunk=chunk, reserve_gb=reserve_gb, q8=q8, mtp=mtp)
-            if base is None:
-                return None
-            need = base - (hy4_cache_bytes(ctx, ch, q8) - hy4_cache_bytes(ctx, ch, q8, res)) / 2**30
-            if need <= usable:
-                return ("q8" if q8 else "f16", max(res, ch), need) if hy4_stream_ram_gib(ctx, q8) <= ram_gib else None
-    return None
-
-
-def hy4_room_key(g: dict) -> str:
-    """What a card's measured share (HY4_ROOM_STORE) holds for: this PC, the card (its name, PCI place and VRAM) and
-    its driver - a new driver or another card in the slot is measured again."""
-    return "|".join([platform.node() or "?", str(g.get("name") or "?"), S._pci_key(str(g.get("pci") or "?")),
-                     f"{float(g.get('vram_gb') or 0):.2f}", str(g.get("driver") or "?")])
-
-
-def hy4_room_load() -> dict:
-    """HY4_ROOM_STORE's records ({hy4_room_key: {"own_gib": ..., ...}}); {} where there are none."""
-    try:
-        got = json.loads(HY4_ROOM_STORE.read_text(encoding="utf-8"))
-        return got if isinstance(got, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def hy4_room_set_key(cards: list) -> str:
-    """What the measured shares of several cards in one start (HY4_ROOM_STORE) hold for: this PC and the cards (each
-    one's name, PCI place, VRAM and driver, as hy4_room_key) - another card in the set, or a driver, is measured
-    again; a start on one of them alone has its own record (hy4_room_key)."""
-    return "|".join([platform.node() or "?", "set"]) + "|" + "+".join(sorted(hy4_room_key(g).split("|", 1)[1]
-                                                                              for g in cards))
-
-
-def hy4_room_store(key: str, rec: dict, same) -> dict | None:
-    """rec kept in HY4_ROOM_STORE under key - a record same(key) says is the same cards' under another driver gone."""
-    store = {k: v for k, v in hy4_room_load().items() if not same(k)}
-    store[key] = rec
-    try:
-        HY4_ROOM_STORE.parent.mkdir(parents=True, exist_ok=True)
-        HY4_ROOM_STORE.write_text(json.dumps(store, indent=1) + "\n", encoding="utf-8")
-    except OSError:
-        return None
-    return rec
-
-
-def hy4_room_need(cfg: dict, info: dict) -> tuple:
-    """(the setup's sums for the start the engine reported on - hy4_config_need_gib with the cache's rows and the
-    drafters' room the engine took, no margin -, its context, size, layout); need None where there are none."""
-    args, inst = [str(x) for x in cfg.get("args") or []], cfg.get("installer") or {}
-
-    def arg(k: str):
-        return args[args.index(k) + 1] if k in args[:-1] else None
-    quant, layout = inst.get("hy4_quant") or "", inst.get("layout") or HY4_STANDARD
-    ctx = int(arg("--max-context") or 0)
-    need = hy4_config_need_gib(quant, layout, ctx, chunk=int(arg("--chunk")) if arg("--chunk") else None,
-                               reserve_gb=float(arg("--reserve-gb")) if arg("--reserve-gb") else None,
-                               q8=info.get("room_rows") == "q8",
-                               mtp=bool(int(info.get("room_mtp") or 0)) if "room_mtp" in info else "--mtp" in args,
-                               dfly2=bool(int(info.get("room_drafter") or 0)), margin=False) if ctx else None
-    return need, ctx, quant, layout
-
-
-def hy4_room_measure_set(cfg: dict, cards: list, info: dict, probe=None, save: bool = True) -> dict | None:
-    """hy4_room_measure for a start on several cards (a layer split or tensor parallel): the setup's sums for it are
-    one figure for the cards together (need: hy4_usable_gib adds the cards' rooms), and the engine says how much less
-    free on every card at once what the setup claims of the start holds with (room_joint: that it fits, the cache's
-    rows, the drafters, the pictures, KV streaming - not tensor parallel against a layer split, which the sums do
-    not count; each card's own figure counts the others' spare too where a layer split moves layers to a card with
-    room).  So the cards' shares together are need + n * joint
-    less what the probe saw of them, each card's in proportion to what the start takes on it (its probe less joint):
-    a tensor-parallel group's cache on every member, a split's layers by the cards' room.  Kept as one record for
-    these cards (hy4_room_set_key: "cards", each one's share by PCI place) - a start on one of them alone has its own.
-    Not kept: as hy4_room_measure's, or a share beyond -2 / +2 GiB on a card."""
-    try:
-        if int(info.get("room_streamed") or 0) or "room_joint" not in info:
-            return None
-        joint = float(info["room_joint"]) / 2**30
-        need, ctx, quant, layout = hy4_room_need(cfg, info)
-        seen = []
-        for g in cards:
-            r = g.get("cuda_probe") or (probe or {}).get(S._pci_key(str(g.get("pci") or "")))
-            if not r:
-                return None
-            seen.append(float(r[0]) / 2**30)
-        takes = [x - joint for x in seen]
-        if need is None or min(takes) <= 0:
-            return None
-        own = [t * (need / sum(takes) - 1.0) for t in takes]
-        if not all(-2.0 <= x <= 2.0 for x in own):
-            return None
-    except (TypeError, ValueError, IndexError, KeyError, AttributeError, ZeroDivisionError):
-        return None
-    rec = {"cards": {S._pci_key(str(g["pci"])): round(x, 3) for g, x in zip(cards, own)},
-           "probe_free_gib": [round(x, 3) for x in seen], "joint_gib": round(joint, 3), "need_gib": round(need, 3),
-           "context": ctx, "rows": info.get("room_rows"), "tp": int(info.get("room_tp") or 0),
-           "drafter": bool(int(info.get("room_drafter") or 0)), "mtp": bool(int(info.get("room_mtp") or 0)),
-           "quant": quant, "layout": layout, "measured": time.strftime("%Y-%m-%d %H:%M:%S")}
-    if save:
-        key = hy4_room_set_key(cards)                  # (these cards' figures under other drivers: gone)
-
-        def bare(k: str) -> list:                      # (a set key's cards without their drivers)
-            return sorted("|".join(c.split("|")[:3]) for c in "|".join(k.split("|")[2:]).split("+"))
-        return hy4_room_store(key, rec, lambda k: k.split("|")[:2] == key.split("|")[:2] and bare(k) == bare(key))
-    return rec
-
-
-def hy4_dfly2_entry(quant: str) -> dict | None:
-    """A Maya size's DFly2 drafter - its size entry's "drafter" in download.json: Tencent's draft layers in a GGUF
-    named .dfly2 on the Hub, kept under that name (the pack finds it in the model's folder) - as a MODELS entry
-    (offer_download's form), from Maya's repo at the table's commit.  None: the size has none (Tencent's own Q4_K_M
-    drafts with its MTP block)."""
-    if quant == HY4_Q4:
-        return None
-    man = read_json(HY4_MANIFEST)
-    src = hy4_quant_table(quant).get("drafter") or {}
-    if not src or not man.get("repo"):
-        return None
-    path, (size, sha) = next(iter(src.items()))
-    name, folder = Path(path).name, Path(path).parent.as_posix()
-    return {"about": f"{HY4}'s DFly2 drafter for {Q.shown('hy4', quant)}; {man.get('license', 'Tencent Hy License')}",
-            "format": "hy4-gguf", "repo": man["repo"], "revision": man.get("revision") or "main",
-            "folder": "" if folder == "." else folder, "files": {name: size}, "sha256": {name: sha},
-            "download_gb": size / 1e9, "name": name, "published": bool(man.get("revision"))}
-
-
-def hy4_drafter_need_gib(plan: dict, fit: dict, drafter: float) -> float:
-    """The VRAM (GiB) a start hy4_fit worked out on a layout's plan needs with a drafter of `drafter` GiB beside it (the
-    DFly2 drafter: hy4_dfly2_gib): the fit's own figure ("need", with the cache's rows it chose), a prompt chunk it
-    doubled (HY4_CHUNK_UP_GIB), the drafter's room, and HY4_FIT_MARGIN_GIB where the fit's figure is one measured on a
-    card (a start with the drafter beside it never was; a context the plan does not list carries the margin already).
-    The engine loads the drafter only where its room changes nothing but the experts' places - the cache's rows, the
-    prompt chunk, KV streaming (src/hy4 load()): with this figure free it does, with less it decodes without drafts.
-    "room_measured" (hy4_fit's: every card's room counts CUDA's own share as the engine measured it on this PC -
-    hy4_engine_room): the sums without HY4_FIT_MARGIN_GIB, neither this one nor a context's the plan does not list -
-    the margin stands for sums never set against an engine, and that start set them against this PC's; a claim the
-    engine then finds no room for costs a start without drafts, never a start (the contexts and the rows that fit keep
-    their margins).  Measured on an RTX 3050 8 GB: so the setup claims the drafter at 4K and 5K, not at 6K and 8K,
-    and finds it room at 8K beside 8-bit rows - each as its engine then does."""
-    listed = plan.get("need_gib_q8" if fit.get("kv") == "q8" else "need_gib") or {}
-    up = HY4_CHUNK_UP_GIB if int(fit.get("chunk") or 0) > int(plan.get("chunk") or 0) > 0 else 0.0
-    if fit.get("room_measured") and not fit.get("kv_streaming"):
-        own = 0.0 if str(fit.get("context")) in listed else HY4_FIT_MARGIN_GIB   # (hy4_fit_need_gib's, taken out)
-        return float(fit.get("need") or 0) - own + up + drafter
-    margin = HY4_FIT_MARGIN_GIB if str(fit.get("context")) in listed else 0.0
-    return float(fit.get("need") or 0) + up + drafter + margin
-
-
-def hy4_mtp_need_gib(quant: str, fit: dict) -> float:
-    """hy4_drafter_need_gib for the MTP block (hy4_mtp_gib at the fit's prompt chunk) beside the start hy4_fit worked
-    out for a size - the engine counts the block's room as the DFly2 drafter's (with drafting on and off; where it
-    would change the cache's rows or KV streaming, the block is not loaded).  With both drafters in
-    a pack the engine counts the larger room once (one drafter at a time): the block's."""
-    plan = (hy4_layouts(hy4_quant_table(quant)).get(fit.get("layout") or HY4_STANDARD) or {}).get("plan") or {}
-    return hy4_drafter_need_gib(plan, fit, hy4_mtp_gib(int(fit.get("chunk") or plan.get("chunk") or 1024)))
-
-
-def hy4_fast_drafting_fit(quant: str, gpus: list, fit: dict, used: dict | None = None,
-                          ram_gb: float | None = None) -> dict | None:
-    """The setup's opt-in faster drafting (--fast-drafting on) for the start hy4_fit worked out (fit): the same
-    context and layout with the latent cache in 8-bit rows (the engine's --kv q8, "--kv q8" in "args";
-    "fast_drafting": True) where those rows are what gives the size's DFly2 drafter its room - on one GPU, where the
-    start as worked out drafts with nothing: its rows F16 in VRAM (no KV streaming), no room for the drafter beside
-    them nor for the MTP block, and with 8-bit rows the drafter's room as the engine counts it
-    (hy4_dfly2_need_gib).  "f16_room": True where these sums find the drafter room beside the F16 rows too (the
-    default then claims it; the engine, which counts its own free VRAM at every start, may still find none there -
-    its start line says so - so the faster start is taken there only when asked by
-    name).  Decided by this PC's own figures (its cards' free VRAM, the size's plan), no card named.  The 8-bit rows
-    round the cache, so the answers are worded slightly differently from the default's (F16) - only when asked;
-    within that start drafting on and off give the same tokens (the drafter's room is counted either way).  None: no
-    such trade here."""
-    if quant == HY4_Q4 or len(gpus or []) != 1 or "error" in fit or fit.get("kv") != "f16" or \
-            fit.get("kv_streaming") or hy4_dfly2_entry(quant) is None:
-        return None
-    usable = float(fit.get("usable") or 0)
-    if fit.get("layout") == HY4_STANDARD and hy4_mtp_entry() is not None and \
-            float(fit.get("need") or 0) + hy4_mtp_gib(int(fit.get("chunk") or 1024)) <= usable:
-        return None                                    # (the MTP block fits: the default drafts with it)
-    f8 = hy4_fit(hy4_quant_table(quant), gpus, fit["context"], used=used, layout=fit.get("layout"),
-                 pictures=bool(fit.get("vision", True)), ram_gb=ram_gb, drafter=hy4_dfly2_gib(quant), kv="q8")
-    if "error" in f8 or f8.get("kv") != "q8" or f8.get("kv_streaming") or hy4_dfly2_need_gib(quant, f8) > f8["usable"]:
-        return None
-    room = hy4_dfly2_need_gib(quant, fit) <= usable
-    if room and fit.get("layout") == HY4_STANDARD:
-        return None                                    # (the standard layout: its room comes from the experts' VRAM)
-    return {**f8, "fast_drafting": True, "f16_room": room}
-
-
-def hy4_pack_dfly2_file(pack: Path) -> str | None:
-    """The name of the DFly2 drafter's file a pack reads (hy4.txt has dfly_layers; tensors.txt's `file` line of the
-    file that is no trunk shard, MTP block or mmproj), or None."""
-    try:
-        if not any(ln.split()[:1] == ["dfly_layers"] for ln in (pack / "hy4.txt").read_text(encoding="utf-8").splitlines()):
-            return None
-        with (pack / "tensors.txt").open(encoding="utf-8") as f:
-            for ln in f:
-                if not ln.startswith("file "):
-                    break
-                n = Path(ln.split(None, 2)[2].strip()).name
-                if n.endswith(".dfly2") or "drafter" in n.lower():
-                    return n
-    except (OSError, IndexError):
-        pass
-    return None
-
-
-def hy4_dfly2_step(a, d: Path, quant: str, models: Path | None = None) -> Path | None:
-    """A Maya size's DFly2 drafter file in d, or None (no drafts: said in step 7).  A file the folder has is taken;
-    else it is hard-linked from another folder of this size here (its other layout's), else downloaded (asked like
-    the model).  Checked against its sha256 (once, then remembered)."""
-    e = hy4_dfly2_entry(quant)
-    if e is None:
-        return None
-    f = d / e["name"]
-    if file_incomplete(e, f) and models is not None:
-        link_published(f, e["files"][f.name], e["sha256"][f.name], hy4_places(models, f.name))
-    if file_incomplete(e, f) and e["published"]:
-        offer_download(a, f"{HY4}'s DFly2 drafter for this size ({e['download_gb']:.1f} GB)", d, [f], e)
-    if file_incomplete(e, f):
-        return None
-    if not sha256_checked(f, e["sha256"][f.name]):
-        fail(f"{f}: the sha256 does not match the published one - the file is damaged (its size is right)",
-             f"delete it and run {ME} --setup again")
-    return f
-
-
-def hy4_smaller_fit(quant: str, gpus: list, pictures: bool = True) -> tuple[str, str] | None:
-    """Where `quant` does not fit these cards even at its smallest context: the largest smaller Maya size that does
-    (hy4_fit) and that the setup offers - its files published, the layout it takes there too: (key, layout), or None.
-    Another set of files (Tencent's Q4_K_M): any Maya size."""
-    keys = list(HY4_QUANTS)
-    for k in reversed(keys[:keys.index(quant)] if quant in keys else keys):
-        q = hy4_quant_table(k)
-        if not hy4_layouts(q) or not hy4_published(k):
-            continue
-        f = hy4_fit(q, gpus, pictures=pictures)
-        if "error" not in f and hy4_published(k, f["layout"]):
-            return k, f["layout"]
-    return None
-
-
-def hy4_fast_drafting_step(a, pc: dict, quant: str, fit: dict, before: bool = False) -> tuple:
-    """Step 2's faster drafting for a Maya size (hy4_fast_drafting_fit: the cache in 8-bit rows where that gives the
-    DFly2 drafter its room): (the start the setup goes on with, the faster one where it applies here but was not
-    taken - step 5's drafting line names it - else None).  --fast-drafting on: the faster where it applies (else
-    said why not; the default); off: the default; not given: the config before's choice (before) where it still
-    applies, else asked where the setup's sums give the drafter no room beside the F16 rows - the default first
-    (--yes: the default).  Never the default by itself: its answers are not the default's."""
-    want, how = getattr(a, "fast_drafting", None), getattr(a, "drafting", None)
-    if how in ("off", "mtp"):
-        if want == "on":
-            warn(f"faster drafting: not set up with --drafting {how} - it is for the DFly2 drafter; the cache's rows "
-                 "stay the default's")
-        return fit, None
-    fast = hy4_fast_drafting_fit(quant, pc["gpus"], fit, ram_gb=mem_gb()[0])
-    if fast is None:
-        if want == "on" or (want is None and before):
-            usable = float(fit.get("usable") or 0)
-            why = (f"the DFly2 drafter runs on one GPU for now (this PC: {len(pc['gpus'])})" if len(pc["gpus"]) != 1
-                   else "this size has no DFly2 drafter" if hy4_dfly2_entry(quant) is None
-                   else "at this context the cache is in 8-bit rows by default already" if fit.get("kv") == "q8"
-                   else "at this context the cache's older rows live in RAM" if fit.get("kv_streaming")
-                   else "the MTP block drafts here, with the default's answers"
-                   if fit.get("layout") == HY4_STANDARD and hy4_mtp_entry() is not None and
-                   float(fit.get("need") or 0) + hy4_mtp_gib(int(fit.get("chunk") or 1024)) <= usable
-                   else f"even with the cache in 8-bit rows the DFly2 drafter has no room at this context "
-                        f"({usable:.1f} GB free)")
-            (warn if want == "on" else ok)(f"faster drafting: not set up - {why}; the default start")
-        return fit, None
-    if want is None and not before and fast["f16_room"]:
-        return fit, None                               # (the default claims the drafter: nothing asked, nothing said)
-    if want is None and not before:
-        rows = [("Default: the cache in F16 rows, no drafting at this context", "recommended",
-                 "The answers as Maya's default writes them."),
-                ("Faster drafting: the cache in 8-bit rows, so the DFly2 drafter fits", None,
-                 f"Decoding is faster; {HY4_FAST_DRAFTING_SAID}.")]
-        pick = choose("Faster drafting?",
-                      [f"At a context of {context_label(fit['context'])} the DFly2 drafter has no room on this card beside "
-                       "the cache's F16 rows.", "With the cache in 8-bit rows it fits: faster drafting, slightly "
-                       "different wording than the default."], rows, 0, a.yes or getattr(a, "check", False))
-        want = "on" if pick == 1 else "off"
-    if want == "off":                                  # (not asked for by name: step 5 names the faster one)
-        return fit, (fast if getattr(a, "fast_drafting", None) is None else None)
-    ok("faster drafting: on" + (" (as set up before)" if getattr(a, "fast_drafting", None) is None else "") +
-       f" - the cache in 8-bit rows at this context, so the DFly2 drafter fits" +
-       (" also where the engine finds no room for it beside F16 rows (its start line says which)"
-        if fast["f16_room"] else "") +
-       f": {HY4_FAST_DRAFTING_SAID} (F16 rows; {ME} --setup --fast-drafting off sets the default up again)")
-    return fast, None
-
-
-def keep_server_settings(cfg: dict, old: dict, a, extra: tuple = ()) -> list:
-    """The config before's SERVER_KEYS (and a family's own `extra` keys) into the new config `cfg`, except a --port /
-    --host / --api-key given now (it wins): the keys that differ from what this setup wrote."""
-    given = {"port": getattr(a, "port", None), "host": getattr(a, "host", None), "api_key": getattr(a, "api_key", None)}
-    kept = []
-    for k in SERVER_KEYS + tuple(extra):
-        if (old or {}).get(k) is None or given.get(k):
-            continue
-        if cfg.get(k) != old[k]:
-            kept.append(k)
-        cfg[k] = old[k]
-    return kept
-
-
-CUDA_ROOM_PROBE = r"""
-import ctypes, json, sys
-cu = ctypes.WinDLL("nvcuda.dll") if sys.platform == "win32" else ctypes.CDLL("libcuda.so.1")
-out = {}
-n = ctypes.c_int(0)
-if cu.cuInit(0) == 0 and cu.cuDeviceGetCount(ctypes.byref(n)) == 0:
-    for i in range(n.value):
-        dev, bus, p, c = ctypes.c_int(0), ctypes.create_string_buffer(32), ctypes.c_void_p(), ctypes.c_void_p()
-        if cu.cuDeviceGet(ctypes.byref(dev), i) or cu.cuDeviceGetPCIBusId(bus, 32, dev) or \
-                cu.cuDevicePrimaryCtxRetain(ctypes.byref(p), dev):
-            continue
-        one, two, tot = ctypes.c_size_t(0), ctypes.c_size_t(0), ctypes.c_size_t(0)
-        ok = cu.cuCtxSetCurrent(p) == 0 and cu.cuMemGetInfo_v2(ctypes.byref(one), ctypes.byref(tot)) == 0
-        if ok and cu.cuCtxCreate_v2(ctypes.byref(c), 0, dev) == 0:
-            ok = cu.cuMemGetInfo_v2(ctypes.byref(two), ctypes.byref(tot)) == 0
-            cu.cuCtxDestroy_v2(c)
-        else:
-            ok = False
-        cu.cuCtxSetCurrent(None)
-        cu.cuDevicePrimaryCtxRelease_v2(dev)
-        if ok:
-            out[bus.value.decode("ascii", "replace")] = [one.value, two.value, tot.value]
-print(json.dumps(out))
-"""
-
-GLM_SETUP_ENV = ("MAYA_GLM_RESERVE_MB", "MAYA_GLM_RAM_HEADROOM_GB", "MAYA_GLM_SPLIT", "MAYA_GLM_MTP_DECODE",
-                 "MAYA_GLM_PARALLEL_LOAD", "MAYA_GLM_PREFILL_SUB", "MAYA_GLM_PREFILL_MB", "MAYA_HIPBLASLT_TUNING")
-
-SERVER_KEYS = ("host", "port", "api_key", "cors_origins", "mcp_servers", "model_management", "web_ui",
-               "idle_unload_s", "loop_guard", "fit_max_tokens")
-
-ROUTE_PROMPTS = 12                                 # (... then long prompts at most for the prompt route's rates)
-
-CONFIG_VOLATILE = ("written", "ablate")
-
-def cuda_room_bytes() -> dict:
-    """{PCI id (setup.py's _pci_key form): (free, free with a second context, total) in bytes} - what CUDA's driver
-    says of each NVIDIA device's VRAM with a context held (CUDA_ROOM_PROBE, in a process of its own); {} where it
-    cannot be asked (no driver, a failing call, a timeout)."""
-    try:
-        txt = subprocess.run([sys.executable, "-I", "-c", CUDA_ROOM_PROBE], capture_output=True, text=True,
-                             timeout=60).stdout
-        got = json.loads(txt.strip().splitlines()[-1]) if txt.strip() else {}
-        return {S._pci_key(k): tuple(int(x) for x in v) for k, v in got.items() if len(v) == 3}
-    except (OSError, subprocess.SubprocessError, ValueError, TypeError, IndexError):
-        return {}
-
-
-def _set_up(a, prev: dict) -> Path | None:
-    """Steps 1-8, then the tuning: the config written, or None when the model was not downloaded.  `prev`: the
-    config of the setup before (its answers are the defaults).  The model comes first: GLM-5.3-Flash or DeepSeek-V4.1-
-    Flash-1017 (set_up_ds4), each then with the answers of its own setup before."""
-    family = choose_family(a, prev)
-    S.model_named(FAMILY_TITLE[family])
-    check_parallel(a, family)
-    if config_family(prev) != family:
-        prev = next((c for c in map(read_json, configs()) if config_family(c) == family and
-                     c.get("backend", "cuda") == a.backend), {})
-    if family == "deepseek":
-        return set_up_ds4(a, prev)
-    if family == "minimax":
-        return set_up_mm3(a, prev)
-    if family == "qwen":
-        return set_up_qwen(a, prev)
-    if family == "hy4":
-        return set_up_hy4(a, prev)
-    if family == "ik2":
-        return set_up_ik2(a, prev)
-    inst = prev.get("installer") or {}
-    prev_args = prev.get("args") or []
-    prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
-    a.gpus_before = prev.get("gpu")                    # (the GPU question's default: this config's GPUs)
-    pc = check_pc(a)                                   # 1
-    metal = pc["backend"] == "metal"
-    step(2, "your choices")                            # 2
-    # the models folder: --models-dir, else the one set up before (a config from before the option has its data
-    # folder, whose models/ held the downloads), else Maya-data/models next to this folder
-    models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
-              Path(inst["models_dir"]) if inst.get("models_dir") else
-              Path(inst["data_dir"]) / "models" if inst.get("data_dir") else ROOT.parent / "Maya-data" / "models")
-    choice = choose_model(a, models, inst, pc)
-    # a GLM-5.3-Flash quant that cannot start on this PC's one card: said here, before the tools, the build and the
-    # download (glm_fit_gate; --force-fit goes on)
-    fit = glm_fit_gate(a, choice[1], pc) if choice[0] == "download" and choice[1] in GLM_FIT else None
-    if choice[0] == "download" and choice[1] in G53_MODELS:   # (GLM-5.3: "GLM-5.3 (744B) · UD-IQ2_M")
-        ok(f"model: {G53.LABEL} · {Q.glm53_quant(choice[1])}, in {download_dir(models, choice[1])}")
-    elif choice[0] == "download":
-        ok(f"model: {Q.shown('glm', choice[1])}, in {download_dir(models, choice[1])}")
-    else:
-        ok(f"model: {choice[1]} (yours)")
-    if g53_choice(choice):                             # GLM-5.3 (744B): the contexts its cache fits on these GPUs
-        plan = g53_cache_plan(a, pc, choice)           # (as the config will run: write_config's)
-        contexts = g53_contexts(pc, **plan)
-        # (a unified-memory APU: the largest context that keeps the whole model in memory - --context still wins)
-        rec, line = g53_apu_context(pc, plan, choice[1] if choice[0] == "download" else quant_of(Path(choice[1])),
-                                    contexts)
-        if line and not getattr(a, "context", None):
-            (ok if rec else warn)(line)
-        ctx = choose_context(a, prev_ctx, contexts, rec or (DEFAULT_CONTEXT if DEFAULT_CONTEXT in contexts else contexts[-1]))
-        if rec and ctx > rec:                          # (--context, or the earlier setup's answer: kept, said)
-            warn(f"a {context_label(ctx)} context's cache pushes experts to the SSD on this PC; "
-                 f"{context_label(rec)} keeps the whole model in memory")
-    else:
-        rec_ctx = recommended_context(choice, pc)
-        fit_ctx = glm_fit_context(a, fit, getattr(a, "context", None))   # (the contexts that start on this card)
-        if fit_ctx:
-            ctx = choose_context(a, prev_ctx, fit_ctx, rec_ctx if rec_ctx in fit_ctx else fit_ctx[-1])
-        else:
-            ctx = choose_context(a, prev_ctx, recommended=rec_ctx)
-    ok(f"context: {ctx} tokens")
-    draft = choose_draft(a, pc, inst)
-    ok("drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else "the MTP block"))
-    llama = tools_step(a)                              # 3
-    meta = build_step(a, pc, llama)                    # 4
-    mixed_builds(a, pc, llama, "maya")                 # (an NVIDIA card beside an AMD GPU: its engine too)
-    got = model_step(a, models, choice)                # 5
-    if got is None:
-        return None
-    d, shards, quant = got
-    dsa = kind_is_glm_dsa(choice, shards)              # GLM-5.3 (glm-dsa): text only, NextN drafting
-    if dsa and metal:
-        fail(f"{G53.SHOWN} runs on NVIDIA and AMD GPUs (not on Metal yet)", f"{ME} --setup picks another model")
-    if dsa:
-        S.model_named(G53.SHOWN)                       # (the header: GLM-5.3, not GLM-5.3-Flash)
-        draft = maya_sync.draft_for(draft, G53.ARCH, warn)
-        have = g53_memory_gb(pc)                       # (neutral memory guidance, no speeds)
-        (ok if have is not None and have >= g53_figures(quant)[0] else warn)(
-            f"{G53.SHOWN}: {g53_memory_note(pc, quant)}")
-    dflash = drafter_step(models) if draft == "dflash2" else None
-    pack = metal_tokenizer_step(a, d, shards, quant) if metal else pack_step(a, d, shards, llama, quant)       # 6
-    if dsa:
-        step(7, "images (the vision encoder)")
-        ok(f"{G53.SHOWN}: text only (the model has no vision tower)")
-        vision = None
-    else:
-        vision = vision_step(a, pc, meta, llama, d, quant)  # 7
-    cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice, dflash, shards[0] if metal else None)   # 8
-    if not metal:                                      # (the Mac engine does not project a direction)
-        ablate_step(cfg_path, "glm-dsa" if dsa else "glm", models, a)
-    if dflash is not None and metal:                   # (the speed calibration is CUDA's: on a Mac the choice is yours)
-        ok("DFlash2 drafts on this Mac, not measured against the MTP block (the model checks both): "
-           f"{ME} --setup --draft mtp goes back")
-    elif dflash is not None:                           # DFlash2: kept only if it makes THIS PC faster (measured)
-        how = drafting_choice(a, "DFlash2", "5-20")
-        if how != "measure":                           # (or as the user chose)
-            keep_drafting(cfg_path, how == "on")
-        else:
-            if S.UI is not None:                       # (the screen shows it in the tuning's tab)
-                S.UI.step(9, "speed calibration: DFlash2 or the MTP block")
-            speed_calibration(cfg_path, measure_asked(a))
-    elif g53_one_gpu_drafting(read_json(cfg_path)):    # GLM-5.3 on one APU: drafting kept only where it is faster
-        fallback = bool(read_json(cfg_path)["installer"]["one_gpu_drafting"].get("on"))
-        how = "on" if fallback else "off"
-        if not getattr(a, "no_speed_calibration", False):   # (skipped: the setup's estimate for this PC stays)
-            how = drafting_choice(a, "Drafting with the MTP block on this GPU", "5-10")
-        if how != "measure":
-            keep_drafting(cfg_path, how == "on")
-        else:
-            if S.UI is not None:
-                S.UI.step(9, "speed calibration: drafting or not")
-            speed_calibration(cfg_path, measure_asked(a))
-    # the tuning: asked for (--calibrate), or offered when nothing was tuned for this PC and model yet and someone
-    # answers (--yes and --no-start setups are not held up by it)
-    tuned = None
-    cfg = read_json(cfg_path)
-    offer = (cfg.get("backend") not in ("hip", "metal") and saved_calibration(cfg, any_context=True) is None
-             and not a.yes and not a.no_start)
-    if metal and a.calibrate:
-        warn("--calibrate does not apply to Metal: there is no CPU lane to tune")
-    if (a.calibrate and not metal) or (offer and ask(
-            "Tune Maya for this PC now? It measures the split of the work between the CPU and the PCIe link and the "
-            f"CPU threads (about {G53.CALIBRATE_MINUTES if dsa else '10-15'} minutes; later: ./maya.sh --calibrate)",
-            ["y", "n"], "y", a.yes) == "y"):
-        if S.UI is not None:                           # (the screen lists the tuning as a step of its own)
-            S.UI.step(9, "tuning Maya for this PC")
-        tuned = calibrate_config(cfg_path)
-    if tuned is False:
-        say()
-        warn("this PC is NOT tuned (the reason is above): ./maya.sh --calibrate tries again")
-    return cfg_path
-
-
-def args_map(args) -> dict:
-    """An engine argument list as {flag: value, or True for a flag without one} (order and paths left as they are)."""
-    out, args = {}, [str(x) for x in args or []]
-    for i, x in enumerate(args):
-        if x.startswith("--"):
-            out[x] = args[i + 1] if i + 1 < len(args) and not args[i + 1].startswith("--") else True
-    return out
-
-
-def config_before(cfg_path: Path) -> dict | None:
-    """The config at cfg_path as it was when this setup run began, or None (a new one, or not a setup run)."""
-    text = SETUP_BEFORE.get(str(Path(cfg_path).resolve()))
-    try:
-        return json.loads(text) if text is not None else None
-    except ValueError:
-        return None
-
-
-def config_changes(old: dict, new: dict) -> list:
-    """What a setup run changed in a config, in words: GPUs, engine arguments, environment, other settings (its
-    installer record's date left out) - [] when nothing that matters changed."""
-    lines = []
-    if old.get("gpu") != new.get("gpu"):
-        lines.append(f"GPUs {old.get('gpu')} -> {new.get('gpu')}")
-    oa, na = args_map(old.get("args")), args_map(new.get("args"))
-    short = lambda v: "" if v is True else f" {v}" if len(str(v)) <= 40 else " ..." + str(v)[-30:]   # noqa: E731
-    lines += [f"{f} added" for f in na if f not in oa]
-    lines += [f"{f} removed" for f in oa if f not in na]
-    lines += [f"{f}{short(oa[f])} ->{short(na[f])}" for f in na if f in oa and na[f] != oa[f]]
-    oe, ne = old.get("env") or {}, new.get("env") or {}
-    lines += [f"env {k} added" for k in ne if k not in oe] + [f"env {k} removed" for k in oe if k not in ne]
-    lines += [f"env {k}={oe[k]} -> {ne[k]}" for k in ne if k in oe and str(ne[k]) != str(oe[k])]
-    for k in sorted(set(old) | set(new)):
-        if k in ("gpu", "args", "env"):
-            continue
-        ov, nv = old.get(k), new.get(k)
-        if k == "installer":
-            ov = {x: y for x, y in (ov or {}).items() if x not in CONFIG_VOLATILE}
-            nv = {x: y for x, y in (nv or {}).items() if x not in CONFIG_VOLATILE}
-        if ov != nv:
-            lines.append(f"{k} " + ("added" if ov is None else "removed" if nv is None else "changed"))
-    return lines
-
-
-def draft_forget() -> None:
-    """--speed-calibration: maya-hy4's drafting measured on this PC (data/hy4-drafting.txt) is dropped, so the engine
-    measures it again - in the CPU lane check's run below, else at the next start (before it is ready)."""
-    path = ROOT / "data" / "hy4-drafting.txt"
-    try:
-        path.unlink()
-        ok("drafting (none, the MTP block or the DFly2 drafter, whichever decodes fastest here) is measured again")
-    except FileNotFoundError:
-        pass
-    except OSError as e:
-        warn(f"{path} could not be removed ({e}): delete it by hand to measure the drafting again")
-
-
-def gpu_readings_report() -> str:
-    """--report: what the dashboard's Monitor reads on each NVIDIA GPU (serve/telemetry.py's NVML reader, a process of
-    its own): each card's readings given or not, any that failed with its error - never an error of the report's own."""
-    try:
-        from serve import telemetry as TM
-        return TM.readings_report()
-    except Exception as e:  # noqa: BLE001 - the report goes on without this part
-        return f"not read ({type(e).__name__}: {e})"
-
-
-def gpus_before(before, usable: list) -> list | None:
-    """The GPU numbers a config of this model ran on (its "gpu"), when every one of them is still here and usable -
-    a setup again offers them first (#1066: it took all the GPUs again, adding one the user had left out)."""
-    ids = before if isinstance(before, list) else [before] if isinstance(before, int) else []
-    ids = [i for i in ids if isinstance(i, int)]
-    byid = {g["index"]: g for g in usable}
-    if not ids or len(set(ids)) != len(ids) or any(i not in byid for i in ids):
-        return None
-    return ids
-
-
-def had_ablation(cfg: dict) -> bool:
-    """Whether a config loads a refusal direction (its "ablate" record, or --ablate in its args)."""
-    return isinstance(cfg.get("ablate"), dict) or "--ablate" in [str(x) for x in cfg.get("args") or []]
-
-
-def hot_forget(cfg: dict) -> None:
-    """--speed-calibration: maya-hy4's HY4_HOT scores for this config's model (data/hy4-expert-hot-<model>.bin: which
-    experts a start places in VRAM, kept as they are between calibrations so that every start begins the same) are
-    dropped - the next run learns them again from its answers (the CPU lane check's run below, else the next start)."""
-    sys.path.insert(0, str(ROOT))
-    import serve.server as SV
-    path = ROOT / "data" / SV.hy4_hot_file(cfg).name
-    try:
-        path.unlink()
-        ok("the experts a start places in VRAM (HY4_HOT's scores) are learned again from the next answers")
-    except FileNotFoundError:
-        pass
-    except OSError as e:
-        warn(f"{path} could not be removed ({e}): delete it by hand to learn the experts in VRAM again")
-
-
-def ik2_about() -> str:
-    """The setup's model row for Inkling-2-Mini."""
-    files = read_json(IK2_MANIFEST).get("files") or {}   # (damaged: the setup says so when it is picked)
-    gb = f"{sum(v[0] for v in files.values()) / 1e9:.0f} GB" if files else "about 18 GB"
-    return ("An EXPERIMENTAL PREVIEW: thinkingmachines' Inkling-2-Mini (26B, a looped model: 8 of 128 experts a token) "
-            f"on its own engine, in unsloth's UD-Q4_K_XL GGUF ({gb}); NVIDIA RTX 30 / "
-            "A100 and newer, Linux, one GPU with 24 GB of VRAM or more - the whole model sits on the card; tool calls, "
-            "its thinking levels, up to a 256K context, pictures (its vision tower, 0.6 GB); one answer at a time.")
-
-
-def ik2_dir(a, models: Path, prev: dict) -> Path:
-    """The model's folder: --model-dir, else the folder of the setup before, else <models folder>/Inkling-2-Mini."""
-    if a.model_dir:
-        return Path(a.model_dir).expanduser().resolve()
-    d = (prev.get("installer") or {}).get("model_dir")
-    if d and Path(d).is_dir() and config_family(prev) == "ik2":
-        return Path(d)
-    return models / IK2
-
-
+# ------------------------------------------------------------------------------------------------ Inkling-2-Mini
 def ik2_entry() -> dict:
     """Inkling-2-Mini's download (tools/ik2/download.json: unsloth's UD-Q4_K_XL) as a MODELS entry (offer_download's
     form)."""
@@ -11026,11 +11131,27 @@ def ik2_entry() -> dict:
             "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
 
 
-def ik2_gpus_asked(a) -> int:
-    """How many GPUs --gpu / --gpus name (0: none named) - Inkling-2-Mini's preview refuses more than one."""
-    if getattr(a, "gpus", None):
-        return len({x.strip() for x in str(a.gpus).split(",") if x.strip()})
-    return 1 if getattr(a, "gpu", None) is not None else 0
+def ik2_about() -> str:
+    """The setup's model row for Inkling-2-Mini."""
+    files = read_json(IK2_MANIFEST).get("files") or {}   # (damaged: the setup says so when it is picked)
+    gb = f"{sum(v[0] for v in files.values()) / 1e9:.0f} GB" if files else "about 18 GB"
+    return ("An EXPERIMENTAL PREVIEW: thinkingmachines' Inkling-2-Mini (26B, a looped model: 8 of 128 experts a token) "
+            f"on its own engine, in unsloth's UD-Q4_K_XL GGUF ({gb}); NVIDIA V100 / "
+            "RTX 20 and newer with 8 GB or more (experts that do not fit in VRAM stay in RAM: about 13 GB of RAM with an 8 GB card), or "
+            "AMD RDNA 3 / 3.5 / 4 or a Halo / APU with 24 GB (every expert in memory); Linux only; tool calls, "
+            "its thinking levels, up to a 256K context, pictures (its vision tower, 0.6 GB), drafting on RTX 30 / A100 "
+            "and newer with every expert in VRAM, or AMD (its own drafter, 0.6 GB, and the prompt lookup: measured once on this PC, the same answers); "
+            "one answer at a time.")
+
+
+def ik2_dir(a, models: Path, prev: dict) -> Path:
+    """The model's folder: --model-dir, else the folder of the setup before, else <models folder>/Inkling-2-Mini."""
+    if a.model_dir:
+        return Path(a.model_dir).expanduser().resolve()
+    d = (prev.get("installer") or {}).get("model_dir")
+    if d and Path(d).is_dir() and config_family(prev) == "ik2":
+        return Path(d)
+    return models / IK2
 
 
 def ik2_model_step(a, d: Path, models: Path) -> Path | None:
@@ -11094,6 +11215,58 @@ def ik2_vision_model() -> dict | None:
             "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
 
 
+def ik2_drafter_model() -> dict | None:
+    """The model's drafter as offer_download's form (tools/ik2/download.json's "drafter": thinkingmachines' own
+    mtp.safetensors at a pinned revision), or None when the manifest names none."""
+    man = read_json(IK2_MANIFEST).get("drafter") or {}
+    if not man.get("files") or not man.get("repo") or not man.get("revision"):
+        return None
+    return {"about": f"{IK2_SHOWN}'s drafter (it drafts tokens the model checks: faster answers, the same ones): "
+                     f"thinkingmachines' own ({man.get('license', 'Apache 2.0')})", "format": "safetensors",
+            "repo": man["repo"], "revision": man["revision"], "folder": man.get("folder", ""),
+            "files": {k: v[0] for k, v in man["files"].items()}, "sha256": {k: v[1] for k, v in man["files"].items()},
+            "download_gb": sum(v[0] for v in man["files"].values()) / 1e9}
+
+
+def ik2_drafting(a) -> str:
+    """The engine's --drafting from the setup's: off by hand; on by hand (the drafter and the prompt lookup, not
+    measured); else auto - measured once on the PC at the engine's first start (measure, --yes, another model's
+    mtp / dfly2: the same as auto)."""
+    how = getattr(a, "drafting", None)
+    return how if how in ("on", "off") else "auto"
+
+
+def ik2_drafter_step(a, d: Path, vram: float, ctx: int, kv: str) -> Path | None:
+    """The drafter beside the GGUF (in d), downloaded when it is not there and checked against its published sha256,
+    or None: drafting off (--drafting off), or not downloaded - the engine then drafts with the prompt lookup alone.
+    Truthful about this card: where the drafter's room does not fit beside the model at this context, the engine
+    leaves it out at its start (the plan as without it)."""
+    how = ik2_drafting(a)
+    if how == "off":
+        ok("drafting: off (--drafting off) - every token from a full model step")
+        return None
+    m = ik2_drafter_model()
+    if m is None:
+        warn(f"{IK2_MANIFEST} names no drafter: drafting with the prompt lookup alone")
+        return None
+    files = [d / n for n in m["files"]]
+    if any(file_incomplete(m, f) for f in files) and not offer_download(a, "the drafter", d, files, m):
+        warn(f"the drafter was not downloaded: drafting with the prompt lookup alone ({ME} --setup asks again)")
+        return None
+    for f in files:
+        if not sha256_checked(f, m["sha256"][f.name]):
+            f.unlink(missing_ok=True)                  # else the next run finds it complete and fails here again
+            fail(f"{f}: the sha256 does not match the published one (the file was removed)", "run the setup again")
+    fits = IK2F.draft_fits(vram, ctx, kv)
+    ok(f"drafting: {how} - {files[0].name} ({m['download_gb']:.1f} GB) and the prompt lookup; "
+       + ("measured once at the engine's first start on this PC (a minute), the faster kept - the answers are the "
+          "same with drafting or without" if how == "auto" else "on (--drafting on), not measured"))
+    if not fits:
+        warn(f"at {context_label(ctx)} the drafter's {IK2F.draft_gib(ctx):.1f} GB does not fit beside the model on this "
+             f"card: the engine leaves it out (the prompt lookup still drafts) - a smaller context leaves it room")
+    return files[0]
+
+
 def ik2_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path) -> dict | None:
     """Step 7: the config's "vision" entry - maya-vision with the model's mmproj (beside the GGUF, in d) - or None
     (text only, said why).  No text model in it: the pinned llama.cpp does not open Inkling's GGUF, and maya-vision
@@ -11123,136 +11296,28 @@ def ik2_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path) -> dict | Non
     return {"exe": str(VEXE), "mmproj": str(files[0]), "gpu": True}
 
 
-def keep_config_backups(before: dict) -> list:
-    """After a setup run: each installed config it changed gets the text it had before kept next to it, as
-    <config>.json.bak-<date> (not a config the start or the Models page lists), and the changes are said.  The
-    backups made."""
-    made = []
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    for p, text in before.items():
-        path = Path(p)
-        try:
-            now = path.read_text(encoding="utf-8-sig")
-        except OSError:
-            continue
-        if now == text:
-            continue
-        try:
-            changes = config_changes(json.loads(text), json.loads(now))
-        except ValueError:
-            changes = ["rewritten"]
-        if not changes:
-            continue
-        bak = path.with_name(f"{path.name}.bak-{stamp}")
-        try:
-            bak.write_text(text, encoding="utf-8")
-        except OSError as e:
-            warn(f"{path.name}: changed by this setup, but the copy of the config before could not be written ({e})")
-            continue
-        made.append(bak)
-        ok(f"{path.name}: changed by this setup (" + "; ".join(changes[:8]) +
-           (f"; {len(changes) - 8} more" if len(changes) > 8 else "") + f") - the config before is kept as {bak.name}")
-    return made
-
-
-def route_forget() -> None:
-    """--speed-calibration: maya-hy4's prompt route rates measured on this PC are dropped (data/hy4-prompt-route.txt),
-    so the engine measures them again - in the CPU lane check's run below, else at the next start (before it is
-    ready, on this install's docs: serve/server.py's hy4_measure_ids)."""
-    path = ROOT / "data" / "hy4-prompt-route.txt"
-    try:
-        path.unlink()
-        ok("the prompt route's rates (GPU stream or CPU lane for a prompt's experts outside VRAM) are measured again")
-    except FileNotFoundError:
-        pass
-    except OSError as e:
-        warn(f"{path} could not be removed ({e}): delete it by hand to measure the prompt route again")
-
-
-def route_prompts(tdir: Path, n: int) -> list[str]:
-    """--speed-calibration's prompts for the prompt route's rates: long and each its own (no prefix the engine reuses),
-    from this install's docs - a few prompt chunks each."""
-    text = ""
-    for name in ("docs/SETTINGS.md", "README.md", "CHANGELOG.md"):
-        p = ROOT / name
-        if p.exists():
-            text += p.read_text(encoding="utf-8", errors="replace")
-    chat = bench_chat("hy4", tdir)
-    step = 6000
-    return [chat(f"Summarise this in three sentences:\n\n{text[i * step:(i + 1) * step]}") for i in range(n)
-            if len(text) >= (i + 1) * step]
-
-
-def route_state(log_text: str) -> str | None:
-    """maya-hy4's prompt route in its log: "measuring" (its prompt chunks still take the GPU stream and the CPU lane in
-    turns), "measured", "pinned" / "remembered", or None - every routed expert in VRAM, no route to choose."""
-    if "prompt route: the CPU lane" in log_text:
-        return "measured"
-    if "prompt route: pinned" in log_text:
-        return "pinned"
-    if "prompt route: by the rates measured" in log_text:
-        return "remembered"
-    return "measuring" if "prompt route: measured on this PC" in log_text else None
-
-
-def set_up_ik2(a, prev: dict) -> Path | None:
-    """Inkling-2-Mini's steps 1-8 (an experimental preview): the PC (refused in one line where the preview does not
-    run: AMD, a Mac, Windows, two GPUs or more asked for, a card older than RTX 30 / A100 or under 24 GB), the context
-    (the largest that keeps every expert in VRAM on this card), the engine (build/maya-ik2), the files (pinned,
-    sha256-checked), the tokenizer with the model's own template, the pictures (its mmproj and maya-vision), the
-    config."""
-    inst = prev.get("installer") or {}
-    prev_args = prev.get("args") or []
-    prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
-    a.gpus_before = prev.get("gpu")                    # (the GPU question's default: this config's GPU)
-    pc = check_pc(a, "ik2")                            # 1
-    vram = float(pc["gpus"][0].get("vram_gb") or 0)
-    step(2, "your choices")                            # 2
-    warn(f"{IK2_SHOWN} is an experimental preview: run by its contributor on RTX 3090 cards (Linux), not yet by "
-         "Maya's team on every card - tell us how it goes in an issue")
-    m = ik2_entry()
-    ok(f"model: {Q.shown('ik2', Q.IK2_QUANT, m['download_gb'])} - thinkingmachines' Inkling-2-Mini in unsloth's GGUF "
-       "(Apache 2.0)")
-    kv = str((prev.get("env") or {}).get("IK2_KV") or IK2F.DEFAULT_KV)
-    rec = IK2F.recommended_context(vram, kv)
-    ctx = choose_context(a, prev_ctx, IK2F.CONTEXTS, rec)
-    fit = IK2F.plan(vram, ctx, kv)
-    ok(f"context: {ctx} tokens" + (" (recommended for this card's VRAM)" if ctx == rec else "") +
-       f"; its cache: {ctx * IK2F.KV_BYTES.get(kv, IK2F.KV_BYTES['f16']) / 2**30:.1f} GB of VRAM ({kv.upper()})")
-    if not fit["resident"]:
-        warn(f"at {context_label(ctx)} the model and its cache do not all fit in this card's {vram:.0f} GB: the "
-             f"engine then runs its slower path (a context of {context_label(rec)} keeps everything in VRAM)")
-    models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
-              Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
-    d = ik2_dir(a, models, prev)
-    ok(f"model folder: {d}")
-    llama = tools_step(a)                              # 3
-    meta = build_step(a, pc, llama, "maya-ik2")        # 4
-    if not IK2_EXE.exists():
-        fail(f"the engine was not built ({IK2_EXE})", "the reason is in the build's messages above (maya-ik2 needs "
-             "an RTX 30 / A100 or newer card in the build's GPU list)")
-    gguf = ik2_model_step(a, d, models)               # 5
-    if gguf is None:
-        return None
-    tok = ik2_tokenizer_step(a, d, gguf)              # 6
-    vision = ik2_vision_step(a, pc, meta, llama, d)   # 7
-    return write_config_ik2(a, pc, meta, gguf, tok, ctx, models, d, vision)   # 8
-
-
 def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, models: Path, d: Path,
-                     vision: dict | None = None) -> Path:
+                     vision: dict | None = None, drafter: Path | None = None) -> Path:
     """maya-inkling-2-mini.json and its start script.  A setup again keeps what the config before says that this one
     does not ask (its engine flags it names, where the server listens and its key); the model's own sampling and
-    thinking level every setup; pictures (`vision`, step 7) when they were set up."""
+    thinking level every setup; pictures (`vision`, step 7) when they were set up; drafting (--drafting auto by
+    default: the drafter where it was downloaded, and the prompt lookup)."""
     step(8, "the configuration and the start script")
     port = a.port or 8080
     cfg_path = ROOT / f"{Q.config_stem('ik2', Q.IK2_QUANT)}.json"
     old = read_json(cfg_path)
     args = ["--model", str(gguf), "--max-context", str(ctx)]
+    two = len(pc.get("gpus") or []) == 2 and pc.get("backend") != "hip"
+    args += ["--gpus", "2"] if two else []           # (the split: the config's two GPUs, the larger first)
+    how = ik2_drafting(a)
+    args += (["--draft", str(drafter)] if drafter and how != "off" else []) + ["--drafting", how]
     kept = keep_args(old.get("args") or [], args, ("--threads", "--eos", "--cache-gb"))
-    inst = {"family": "ik2", "quant": Q.OTHERS[("ik2", Q.IK2_QUANT)], "ik2_quant": Q.IK2_QUANT}
+    inst = {"family": "ik2", "quant": Q.OTHERS[("ik2", Q.IK2_QUANT)], "ik2_quant": Q.IK2_QUANT, "drafting": how}
+    if pc["gpus"][0].get("ik2_vram_gb"):              # (Windows: the card as CUDA gets it, measured - the Models page)
+        inst["ik2_vram_gb"] = pc["gpus"][0]["ik2_vram_gb"]
     sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup)
     cfg = {"exe": str(IK2_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(tok), "model_name": IK2_MODEL_NAME,
+           **({"backend": "hip"} if pc.get("backend") == "hip" else {}),
            "gpu": [g["index"] for g in pc["gpus"]], "sampling": sampling, "reasoning_effort": effort,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port,
            **({"vision": vision} if vision else {})}
@@ -11260,6 +11325,15 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
     # (its cache in FP8 - half the bytes, the faster one deep in a context; the user's own variables kept)
     env = dict(old.get("env") or {})
     env.setdefault("IK2_KV", IK2F.DEFAULT_KV)
+    # (a card that does not hold every expert: the offload path's VRAM tier starts from Maya's profile of the
+    #  experts Inkling-2-Mini picks most - data/expert-profile-ik2mini.bin; where every expert fits, none)
+    vram = float(pc["gpus"][0].get("vram_gb") or 0) if pc.get("gpus") else 0.0
+    vram1 = float(pc["gpus"][1].get("vram_gb") or 0) if two else 0.0
+    seed = str(IK2_PROFILE)
+    if IK2F.plan_two(vram, vram1, ctx, env["IK2_KV"])["layout"] != "resident" and IK2_PROFILE.is_file():
+        env.setdefault("IK2_WARM", seed)
+    elif env.get("IK2_WARM") == seed:
+        env.pop("IK2_WARM")
     env.update(parse_env(a.env))
     cfg["env"] = env
     if a.host:
@@ -11277,6 +11351,183 @@ def write_config_ik2(a, pc: dict, meta: dict, gguf: Path, tok: Path, ctx: int, m
     return cfg_path
 
 
+def ik2_engine_vram(pc: dict, probe=None, saved: dict | None = None, busy: dict | None = None) -> tuple:
+    """Windows, NVIDIA: the card's VRAM in tools/ik2_fit.py's terms as maya-ik2's CUDA gets it - (GiB, "measured"),
+    else (nvidia-smi's VRAM, "").  Windows keeps part of every card from CUDA (the display driver's budget, the
+    desktop) that nvidia-smi does not show - an RTX 3050 8 GB gave CUDA 7.0 GB free - and maya-ik2 plans its start on
+    CUDA's free figure (every expert in VRAM or the offload path, the tier's size), so the setup's sums take that
+    figure (cuda_room_bytes: free with a context held, in a process of its own) plus ik2_fit's MARGIN_GIB (the share
+    its sums leave for the context and the desktop).  Measured now and kept for this PC, card and driver in
+    HY4_ROOM_STORE ("ik2|" + hy4_room_key), the kept figure read back where the card is busy (a Maya engine holds it)
+    or the driver gives no reading.  Not Windows, AMD, an APU, nothing measured: nvidia-smi's figure.  probe, saved,
+    busy: the readings, the records and maya_engine_mib's cards (tests; else read)."""
+    g = ((pc or {}).get("gpus") or [{}])[0]
+    vram = float(g.get("vram_gb") or 0)
+    if not WIN or (pc or {}).get("backend", "cuda") != "cuda" or not g.get("pci") or not vram or \
+            g.get("unified_memory"):
+        return vram, ""
+    key = "ik2|" + hy4_room_key(g)
+    if g.get("index") not in (maya_engine_mib() if busy is None else busy):
+        r = (cuda_room_bytes() if probe is None else probe).get(S._pci_key(str(g["pci"])))
+        if r:
+            free = float(r[0]) / 2**30
+            if saved is None:                          # (this card's figure under another driver: gone)
+                hy4_room_store(key, {"ik2_free_gib": round(free, 3), "measured": time.strftime("%Y-%m-%d %H:%M:%S")},
+                               lambda k: k.split("|")[:4] == key.split("|")[:4])
+            return min(vram, free + IK2F.MARGIN_GIB), "measured"
+    rec = (hy4_room_load() if saved is None else saved).get(key) or {}
+    if isinstance(rec.get("ik2_free_gib"), (int, float)):
+        return min(vram, float(rec["ik2_free_gib"]) + IK2F.MARGIN_GIB), "measured"
+    return vram, ""
+
+
+def set_up_ik2(a, prev: dict) -> Path | None:
+    """Inkling-2-Mini's steps 1-8 (an experimental preview): the PC (refused in one line where the preview does not
+    run: a Mac, AMD on Windows, two GPUs or more asked for, a card older than V100 / RTX 20 or under 8 GB, an AMD
+    GPU older than RDNA 3 or with less memory - an APU counts the RAM it shares, less what is kept free), the context
+    (the largest that keeps every expert in VRAM on this card), the engine (build/maya-ik2), the files (pinned,
+    sha256-checked), the tokenizer with the model's own template, the pictures (its mmproj and maya-vision), the
+    config."""
+    inst = prev.get("installer") or {}
+    prev_args = prev.get("args") or []
+    prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
+    a.gpus_before = prev.get("gpu")                    # (the GPU question's default: this config's GPU)
+    pc = check_pc(a, "ik2")                            # 1
+    vram = float(pc["gpus"][0].get("vram_gb") or 0)
+    amd = pc.get("backend") == "hip"
+    if amd:   # (AMD, Linux: RDNA 3 / 3.5 / 4 with every expert in memory; an APU's is the RAM, less what is kept free)
+        g = dict(pc["gpus"][0])
+        if hip_unified_memory(g):
+            ram = mem_gb()[0]
+            g.update(unified_memory=True, memory_gb=apu_memory(vram, ram, not WIN) - apu_margin_gb(ram))
+            vram = g["memory_gb"]
+        why = IK2F.unsupported("hip", WIN, len(pc["gpus"]), [g])
+        if why:
+            fail(why)
+    else:   # (Windows: the card as CUDA gets it, measured - the figure the engine plans with)
+        room, how = ik2_engine_vram(pc)
+        if how:
+            ok(f"VRAM for the engine: {room - IK2F.MARGIN_GIB:.1f} GB of the card's {vram:.1f} GB (measured: "
+               "Windows keeps the rest for the display)")
+            vram = pc["gpus"][0]["ik2_vram_gb"] = round(room, 2)
+    step(2, "your choices")                            # 2
+    warn(f"{IK2_SHOWN} is an experimental preview: run by its contributor on RTX 3090 cards (Linux) and by Maya's "
+         "team on V100s (Linux) and an RTX 3050 8 GB (Windows), not yet on every card - tell us how it goes in "
+         "an issue" if not amd else
+         f"{IK2_SHOWN} on AMD is an experimental preview: run by Maya's team on a Radeon 8065S (Gorgon Halo, "
+         "Linux), not yet on Radeon RX 7000 / 9000 cards - tell us how it goes in an issue")
+    m = ik2_entry()
+    ok(f"model: {Q.shown('ik2', Q.IK2_QUANT, m['download_gb'])} - thinkingmachines' Inkling-2-Mini in unsloth's GGUF "
+       "(Apache 2.0)")
+    kv = str((prev.get("env") or {}).get("IK2_KV") or IK2F.DEFAULT_KV)
+    rec = IK2F.recommended_context(vram, kv)
+    ctx = choose_context(a, prev_ctx, IK2F.CONTEXTS, rec)
+    fit = IK2F.plan(vram, ctx, kv, amd)
+    kv_gb = ctx * IK2F.KV_BYTES.get(kv, IK2F.KV_BYTES['f16']) / 2**30
+    ok(f"context: {ctx} tokens" + (" (recommended for this card's VRAM)" if ctx == rec else "") +
+       (f"; its cache: {kv_gb:.1f} GB ({kv.upper()}), about {fit['kv_ram_gib']:.0f} GB of it in RAM (KV streaming)"
+        if fit.get("kv_streamed") else f"; its cache: {kv_gb:.1f} GB of VRAM ({kv.upper()})"))
+    vram1 = float(pc["gpus"][1].get("vram_gb") or 0) if len(pc["gpus"]) == 2 and not amd else 0.0
+    if vram1:   # (two GPUs: the first alone where it holds every expert, else the split)
+        word, line = IK2F.verdict_two(vram, vram1, mem_gb()[0], ctx, kv)
+        if IK2F.plan_two(vram, vram1, ctx, kv)["gpus"] == 1:
+            warn(f"at {context_label(ctx)} the first card holds every expert: the second is not used (one GPU is "
+                 "faster there) - set up with --gpu N for one card")
+        elif word == "fast":
+            ok(f"two GPUs: {line}")
+        else:
+            warn(f"two GPUs at {context_label(ctx)}: {line}" + (" - it may not start" if word == "tight" else ""))
+    elif fit["resident"] and fit.get("kv_streamed"):   # (one GPU only: KV streaming is off on two GPUs)
+        word, line = IK2F.verdict(vram, mem_gb()[0], ctx, kv, amd)
+        warn(line if word == "does not fit" else
+             f"at {context_label(ctx)}: {line} (a context of {context_label(rec)} keeps the cache in VRAM)")
+    elif not fit["resident"]:
+        word, line = IK2F.verdict(vram, mem_gb()[0], ctx, kv, amd)
+        keep = (f" (a context of {context_label(rec)} keeps everything in VRAM)"
+                if IK2F.plan(vram, rec, kv, amd)["resident"] else "")
+        warn(f"at {context_label(ctx)} the model and its cache do not all fit in this card's {vram:.0f} GB: "
+             f"{line}{keep}" + (" - it may not start" if word == "tight" else ""))
+    models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
+              Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
+    d = ik2_dir(a, models, prev)
+    ok(f"model folder: {d}")
+    llama = tools_step(a)                              # 3
+    meta = build_step(a, pc, llama, "maya-ik2")        # 4
+    if not IK2_EXE.exists():
+        fail(f"the engine was not built ({IK2_EXE})", "the reason is in the build's messages above (maya-ik2 needs "
+             + ("an RDNA 3 / 3.5 / 4 GPU in the build's list, on Linux)" if amd else
+                "a V100 / RTX 20 or newer card in the build's GPU list)"))
+    gguf = ik2_model_step(a, d, models)               # 5
+    if gguf is None:
+        return None
+    off = IK2F.drafting_off_reason(None if amd else pc["gpus"][0].get("arch"), vram, ctx, kv, amd)
+    if vram1 and IK2F.plan_two(vram, vram1, ctx, kv)["gpus"] == 2:
+        off = "drafting off: on two GPUs it is not checked yet - every token comes from a full model step"
+    if off:                                            # (Volta / Turing, the offload path: no drafter, drafting off)
+        ok(off)
+        a.drafting = "off"
+        drafter = None
+    else:
+        drafter = ik2_drafter_step(a, d, vram, ctx, kv)   # (5: its drafter)
+    tok = ik2_tokenizer_step(a, d, gguf)              # 6
+    vision = ik2_vision_step(a, pc, meta, llama, d)   # 7
+    return write_config_ik2(a, pc, meta, gguf, tok, ctx, models, d, vision, drafter)   # 8
+
+
+def set_up_and_serve(a, prev: dict) -> tuple | None:
+    """On the setup's screen: the setup, then Maya running on the same screen - its server's output there, Ctrl+C
+    stops it.  (The config, the server's exit code or None when it was not started), or None when the model was not
+    downloaded."""
+    cfg_path = set_up(a, prev)
+    if cfg_path is None or a.no_start:
+        return cfg_path and (cfg_path, None)
+    return cfg_path, serve_on_screen(cfg_path, a)
+
+
+# ------------------------------------------------------------------------------------------------ main
+def maya_version() -> str:
+    return (HERE / "VERSION").read_text(encoding="utf-8").strip() if (HERE / "VERSION").exists() else "?"
+
+
+def model_option(a) -> str | None:
+    """--model as typed -> what the setup reads (in place): a.model a GLM download (a MODELS key), DS4 or MM3, and a
+    DeepSeek / MiniMax / Hy4-Flash quant's files as --ds4-quant / --mm3-quant / --hy4-quant.  It takes a setup id (glm-maya-s, deepseek-maya-xs,
+    minimax-maya-xs ...), a quant's full name (MiniMax-M3.1-Flash-Maya-XS) or any name it took before (Maya-S24,
+    EXL3-3.05bpw, DeepSeek-V4.1-Flash-1017 ...; --mm3-quant gguf-xs as maya-xs).  The error for a name it does not
+    know, or for a quant --ds4-quant / --mm3-quant names otherwise; else None."""
+    if getattr(a, "mm3_quant", None):
+        a.mm3_quant = Q.MM3_QUANT_ALIASES.get(a.mm3_quant, a.mm3_quant)
+    if not a.model:
+        return None
+    hit = Q.resolve(a.model, list(glm_downloads()))   # (GLM-5.3's downloads included)
+    if hit is None:
+        return (f"--model {a.model}: not a model Maya knows - one of " + ", ".join(i for _, _, _, i in Q.QUANTS) +
+                f", {DS4}, {MM3}, {HY4}, cyber-frost = {QWEN_SHOWN}, {Q.IK2_IDS[0]} = {IK2_SHOWN} (experimental), or a GLM-5.3-Flash download: " + ", ".join(MODELS))
+    family, key = hit
+    if family == "glm":
+        a.model = key
+        return None
+    if family == "qwen":                                 # (CYBER-FROST's GGUF, or unsloth's UD-IQ2_XS: --qwen-quant)
+        given = getattr(a, "qwen_quant", None)
+        if key is not None and given and given != key:
+            return (f"--model {a.model} is {Q.shown(family, key)}, but --qwen-quant says {given}: give one of them")
+        a.model = QWEN
+        if key is not None:
+            a.qwen_quant = key
+        return None
+    if family == "ik2":                                  # (Inkling-2-Mini: its one file set, unsloth's UD-Q4_K_XL)
+        a.model = IK2
+        return None
+    a.model, flag = {"deepseek": (DS4, "ds4_quant"), "hy4": (HY4, "hy4_quant")}.get(family, (MM3, "mm3_quant"))
+    if key is not None:
+        given = getattr(a, flag, None)
+        if given and given != key:
+            return (f"--model {Q.setup_id(family, key)} is {Q.shown(family, key)}, but --{flag.replace('_', '-')} "
+                    f"says {given}: give one of them")
+        setattr(a, flag, key)
+    return None
+
+
 def main() -> int:
     N.alias_env(os.environ)   # (MAYA_* settings under the names the code and the engines read, for all it starts)
     stop_signals()            # (SIGTERM / SIGHUP stop it as Ctrl+C does: the server it runs with it)
@@ -11285,6 +11536,10 @@ def main() -> int:
                     help="GPU backend (HIP: gfx1100/gfx1201/gfx1151 on Linux and Windows; Metal: experimental, "
                          "Apple Silicon Macs, text only; the default on a Mac)")
     ap.add_argument("--setup", action="store_true", help="set up again instead of starting the installed model")
+    ap.add_argument("--ablation", choices=["on", "off"],
+                    help="GLM, DeepSeek and MiniMax: the model's refusal direction loaded (on - each request still "
+                         "asks for it, off by default) or left out (off). Not given: a new config loads it, a setup "
+                         "again keeps what its config had")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
     ap.add_argument("--no-start", action="store_true", help="set up, but do not start the dashboard")
     ap.add_argument("--yes", action="store_true",
@@ -11335,8 +11590,8 @@ def main() -> int:
                          "from V100 on and on AMD; with --model-dir: the files you have (the same as --model "
                          "minimax-maya-xs / minimax-maya-s)")
     ap.add_argument("--hy4-quant", choices=list(HY4_QUANTS) + [HY4_Q4],
-                    help=f"{HY4}'s files, Maya's own GGUF quants of it (NVIDIA from V100 on, Linux or Windows; AMD on Linux; text "
-                         "only for now): maya-xs = Hy4-Flash-Maya-XS (routed experts in 2 bits), maya-s / maya-m / "
+                    help=f"{HY4}'s files, Maya's own GGUF quants of it (NVIDIA from V100 on, Linux or Windows; AMD on Linux, "
+                         "and under Windows experimental): maya-xs = Hy4-Flash-Maya-XS (routed experts in 2 bits), maya-s / maya-m / "
                          "maya-l once they are published; q4_k_m = Tencent's own Q4_K_M from AngelSlim, with MTP "
                          "drafting (--drafting off: without; run on RTX 30 / A100 and newer, Linux); with "
                          "--model-dir: the files you have (the same as --model hy4-flash-maya-xs, hy4-flash-q4_k_m ...)")
@@ -11374,7 +11629,8 @@ def main() -> int:
                          "stopping before the download)")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the expert pool leaves free on each GPU for the driver, the desktop and other "
-                         "programs (default 700), kept in the config")
+                         "programs (default 700; DeepSeek 600, MiniMax 1024, Hy4-Flash 715), kept in the config - given on a start "
+                         "too, it is written into the config that starts")
     ap.add_argument("--mmap-experts", choices=["auto", "on", "off"],
                     help="DeepSeek: the experts VRAM does not hold - read in place from the files (auto, the default), "
                          "or off: copied into RAM (with DS4_REQUIRE_ALL_RAM=1 all of them); kept in the config")
@@ -11415,10 +11671,18 @@ def main() -> int:
                          "without it (sustained speed, ~5-30 minutes, the model loaded twice) and keep the faster; "
                          "then start the model "
                          "(with --no-start: only measure)")
-    ap.add_argument("--drafting", choices=("measure", "on", "off"),
+    ap.add_argument("--drafting", choices=("measure", "on", "off", "mtp", "dfly2"),
                     help="the drafter (DFlash2 with --draft dflash2, DeepSeek's DSpark): measure = the speed "
                          "calibration keeps it only if it is faster on this PC (the default with --yes; asked "
-                         "otherwise), on = draft with it, off = without it - both skip the measuring")
+                         "otherwise), on = draft with it, off = without it - both skip the measuring.  Hy4-Flash's "
+                         "sizes: on = the MTP block where it fits in the VRAM, else the size's DFly2 drafter; mtp / "
+                         "dfly2 = that one alone (another model: the same as on)")
+    ap.add_argument("--fast-drafting", choices=["on", "off"],
+                    help="Hy4-Flash's sizes on a small card (a setup setting, kept in the config): where the DFly2 "
+                         "drafter has no room beside the cache's F16 rows at the context chosen, on keeps that context "
+                         "with the cache in 8-bit rows so the drafter fits - faster drafting (an 8 GB card at 8K: "
+                         "decoding about +8-27%%), slightly different wording than the default; off = the default "
+                         "(F16 rows, Maya's default answers). Not given: asked where it applies (--yes: the default)")
     ap.add_argument("--no-speed-calibration", action="store_true",
                     help="the same as --drafting on: draft with the drafter without measuring it")
     ap.add_argument("--config", type=Path, help="the installed JSON config to start (its run-maya-<model>.sh does), or "
@@ -11477,6 +11741,12 @@ def main() -> int:
                 say(f"  {i}) {c.name}")
             pick = have[int(ask("Which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
         check_parallel(a, config_family(read_json(pick)))
+        if getattr(a, "fast_drafting", None):   # (a setup setting: the cache's rows are worked out with the context)
+            warn(f"--fast-drafting is a setup setting of Hy4-Flash: {ME} --setup --fast-drafting {a.fast_drafting} "
+                 "sets it up; this start keeps the config as it is")
+        if getattr(a, "ablation", None):       # (a setup setting, kept in the config)
+            warn(f"--ablation is a setup setting: {ME} --setup --ablation {a.ablation} sets it up; this start keeps "
+                 "the config as it is")
         if getattr(a, "fast_prefill", None):   # (given on a start too: written into a DeepSeek config, which keeps it)
             cfg = read_json(pick)
             if config_family(cfg) != "deepseek":
@@ -11499,6 +11769,16 @@ def main() -> int:
                 set_arg(cfg.setdefault("args", []), "--mmap-experts", a.mmap_experts)
                 pick.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
                 ok(f"{pick.name}: --mmap-experts {a.mmap_experts}")
+        if a.vram_reserve_mib is not None:   # (#1026: given on a start too - written into the config, which keeps it)
+            cfg = read_json(pick)
+            put = set_vram_reserve(cfg.setdefault("args", []), config_family(cfg), a.vram_reserve_mib,
+                                   cfg.get("backend"))
+            if put is None:
+                warn("--vram-reserve-mib: this model's engine has no VRAM reserve setting - the start keeps the config "
+                     "as it is")
+            else:
+                pick.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+                ok(f"{pick.name}: VRAM kept free on each GPU {a.vram_reserve_mib} MiB ({put})")
         if (a.calibrate or a.speed_calibration) and read_json(pick).get("backend") == "metal":
             ok("the Metal engine has no CPU lane to tune and no drafter to measure: nothing to tune")
             a.calibrate = a.speed_calibration = False

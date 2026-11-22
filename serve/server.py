@@ -64,6 +64,60 @@ ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run 
 #                                                          (hy4_vision.Vision is an mm3_vision.Vision)
 HY4_TEXT_ONLY = "Hy4-Flash with its pictures off"         # (no vision tower loaded: the errors' name for it)
 HY4_LANE_FILE = ROOT / "data" / "hy4-cpu-lane.txt"        # (maya-hy4's 4-bit copies' verdict on this PC: child_env)
+HY4_ROUTE_FILE = ROOT / "data" / "hy4-prompt-route.txt"   # (... its prompt route's rates measured on this PC: child_env)
+HY4_DRAFT_FILE = ROOT / "data" / "hy4-drafting.txt"       # (... and its drafting, --drafting auto: child_env)
+HY4_MEASURE_DOCS = ("docs/SETTINGS.md", "README.md")      # (... the text its first start measures them on: hy4_measure_ids)
+HY4_MEASURE_CHARS = 200_000                               # (... about 55K tokens of it: up to 12 prompt chunks of 4096)
+
+
+def hy4_hot_file(cfg: dict) -> Path:
+    """maya-hy4's HY4_HOT scores for this config's model (each layer's experts a start places in VRAM): in the data
+    folder, a file a model - named by its folder (the pack's maya-hy4 folder sits in it)."""
+    args = cfg.get("args") or []
+    pack = Path(args[args.index("--pack") + 1]) if "--pack" in args[:-1] else None
+    name = "" if pack is None else pack.parent.name if pack.name == "maya-hy4" else pack.name
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._") or "model"
+    return ROOT / "data" / f"hy4-expert-hot-{name}.bin"
+
+
+def hy4_measure_ids(cfg: dict) -> Path | None:
+    """The text maya-hy4 measures this PC's choices on at its first start here (HY4_MEASURE_IDS): whether the CPU
+    lane's 4-bit expert copies pay and the prompt route's rates, before it says READY - so the first answers read
+    their prompts as fast as at the starts after.  This install's docs in the model's tokens, written once into the
+    data folder (a file a tokenizer).  None: no tokenizer, or the file cannot be written - the engine then measures
+    while it answers, as before."""
+    tdir = Path(cfg.get("tokenizer") or "")
+    vocab = tdir / "vocab.json"
+    if not cfg.get("tokenizer") or not vocab.is_file():
+        return None
+    try:
+        tag = hashlib.md5(vocab.read_bytes()).hexdigest()[:10]
+    except OSError:
+        return None
+    path = ROOT / "data" / f"hy4-measure-ids-{tag}.txt"
+    if path.is_file():
+        return path
+    try:
+        import strata_tokenizer as ST
+        text = ""
+        for name in HY4_MEASURE_DOCS:
+            p = ROOT / name
+            if p.is_file() and len(text) < HY4_MEASURE_CHARS:
+                text += p.read_text(encoding="utf-8", errors="replace")[:HY4_MEASURE_CHARS - len(text)] + "\n\n"
+        ids = ST.Tokenizer.from_dir(tdir).encode(text)
+        if len(ids) < 8192:
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(f"# maya: {', '.join(HY4_MEASURE_DOCS)} in the model's tokens ({len(ids)}) - the text maya-hy4 "
+                       "measures a PC's 4-bit copies and prompt route on at its first start there\n" +
+                       ",".join(map(str, ids)) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+        return path
+    except Exception:  # noqa: BLE001 - no text: the engine measures while it answers, as before
+        return None
+
+
 # (... and what stands for a picture in a tool result then: the agent's turn goes on)
 HY4_PICTURE_NOTE = "[a picture was here; pictures are off on this server, so it was not read]"
 
@@ -705,6 +759,19 @@ def model_management_setting(cfg: dict | None, env=None) -> bool:
     return bool(v) if v is not None else True
 
 
+def web_ui_setting(cfg: dict | None, env=None) -> bool:
+    """Maya's web page (/, /web/*, /fonts/*): on unless the run config has "web_ui": false or MAYA_WEB_UI says 0 / off /
+    false / no - an API-only server (#1089: a backend behind a proxy and another chat front end); the environment, when
+    set, wins over the config."""
+    on = ("1", "on", "true", "yes")
+    env = os.environ if env is None else env
+    v = maya_names.lookup(env, "MAYA_WEB_UI")
+    if v is not None and str(v).strip():
+        return str(v).strip().lower() in on
+    v = (cfg or {}).get("web_ui")
+    return bool(v) if v is not None else True
+
+
 def loop_guard_setting(cfg: dict | None, env=None) -> bool:
     """The loop guard (serve/loop_guard.py), on unless MAYA_LOOP_GUARD (MAYA_LOOP_GUARD) says 0 / off / false / no
     or the run config has "loop_guard": false; the environment, when set, wins over the config."""
@@ -922,6 +989,25 @@ def deepseek_restore_points(ids, user_id, system_id=None, tail=512, least=RESTOR
     return out
 
 
+HY4_MEASURE_LEFT = re.compile(r"measuring this PC: (\d+) of (\d+) choices done in \d+ s - about (\d+) s more")
+# (roughly how long maya-hy4's first-start measurements take - measured on a GPU holding the whole model and on GPUs
+#  with the CPU lane; tools/setup_bridge.py's HY4_TRIAL_TIME / HY4_LANE_TIME are the same)
+HY4_TRIAL_TIME = {2: "about a minute", 3: "one to two minutes"}
+HY4_LANE_TIME = "one minute"
+
+
+def hy4_measure_said(line: str) -> str:
+    """maya-hy4's "measuring this PC once" line in plain words, with roughly how long it takes on this kind of PC
+    (tools/setup_bridge.py's measure_said says the same): the drafting trial - each choice loaded and timed on a few
+    short answers - or the CPU lane's 4-bit copies and the prompt route."""
+    if "before the first answer: drafting" in line:
+        m = re.search(r"drafting \(([^:()]*):", line)
+        n = len(m.group(1).split(", ")) if m else 3
+        return (f"which drafting answers fastest - {n} choices, each loaded and timed on a few short answers, roughly "
+                f"{HY4_TRIAL_TIME.get(n, HY4_TRIAL_TIME[3])}")
+    return "the CPU lane's 4-bit copies and the prompt route, roughly " + HY4_LANE_TIME
+
+
 # MAYA_METAL_RESTORE_POINTS (0, off by default): the same points for a Metal engine whose READY line advertises
 # restore points (READY ... restore); MAYA_METAL_RESTORE_TAIL (512) is its tail distance.  Off until the engine
 # side's greedy-identity gate passes (the P5 mini-plan's bar 4): with it off, or on an engine that does not
@@ -1044,6 +1130,14 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                     say("cache", f"[maya] filling the GPU's expert cache ({n}) ...")
                 elif "session is up" in line:
                     say("up", "[maya] almost ready ...")
+                elif "measuring this PC once, before the first answer:" in line:   # (maya-hy4's first start here)
+                    drafting = "before the first answer: drafting" in line
+                    say("measure-" + ("draft" if drafting else "lane"),
+                        f"[maya] the first start on this PC measures it once before it is ready: {hy4_measure_said(line)};"
+                        " the next starts skip this")
+                elif m := HY4_MEASURE_LEFT.search(line):   # (... at this PC's own pace, after each drafting choice)
+                    say("measure-left" + m.group(1), f"[maya] measuring this PC: {m.group(1)} of {m.group(2)} choices "
+                                                     f"done - about {m.group(3)} s more")
                 elif "WARNING - " in line:   # the engine's own (e.g. Windows' commit limit capping the RAM tier)
                     print("[maya] WARNING: " + line.split("WARNING - ", 1)[1].strip(), flush=True)
         if time.time() - last > heartbeat:
@@ -1123,6 +1217,17 @@ class StrataEngine:
             # only after the process is reaped (a busy CI runner saw it alive right after a failed restart)
             self.ended = True
             raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))
+        # (#1026) a start that came out short of its VRAM reserve (maya-ds4: INFO reserve_short=<MiB>) - the engine
+        # measured what it allocates after its experts' plan and keeps that free from its next start on: started
+        # once more now, so the first start after an update or a new setting never serves with the reserve used up
+        if self.info.get("reserve_short") and not (env or os.environ).get("MAYA_RESERVE_RESTARTED"):
+            print(f"[maya] this start came out short of the VRAM reserve: the engine starts once more and keeps "
+                  f"{self.info['reserve_short']} MiB more free beside it (measured on this PC)", flush=True)
+            self.close()
+            if self.log is not subprocess.DEVNULL:
+                self.log.close()
+            self.__init__(exe, args, cwd, log, dict(env if env is not None else os.environ, MAYA_RESERVE_RESTARTED="1"))
+            return
         # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
         # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
         if self.info.get("engine"):
@@ -1980,7 +2085,8 @@ class Vision:
     resident), for a second or two of start-up per request with new pictures."""
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, start: bool = True):
-        args = [cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]]
+        # (no "model": no text model - Inkling 2's encoder reads its pictures from the mmproj alone)
+        args = [cfg["exe"], "--mmproj", cfg["mmproj"]] + (["--model", cfg["model"]] if cfg.get("model") else [])
         if cfg.get("gpu"):
             args.append("--gpu")
         if cfg.get("threads"):
@@ -1993,6 +2099,11 @@ class Vision:
         self.dir = Path(tempfile.mkdtemp(prefix="maya-vision-"))
         self.proc = None
         self.lend = self.reclaim = None   # on demand: callables (the engine's VLEND / VRECLAIM), wired by main()
+        # on demand without lending (Inkling 2: maya-ik2 lends no memory): a callable, True when the GPU's free memory
+        # holds the encoder now - it then starts there, else on the CPU (no GPU visible, `cpu_threads`); ends after
+        self.room = None
+        self.cpu_threads = 0
+        self.on_gpu = None                # (where the last on-demand start ran: True GPU, False CPU)
         self.owed = False                 # the engine's memory is not back yet (a reclaim that kept failing)
         self.lock = threading.RLock()
         self.cache: dict[str, tuple[Path, int]] = {}
@@ -2003,11 +2114,20 @@ class Vision:
         if self.lend is not None:
             self.settle()
             self.lend()
+        args, env = self.args, self.env
+        if self.room is not None:
+            self.on_gpu = bool(self.room())
+            print(f"[maya] images: reading the pictures on the {'GPU' if self.on_gpu else 'CPU'}", flush=True)
+            if not self.on_gpu:
+                args = [x for x in args if x != "--gpu"] + \
+                    (["--threads", str(self.cpu_threads)] if self.cpu_threads and "--threads" not in args else [])
+                env = dict(env if env is not None else os.environ, CUDA_VISIBLE_DEVICES="")
         try:
-            self.proc = subprocess.Popen(self.args + (["--no-warmup"] if self.lend is not None else []),
+            self.proc = subprocess.Popen(args + (["--no-warmup"] if self.lend is not None or self.room is not None
+                                                 else []),
                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                          stderr=self.log or subprocess.DEVNULL, text=True, encoding="utf-8",
-                                         bufsize=1, env=self.env)
+                                         bufsize=1, env=env)
             line = self.proc.stdout.readline()
             if not line.startswith("READY"):
                 raise RuntimeError("the vision encoder did not start: " + line.strip())
@@ -2053,7 +2173,7 @@ class Vision:
             try:
                 yield self
             finally:
-                if self.lend is not None and self.proc is not None:
+                if (self.lend is not None or self.room is not None) and self.proc is not None:
                     self._stop()
 
     @staticmethod
@@ -2204,6 +2324,46 @@ class Vision:
             self.proc.kill()
 
 
+def gpu_free_bytes(gpu: int) -> int | None:
+    """The free memory of NVIDIA GPU `gpu` (nvidia-smi's numbering) now, or None when nvidia-smi cannot say."""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits", "-i", str(gpu)],
+                           capture_output=True, text=True, timeout=20)
+        return int(r.stdout.strip().splitlines()[0]) << 20 if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
+        return None
+
+
+def amd_gpu_free_bytes(gpu: int, sysfs: str | None = None, meminfo: str = "/proc/meminfo") -> int | None:
+    """The free memory of AMD GPU `gpu` (HIP's numbering, Linux) now: its VRAM's, as the amdgpu driver says
+    (mem_info_vram_total / _used); on an APU whose memory is the RAM (a carve-out under 8 GiB beside a GTT larger than
+    it: Strix / Gorgon Halo) what MemAvailable leaves beyond the max(8 GiB, 10% of the RAM) the engines keep free.
+    None when it does not read."""
+    from serve import telemetry   # (its KFD -> render node numbering, as the Monitor reads the cards)
+
+    def num(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+    dev = telemetry.amd_device_dir(gpu, sysfs)
+    if not dev:
+        return None
+    total, used = num(os.path.join(dev, "mem_info_vram_total")), num(os.path.join(dev, "mem_info_vram_used"))
+    gtt = num(os.path.join(dev, "mem_info_gtt_total"))
+    if total is not None and total < (8 << 30) and gtt is not None and gtt > total:
+        try:
+            with open(meminfo, encoding="utf-8") as f:
+                kb = {k: int(v.split()[0]) for k, v in (line.split(":", 1) for line in f if ":" in line)
+                      if k in ("MemTotal", "MemAvailable")}
+            margin = max(8 << 30, kb["MemTotal"] * 1024 // 10)
+            return max(0, kb["MemAvailable"] * 1024 - margin)
+        except (OSError, ValueError, KeyError):
+            return None
+    return total - used if total is not None and used is not None else None
+
+
 def vision_footprint(vcfg: dict, env: dict, cache_file: Path, gpu: int) -> tuple[int, int] | None:
     """(image token cap, bytes) for the on-demand vision encoder on THIS machine's first GPU: measured once by
     `maya-vision --measure` (before the model loads, so the GPU is otherwise idle) and cached per encoder file, cap
@@ -2225,8 +2385,9 @@ def vision_footprint(vcfg: dict, env: dict, cache_file: Path, gpu: int) -> tuple
         if not isinstance(m, dict) or not all(isinstance(m.get(k), int) and m[k] > 0 for k in ("bytes", "total")):
             m = None
         if m is None:
-            args = [vcfg["exe"], "--mmproj", vcfg["mmproj"], "--model", vcfg["model"], "--gpu", "--max-tokens", str(cap),
-                    "--measure"] + (["--no-flash-attn"] if vcfg.get("no_flash_attn") else [])
+            args = [vcfg["exe"], "--mmproj", vcfg["mmproj"]] + \
+                (["--model", vcfg["model"]] if vcfg.get("model") else []) + \
+                ["--gpu", "--max-tokens", str(cap), "--measure"] + (["--no-flash-attn"] if vcfg.get("no_flash_attn") else [])
             print(f"[maya] images: measuring the vision encoder on this GPU ({cap} image tokens) ...", flush=True)
             try:
                 r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=env)
@@ -2267,7 +2428,8 @@ def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32")."""
     args = list(cfg["args"])
-    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args:
+    # (maya-ik2 on two GPUs splits by experts, not layers - its --gpus 2 is in the config's args)
+    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args and models.family(cfg) != "ik2":
         args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
     # --parallel N: each extra conversation's rings and KV come out of the experts' room, and the prompt path
     # needs its own room there.  On a card the model already fills (Maya-XS leaves ~130 MB) the third
@@ -2287,6 +2449,91 @@ def engine_args(cfg: dict) -> list[str]:
                       "queue instead of starving the others" % (args[i + 1], cap), flush=True)
                 args[i + 1] = str(cap)
     return args
+
+
+HY4_DRAFT_QS = (   # (--drafting auto's trial: requests as in real use - code, an explanation, plain text)
+    "Write a Python script that reads a CSV file of sales (date, region, amount) and prints the total for each region "
+    "and month as a table, with comments.",
+    "Explain how a hash table works, then show a short Python class that implements one.",
+    "Write a friendly email to my team: the release is on track for Friday, two bugs are left, and every test passes. "
+    "Ask who can review the last changes.")
+
+
+def hy4_draft_ids(cfg: dict) -> Path | None:
+    """The requests maya-hy4's --drafting auto times at its first start here (HY4_DRAFT_IDS): HY4_DRAFT_QS in the
+    model's own chat template, thinking off - a line of token ids each, written once into the data folder (a file a
+    tokenizer and template).  None: no tokenizer or template, or not written - the engine then answers slices of the
+    measuring text."""
+    tdir = Path(cfg.get("tokenizer") or "")
+    vocab, tpl = tdir / "vocab.json", tdir / "chat_template.jinja"
+    if not cfg.get("tokenizer") or not vocab.is_file() or not tpl.is_file():
+        return None
+    try:
+        tag = hashlib.md5(vocab.read_bytes() + tpl.read_bytes()).hexdigest()[:10]
+    except OSError:
+        return None
+    path = ROOT / "data" / f"hy4-draft-ids-{tag}.txt"
+    if path.is_file():
+        return path
+    try:
+        import strata_tokenizer as ST
+        from serve.frontend import ChatTemplate
+        tok, chat = ST.Tokenizer.from_dir(tdir), ChatTemplate(tpl)
+        lines = [",".join(map(str, tok.encode(chat.render([{"role": "user", "content": q}], enable_thinking=False),
+                                              parse_special=True))) for q in HY4_DRAFT_QS]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text("# maya: requests in the model's chat template, a line each - the answers maya-hy4's "
+                       "--drafting auto times at its first start on a PC\n" + "\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+        return path
+    except Exception:  # noqa: BLE001 - none: the engine times slices of the measuring text
+        return None
+
+
+IK2_DRAFT_FILE = ROOT / "data" / "ik2-drafting.txt"   # (maya-ik2's --drafting auto: this PC's choice, child_env)
+IK2_DRAFT_TOOL = {"type": "function", "function": {
+    "name": "get_weather", "description": "The current weather in a city.",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "The city's name."}},
+                   "required": ["city"]}}}
+IK2_DRAFT_QS = HY4_DRAFT_QS[:2] + (   # (chat, code - and a tool call: Inkling's drafting timed on all three)
+    "What is the weather in Paris and in Rome right now? Use the tool for each city.",)
+
+
+def ik2_draft_ids(cfg: dict) -> Path | None:
+    """The requests maya-ik2 times its --drafting auto on (IK2_DRAFT_IDS): IK2_DRAFT_QS in the
+    model's own chat template with thinking off (the last with IK2_DRAFT_TOOL offered) - a line of token ids each,
+    written once into the data folder (a file a tokenizer and template).  None: not written - the engine then says it
+    did not measure and drafts."""
+    tdir = Path(cfg.get("tokenizer") or "")
+    vocab, tpl = tdir / "vocab.json", tdir / "chat_template.jinja"
+    if not cfg.get("tokenizer") or not vocab.is_file() or not tpl.is_file():
+        return None
+    try:
+        tag = hashlib.md5(vocab.read_bytes() + tpl.read_bytes() + repr(IK2_DRAFT_QS).encode()).hexdigest()[:10]
+    except OSError:
+        return None
+    path = ROOT / "data" / f"ik2-draft-ids-{tag}.txt"
+    if path.is_file():
+        return path
+    try:
+        import strata_tokenizer as ST
+        from serve.frontend import ChatTemplate
+        tok, chat = ST.Tokenizer.from_dir(tdir), ChatTemplate(tpl)
+        lines = []
+        for i, q in enumerate(IK2_DRAFT_QS):
+            tools = [IK2_DRAFT_TOOL] if i == len(IK2_DRAFT_QS) - 1 else None
+            text = chat.render([{"role": "user", "content": q}], tools=tools, enable_thinking=False,
+                               reasoning_effort="none")
+            lines.append(",".join(map(str, tok.encode(text, parse_special=True))))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text("# maya: requests in the model's chat template, a line each - the answers maya-ik2's "
+                       "--drafting auto times at its first start on a PC\n" + "\n".join(lines) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+        return path
+    except Exception:  # noqa: BLE001 - none: the engine drafts without measuring
+        return None
 
 
 def child_env(cfg: dict) -> dict:
@@ -2331,6 +2578,15 @@ def child_env(cfg: dict) -> dict:
             ids = hy4_measure_ids(cfg)
             if ids is not None:
                 env["HY4_MEASURE_IDS"] = str(ids)
+    # Inkling 2 (maya-ik2 --drafting auto): which of no drafting, the prompt lookup and the drafter decodes fastest -
+    # measured once on this PC at the first start (before READY) on a chat, a code and a tool-call request in the
+    # model's template, remembered in the data folder (maya --speed-calibration measures again: IK2_DRAFT_MEASURE)
+    if models.family(cfg) == "ik2" and "--drafting" in (cfg.get("args") or []):
+        env.setdefault("IK2_DRAFT_FILE", str(IK2_DRAFT_FILE))
+        if "IK2_DRAFT_IDS" not in env:
+            ids = ik2_draft_ids(cfg)
+            if ids is not None:
+                env["IK2_DRAFT_IDS"] = str(ids)
     dirs =[d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
@@ -3241,10 +3497,10 @@ class Service:
         """Where the configs are: beside this server's own (maya.py's folder)."""
         return Path(self.config_path).parent if self.config_path else ROOT
 
-    def models_info(self, port: int | None = None) -> dict:
+    def models_info(self) -> dict:
         """The configs the setup wrote, the running one marked, each with its engine settings; whether a switch or a
         change to the running one can start Maya again at once (maya.py started this server)."""
-        out = models.listing(self.models_root(), self.config_path, port)
+        out = models.listing(self.models_root(), self.config_path)
         out.update(restarts=bool(os.environ.get("MAYA_RESTART_ON_UPDATE")),
                    running=Path(self.config_path).name if self.config_path else None,
                    restarting=getattr(self, "model_restart", None),
@@ -6360,6 +6616,11 @@ def make_handler(svc: Service):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if not getattr(svc, "web_ui", True) and (path in ("", "/web") or path.startswith(("/web/", "/fonts/"))):
+                # "web_ui": false (an API-only server, #1089): no page and none of its files, as any unknown path; the
+                # API, /health and the page's data routes (each behind the API key when one is set) as before
+                self._json(404, {"error": {"message": "not found"}})
+                return
             if path == "/models/sse":
                 self._models_sse()
                 return
@@ -6499,7 +6760,7 @@ def make_handler(svc: Service):
             elif path == "/api/models":
                 # the Models page: the configs the setup wrote, the running one, each one's engine settings
                 if self._authorized():
-                    self._json(200, svc.models_info(self.server.server_address[1]))
+                    self._json(200, svc.models_info())
             elif path == "/api/savings":
                 # the sidebar's Saved: what the model's own API would have charged for the same tokens, per model
                 if self._authorized():
@@ -7560,119 +7821,6 @@ def tee_server_log(path: str) -> None:
     sys.stdout = ServerLogTee(sys.stdout, handle)
 
 
-HY4_ROUTE_FILE = ROOT / "data" / "hy4-prompt-route.txt"   # (... its prompt route's rates measured on this PC: child_env)
-
-HY4_DRAFT_FILE = ROOT / "data" / "hy4-drafting.txt"       # (... and its drafting, --drafting auto: child_env)
-
-HY4_MEASURE_DOCS = ("docs/SETTINGS.md", "README.md")      # (... the text its first start measures them on: hy4_measure_ids)
-
-HY4_MEASURE_CHARS = 200_000                               # (... about 55K tokens of it: up to 12 prompt chunks of 4096)
-
-HY4_MEASURE_LEFT = re.compile(r"measuring this PC: (\d+) of (\d+) choices done in \d+ s - about (\d+) s more")
-
-HY4_TRIAL_TIME = {2: "about a minute", 3: "one to two minutes"}
-
-HY4_LANE_TIME = "one minute"
-
-HY4_DRAFT_QS = (   # (--drafting auto's trial: requests as in real use - code, an explanation, plain text)
-    "Write a Python script that reads a CSV file of sales (date, region, amount) and prints the total for each region "
-    "and month as a table, with comments.",
-    "Explain how a hash table works, then show a short Python class that implements one.",
-    "Write a friendly email to my team: the release is on track for Friday, two bugs are left, and every test passes. "
-    "Ask who can review the last changes.")
-
-def hy4_hot_file(cfg: dict) -> Path:
-    """maya-hy4's HY4_HOT scores for this config's model (each layer's experts a start places in VRAM): in the data
-    folder, a file a model - named by its folder (the pack's maya-hy4 folder sits in it)."""
-    args = cfg.get("args") or []
-    pack = Path(args[args.index("--pack") + 1]) if "--pack" in args[:-1] else None
-    name = "" if pack is None else pack.parent.name if pack.name == "maya-hy4" else pack.name
-    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._") or "model"
-    return ROOT / "data" / f"hy4-expert-hot-{name}.bin"
-
-
-def hy4_measure_ids(cfg: dict) -> Path | None:
-    """The text maya-hy4 measures this PC's choices on at its first start here (HY4_MEASURE_IDS): whether the CPU
-    lane's 4-bit expert copies pay and the prompt route's rates, before it says READY - so the first answers read
-    their prompts as fast as at the starts after.  This install's docs in the model's tokens, written once into the
-    data folder (a file a tokenizer).  None: no tokenizer, or the file cannot be written - the engine then measures
-    while it answers, as before."""
-    tdir = Path(cfg.get("tokenizer") or "")
-    vocab = tdir / "vocab.json"
-    if not cfg.get("tokenizer") or not vocab.is_file():
-        return None
-    try:
-        tag = hashlib.md5(vocab.read_bytes()).hexdigest()[:10]
-    except OSError:
-        return None
-    path = ROOT / "data" / f"hy4-measure-ids-{tag}.txt"
-    if path.is_file():
-        return path
-    try:
-        import strata_tokenizer as ST
-        text = ""
-        for name in HY4_MEASURE_DOCS:
-            p = ROOT / name
-            if p.is_file() and len(text) < HY4_MEASURE_CHARS:
-                text += p.read_text(encoding="utf-8", errors="replace")[:HY4_MEASURE_CHARS - len(text)] + "\n\n"
-        ids = ST.Tokenizer.from_dir(tdir).encode(text)
-        if len(ids) < 8192:
-            return None
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(f"# maya: {', '.join(HY4_MEASURE_DOCS)} in the model's tokens ({len(ids)}) - the text maya-hy4 "
-                       "measures a PC's 4-bit copies and prompt route on at its first start there\n" +
-                       ",".join(map(str, ids)) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
-        return path
-    except Exception:  # noqa: BLE001 - no text: the engine measures while it answers, as before
-        return None
-
-
-def hy4_measure_said(line: str) -> str:
-    """maya-hy4's "measuring this PC once" line in plain words, with roughly how long it takes on this kind of PC
-    (tools/setup_bridge.py's measure_said says the same): the drafting trial - each choice loaded and timed on a few
-    short answers - or the CPU lane's 4-bit copies and the prompt route."""
-    if "before the first answer: drafting" in line:
-        m = re.search(r"drafting \(([^:()]*):", line)
-        n = len(m.group(1).split(", ")) if m else 3
-        return (f"which drafting answers fastest - {n} choices, each loaded and timed on a few short answers, roughly "
-                f"{HY4_TRIAL_TIME.get(n, HY4_TRIAL_TIME[3])}")
-    return "the CPU lane's 4-bit copies and the prompt route, roughly " + HY4_LANE_TIME
-
-
-def hy4_draft_ids(cfg: dict) -> Path | None:
-    """The requests maya-hy4's --drafting auto times at its first start here (HY4_DRAFT_IDS): HY4_DRAFT_QS in the
-    model's own chat template, thinking off - a line of token ids each, written once into the data folder (a file a
-    tokenizer and template).  None: no tokenizer or template, or not written - the engine then answers slices of the
-    measuring text."""
-    tdir = Path(cfg.get("tokenizer") or "")
-    vocab, tpl = tdir / "vocab.json", tdir / "chat_template.jinja"
-    if not cfg.get("tokenizer") or not vocab.is_file() or not tpl.is_file():
-        return None
-    try:
-        tag = hashlib.md5(vocab.read_bytes() + tpl.read_bytes()).hexdigest()[:10]
-    except OSError:
-        return None
-    path = ROOT / "data" / f"hy4-draft-ids-{tag}.txt"
-    if path.is_file():
-        return path
-    try:
-        import strata_tokenizer as ST
-        from serve.frontend import ChatTemplate
-        tok, chat = ST.Tokenizer.from_dir(tdir), ChatTemplate(tpl)
-        lines = [",".join(map(str, tok.encode(chat.render([{"role": "user", "content": q}], enable_thinking=False),
-                                              parse_special=True))) for q in HY4_DRAFT_QS]
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text("# maya: requests in the model's chat template, a line each - the answers maya-hy4's "
-                       "--drafting auto times at its first start on a PC\n" + "\n".join(lines) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
-        return path
-    except Exception:  # noqa: BLE001 - none: the engine times slices of the measuring text
-        return None
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "maya", "strata"], default="mock")   # (strata: the old name, kept for older scripts)
@@ -7794,14 +7942,17 @@ def main() -> int:
                 vcfg, on_demand = dict(vcfg, gpu=False), False
             else:
                 vcfg = dict(vcfg, max_tokens=fp[0])
-                engine_env = dict(env, MAYA_GLM_VISION_LEND_MB=str((fp[1] >> 20) + 1))
+                if models.family(cfg) != "ik2":   # (maya-ik2 lends no memory: the encoder takes what is free)
+                    engine_env = dict(env, MAYA_GLM_VISION_LEND_MB=str((fp[1] >> 20) + 1))
+                else:   # (... and its drafting leaves the room the encoder would have had on the GPU: IK2_VISION_GIB)
+                    engine_env = dict(env, IK2_VISION_GIB=f"{fp[1] / 2**30:.3f}")
                 print(f"[maya] images: the vision encoder needs {fp[1] / 2**30:.2f} GB on this GPU at up to {fp[0]} "
                       "image tokens", flush=True)
         if vcfg and not on_demand:
             print("loading the vision encoder ...", flush=True)
             vision = Vision(vcfg, log=vlog, env=venv)
         print("loading the model (the first start takes a minute or two) ...", flush=True)
-        if len(gpu_list(cfg)) > 1:
+        if len(gpu_list(cfg)) > 1 and models.family(cfg) != "ik2":
             print(f"[maya] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
         t0 = time.time()
         mixed = mixed_gpus.config_of(cfg)   # (opt-in: an NVIDIA card beside the AMD GPU runs the first layers)
@@ -7866,6 +8017,19 @@ def main() -> int:
                 vision.reclaim = lambda: engine.command("VRECLAIM", "VRECLAIMED")
                 print(f"[maya] images: the vision encoder starts when a picture arrives, in {lent / 2**30:.2f} GB "
                       "the model lends it", flush=True)
+            elif models.family(cfg) == "ik2":
+                # Inkling 2 (maya-ik2 lends no memory, and its plan keeps none for pictures): the encoder starts when
+                # a picture arrives - on the GPU when its free memory then holds what the encoder measured, else on
+                # the CPU - and ends once the request's pictures are read
+                need, gi = fp[1], (gpu_list(cfg) or [0])[0]
+                free_of = amd_gpu_free_bytes if cfg.get("backend") == "hip" else gpu_free_bytes   # (AMD: sysfs)
+                vision = Vision(vcfg, log=vlog, env=venv, start=False)
+                vision.room = lambda: (free_of(gi) or 0) >= need
+                vision.cpu_threads = max(1, (os.cpu_count() or 2) // 2)
+                free = free_of(gi)
+                print(f"[maya] images: the vision encoder starts when a picture arrives - on GPU {gi} while "
+                      f"{need / 2**30:.2f} GB of it is free ({(free or 0) / 2**30:.2f} GB now), else on the CPU; "
+                      "no VRAM kept for it", flush=True)
             else:   # the model's GPU memory is too small to lend that much (or an engine without lending)
                 print("[maya] images: the model cannot lend the vision encoder its GPU memory here - the encoder "
                       "runs on the CPU", flush=True)
@@ -7910,6 +8074,9 @@ def main() -> int:
     svc.model_management = model_management_setting(cfg)   # ("model_management": true: llama.cpp's load/unload/sse)
     if svc.model_management:
         print("[maya] model management: on (/models/load, /models/unload, /models/sse)", flush=True)
+    svc.web_ui = web_ui_setting(cfg)                    # ("web_ui": false or MAYA_WEB_UI=0: the API only, #1089)
+    if not svc.web_ui:
+        print("[maya] web page: off (\"web_ui\": false - /, /web/ and /fonts/ answer 404; the API as before)", flush=True)
     svc.loop_guard = loop_guard_setting(cfg)            # (MAYA_LOOP_GUARD=0 or "loop_guard": false: off)
     if not svc.loop_guard:
         print("[maya] loop guard: off (a request's \"loop_guard\": true turns it on for that request)", flush=True)
@@ -7983,14 +8150,17 @@ def main() -> int:
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, /v1/responses, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''})", flush=True)
-    print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)
+    if svc.web_ui:
+        print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         # issue #26: reachable from other devices - say at which address, and what can still block it
         ips = lan_addresses()
         for ip in ips:
-            print(f"       from other devices: http://{ip}:{a.port}/   (API: http://{ip}:{a.port}/v1)", flush=True)
+            print(f"       from other devices: http://{ip}:{a.port}/   (API: http://{ip}:{a.port}/v1)" if svc.web_ui else
+                  f"       from other devices: http://{ip}:{a.port}/v1", flush=True)
         if not ips:
-            print("       from other devices: http://<this PC's IP address>:" + str(a.port) + "/", flush=True)
+            print("       from other devices: http://<this PC's IP address>:" + str(a.port) + ("/" if svc.web_ui else
+                                                                                               "/v1"), flush=True)
         if not svc.api_key:
             print("       WARNING: no API key - anyone on your network can use this model. Add \"api_key\": \"...\" "
                   "to the config (clients send it as their API key; the web page asks for it)", flush=True)
@@ -7999,7 +8169,7 @@ def main() -> int:
                   "in an admin PowerShell:\n         New-NetFirewallRule -DisplayName \"Maya " + str(a.port) + "\" "
                   "-Direction Inbound -Protocol TCP -LocalPort " + str(a.port) + " -Action Allow -Profile Private\n"
                   "       (and set this network to Private in Windows' network settings)", flush=True)
-    if a.open:
+    if a.open and svc.web_ui:
         import webbrowser
         webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
     # SIGTERM (llama-swap's cmdStop, systemd), SIGHUP (the terminal closed), Ctrl+C, Windows' Ctrl+Break and - with
