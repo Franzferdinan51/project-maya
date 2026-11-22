@@ -57,7 +57,8 @@ CONTEXT_TESTED_DEFAULT = 262144
 QWEN_KV =("fp16", "int8", "k8v4", "q4_0")                        # the Qwen path's --kv
 MM3_KV = ("bf16", "int8", "fp8", "fp4")                           # maya-mm3 --kv-cache (one format for K and V)
 # files the setup's quant list (tools/maya_quants.py) does not name, by their config's installer key
-OTHER_QUANTS = {("deepseek", "abliterated"): "Mix-256G"}
+OTHER_QUANTS = {("deepseek", "abliterated"): "Mix-256G",
+                ("ik2", "sq-20"): "Strata SQ-20"}   # (Inkling-2-Mini's Strata pack: the SQ-20 build's name)
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # variables that change which code the engine's process loads or runs (a library preloaded, the program search path):
 # never set or changed from the page - with remote access on, the page is a network client; a config's own are kept
@@ -167,6 +168,18 @@ def _ik2_mlx_images(cfg: dict) -> bool:
     INFO vision=ik2): pictures are on unless its --mlx-vision flag says off."""
     args = cfg.get("args") or []
     return flag(args, "--backend") == "mlx" and flag(args, "--mlx-vision") != "off"
+
+
+def _ik2_strata(cfg: dict) -> bool:
+    """Inkling 2 on the Strata shape engine (strata-inkling): a real engine program in maya-ik2's place, not the
+    Mac bridge - it speaks the same GEN/T protocol, reads pictures in its own process (its --vision file), drafts
+    with the DSpark built into its packs (its --draft) and takes its cache format as --kv."""
+    return Path(str(cfg.get("exe", ""))).name.startswith("strata-inkling")
+
+
+def _ik2_strata_images(cfg: dict) -> bool:
+    """strata-inkling with its Vision file named: pictures are on (the engine's own tower, in-process)."""
+    return _ik2_strata(cfg) and flag(cfg.get("args") or [], "--vision") is not None
 
 
 def gpus_of(cfg: dict) -> list:
@@ -491,6 +504,10 @@ def _choices(cfg: dict) -> dict:
             return {"draft": ["dspark", "none"],
                     "images": bool(cfg.get("vision") or cfg.get("vision_off")) or _ik2_mlx_images(cfg),
                     "kv": list(IK2F.KV_BYTES)}
+        if _ik2_strata(cfg):                           # (the Strata engine: DSpark is built into its packs and its
+            return {"draft": ["dspark", "none"],       #  Vision file is its own tower - no card arithmetic applies)
+                    "images": _ik2_strata_images(cfg),
+                    "kv": list(IK2F.KV_BYTES)}
         # (drafting: auto - measured once on this PC; the drafter by hand where the setup downloaded it; none)
         ctx = int(flag(cfg.get("args") or [], "--max-context") or 0)
         card = next((g for g in machine_gpus("cuda") if g.get("index") == (gpus_of(cfg) or [0])[0]), None)             if cfg.get("backend") != "hip" else None
@@ -542,7 +559,10 @@ def settings_of(cfg: dict) -> dict:
         return out
     if family(cfg) == "ik2":                           # (maya-ik2's own defaults where the config names none)
         kv = str(env.pop("IK2_KV", "f16")).lower()     # (its cache: Settings' KV cache, not a variable of the page's)
-        out.update(images=bool(cfg.get("vision")) or _ik2_mlx_images(cfg),
+        skv = flag(args, "--kv") if _ik2_strata(cfg) else None   # (the Strata engine's cache is its --kv argument)
+        if skv and str(skv).lower() in ("fp8", "e4m3", "f16", "fp16"):
+            kv = str(skv).lower()
+        out.update(images=bool(cfg.get("vision")) or _ik2_mlx_images(cfg) or _ik2_strata_images(cfg),
                    kv="f16" if kv in ("f16", "fp16") else "fp8" if kv in ("fp8", "e4m3") else kv,
                    parallel=_int(flag(args, "--parallel"), 1),
                    draft="dspark" if flag(args, "--llama-spec-type") == "draft-dspark"
@@ -805,7 +825,16 @@ def apply(cfg: dict, settings: dict) -> dict:
         kv = {"fp16": "f16", "e4m3": "fp8"}.get(kv, kv)
         if kv not in IK2F.KV_BYTES:
             raise ValueError("KV cache: FP8 or F16")
-        if flag(args, "--backend") == "mlx":
+        if _ik2_strata(cfg):
+            # (the Strata engine reads pictures in its own process: Images is its --vision file, named again from
+            #  the setup's record when it was dropped)
+            if s.get("images") is False:
+                args = drop_flag(args, "--vision")
+            elif s.get("images") and not flag(args, "--vision"):
+                vp = (cfg.get("installer") or {}).get("strata_vision")
+                if vp:
+                    args = set_flag(args, "--vision", vp)
+        elif flag(args, "--backend") == "mlx":
             # (the Mac bridge's MLX backend runs the tower itself: Images is its --mlx-vision flag)
             args = drop_flag(args, "--mlx-vision") if s.get("images") else set_flag(args, "--mlx-vision", "off")
         elif s.get("images") and not out.get("vision"):
@@ -817,6 +846,8 @@ def apply(cfg: dict, settings: dict) -> dict:
         env2 = dict(out.get("env") or {})
         env2["IK2_KV"] = kv
         out["env"] = env2
+        if _ik2_strata(cfg):                           # (the Strata engine's cache format is its --kv argument)
+            args = set_flag(args, "--kv", "fp8" if kv == "fp8" else "fp16")
         # (drafting: auto, the drafter by hand (dspark: --drafting on) or none; the drafter's file stays named, so
         #  auto and dspark can come back - with none the engine does not load it)
         if flag(args, "--backend") == "mlx":
@@ -829,7 +860,11 @@ def apply(cfg: dict, settings: dict) -> dict:
         elif s.get("draft") not in can["draft"]:
             raise ValueError("Drafting: this setup has no drafter (the setup downloads it)" if s.get("draft") == "dspark"
                              else "Drafting: auto, the drafter (DSpark) or none")
-        if flag(args, "--backend") != "mlx" and s["draft"] != ik2_draft_of(args):   # (written where it changes)
+        if _ik2_strata(cfg):
+            # (the Strata engine's drafting is its --draft: dspark, or no flag at all for none)
+            if s.get("draft") is not None and s["draft"] != ik2_draft_of(args):
+                args = set_flag(args, "--draft", "dspark") if s["draft"] == "dspark" else drop_flag(args, "--draft")
+        elif flag(args, "--backend") != "mlx" and s["draft"] != ik2_draft_of(args):   # (written where it changes)
             args = set_flag(args, "--drafting", {"auto": "auto", "dspark": "on"}.get(s["draft"], "off"))
         # (--parallel: n conversations at once where every expert stays in VRAM on one GPU - the engine's resident
         #  path, a cache each; drafting is off while it is above 1, elsewhere the engine says so and answers one at a

@@ -149,10 +149,11 @@ class _IsolatedSplits:
         return pieces
 
 
-# Inkling 2's pre-tokenizer under the names its GGUFs carry: "gpt-4o" (the conversion as unsloth's UD-Q4_K_XL was
-# made), "inkling" (as their UD-Q3_K_XL was, later) and "inkling2" (llama.cpp master's: Inkling-2-Mini's files) - the
-# same split, the same vocabulary and merges
-O200K = ("gpt-4o", "inkling", "inkling2")
+# Inkling 2's pre-tokenizer under the names its files carry: "gpt-4o" (the conversion as unsloth's UD-Q4_K_XL was
+# made), "inkling" (as their UD-Q3_K_XL was, later), "inkling2" (llama.cpp master's: Inkling-2-Mini's files) and
+# "o200k" / "o200k_base" (the Strata packs' tokenizer.json: the split's own name) - the same split, the same
+# vocabulary and merges
+O200K = ("gpt-4o", "inkling", "inkling2", "o200k", "o200k_base")
 
 
 class Tokenizer:
@@ -164,7 +165,7 @@ class Tokenizer:
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
         if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax", "hy_v4") + O200K:
             raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax, "
-                             "hy_v4, gpt-4o, inkling, inkling2" % pre)
+                             "hy_v4, gpt-4o, inkling, inkling2, o200k" % pre)
         # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece.  `gpt-4o` (Inkling 2's: its
         # tokenizer.json's one Split with GPT-4o's o200k regex - MINIMAX_PATTERN - and no normalizer, its BPE with
         # ignore_merges; also named "inkling": O200K) the same

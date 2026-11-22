@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -124,6 +125,17 @@ class Template(unittest.TestCase):
         out = public().render([{"role": "system", "content": "Be terse."}] + ASK)
         self.assertEqual(out, SYSTEM + TEXT + "Be terse." + END + EFFORT + "0.9" + END + USER + TEXT +
                          "Weather in Paris?" + END)
+
+    def test_generation_tags_render_their_body(self):
+        # (this template as the Strata packs ship it: each assistant turn wrapped in transformers'
+        #  {% generation %} markers - they emit their body unchanged, and the compile takes them out)
+        src = ("{% for m in messages %}[{{ m.role }}] {{ m.content }}\n{% endfor %}"
+               "{%- generation -%}tail{%- endgeneration -%}")
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "chat_template.jinja"
+            p.write_text(src, encoding="utf-8")
+            out = ChatTemplate(p).render([{"role": "user", "content": "hi"}], add_generation_prompt=False)
+        self.assertEqual(out, "[user] hi\ntail")
 
     def test_history_as_clients_send_it(self):
         # a past call's arguments as a JSON string (OpenAI's form) and its content None: the template refuses both

@@ -48,6 +48,10 @@ class ChatTemplate:
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
+        # (transformers' {% generation %} marks the span a reply is generated into and emits its body unchanged;
+        #  plain Jinja has no such tag.  Inkling 2's template as the Strata packs ship it wraps each assistant turn
+        #  in one, so the markers come out before the compile - the turn's own {{- -}} carry its whitespace)
+        self.source = re.sub(r"\{%-?\s*(?:end)?generation\s*-?%\}", "", self.source)
         self.template = env.from_string(self.source)
         # GLM-5.x: the template knows reasoning_effort "low" and "high" only - anything else, an absent one included,
         # is "Max", its most verbose - and it always opens <think> (no enable_thinking).  The server's levels are

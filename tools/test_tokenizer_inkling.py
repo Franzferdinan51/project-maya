@@ -1,9 +1,10 @@
 """tools/test_tokenizer_inkling.py - Inkling 2's pre-tokenizer, checked without a model.
 
 unsloth's Inkling-2-Small GGUFs name it two ways - "gpt-4o" (UD-Q4_K_XL) and "inkling" (UD-Q3_K_XL, a later
-conversion) - for the one split its tokenizer.json has: GPT-4o's o200k regex (MINIMAX_PATTERN), no normalizer, BPE
-with ignore_merges.  Both names must read the same; the real 201,024-token vocabulary was checked against the
-model's own tokenizer.json (tokenizers) on 442 strings with both files, all equal - no model ships here.
+conversion) - and the Strata packs' tokenizer.json names it "o200k", for the one split its tokenizer.json has:
+GPT-4o's o200k regex (MINIMAX_PATTERN), no normalizer, BPE with ignore_merges.  Every name must read the same;
+the real 201,024-token vocabulary was checked against the model's own tokenizer.json (tokenizers) on 442 strings
+with both files, all equal - no model ships here.
 """
 from __future__ import annotations
 
@@ -27,8 +28,9 @@ class InklingPre(unittest.TestCase):
     CORPUS = ["hello world", "hello world 123456 and 9876", "I'M you're THEY'LL", "UTF-8: héllo, combining é",
               "tabs\tand\nnewlines\r\n  spaces   ", "emoji 👍🏽 and CJK 你好世界", "x = f(a)->b; // done"]
 
-    def test_every_name(self):   # (gpt-4o and inkling: unsloth's conversions; inkling2: llama.cpp master's, Mini's files)
-        self.assertEqual(O200K, ("gpt-4o", "inkling", "inkling2"))
+    def test_every_name(self):   # (gpt-4o and inkling: unsloth's conversions; inkling2: llama.cpp master's, Mini's
+        # files; o200k and o200k_base: the Strata packs' tokenizer.json)
+        self.assertEqual(O200K, ("gpt-4o", "inkling", "inkling2", "o200k", "o200k_base"))
         tokens, merges = tiny_vocab()
         tks = [Tokenizer(tokens, merges, pre=p) for p in O200K]
         for tk in tks:
@@ -65,10 +67,10 @@ class InklingPre(unittest.TestCase):
         finally:
             S.Tokenizer.from_gguf = orig
 
-    def test_unknown_still_refused(self):
+    def test_unknown_still_refused(self):   # (a name no file carries and no transcription covers: refused, not guessed)
         tokens, merges = tiny_vocab()
         with self.assertRaises(ValueError):
-            Tokenizer(tokens, merges, pre="o200k")
+            Tokenizer(tokens, merges, pre="cl100k")
 
 
 if __name__ == "__main__":

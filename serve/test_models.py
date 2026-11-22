@@ -419,6 +419,70 @@ class Settings(unittest.TestCase):
             with mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "GPU", **gpu}]):
                 self.assertEqual(M.choices(M.read(path))["draft"], want, gpu)
 
+    def ik2_strata_cfg(self, **extra) -> Path:
+        """Inkling-2-Mini on the Strata shape engine, as its setup writes it: the .strata pack and its Vision file
+        in the model's folder, the pack's tokenizer beside them, DSpark built into the pack (its --draft)."""
+        d = self.d / "models" / "Inkling-2-Mini-SQ-20"
+        (d / "tokenizer").mkdir(parents=True, exist_ok=True)
+        (d / "Inkling-2-Mini-SQ-20.strata").write_bytes(b"x" * 1000)
+        (d / "Inkling-2-Mini-Vision.strata").write_bytes(b"x" * 100)
+        args = ["--model", str(d / "Inkling-2-Mini-SQ-20.strata"), "--vision", str(d / "Inkling-2-Mini-Vision.strata"),
+                "--max-context", "262144", "--parallel", "1", "--draft", "dspark", "--kv", "fp16"]
+        cfg = {"exe": "/b/strata-inkling", "args": args, "tokenizer": str(d / "tokenizer"),
+               "model_name": "inkling-2-mini-strata", "gpu": [0], "env": {"IK2_KV": "f16"}, "backend": "metal",
+               "sampling": {"temperature": 1.0, "top_p": 1.0}, "reasoning_effort": "high",
+               "installer": {"family": "ik2", "quant": "Strata SQ-20", "ik2_quant": "sq-20",
+                             "models_dir": str(self.d / "models"), "model_dir": str(d), "experimental": True,
+                             "strata_vision": str(d / "Inkling-2-Mini-Vision.strata")}, **extra}
+        p = self.d / "maya-inkling-strata.json"
+        p.write_text(json.dumps(cfg))
+        return p
+
+    def test_ik2_strata_engine_read_and_written_with_its_own_flags(self):
+        """Inkling-2-Mini on the Strata engine: the ik2 family by its installer record (its exe is strata-inkling,
+        not maya-ik2); its settings are the engine's own flags - Images its --vision file, Drafting its --draft,
+        the cache its --kv - and a save that changes nothing changes nothing."""
+        cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "RTX 3090", "vram_gb": 24.0}])
+        cards.start()
+        self.addCleanup(cards.stop)
+        path = self.ik2_strata_cfg()
+        cfg = M.read(path)
+        self.assertEqual(M.family(cfg), "ik2")
+        self.assertEqual(M.settings_of(cfg), {"context": 262144, "gpus": [0], "env": {}, "ablate": False,
+                                              "images": True, "kv": "f16", "draft": "dspark", "parallel": 1})
+        self.assertEqual(M.choices(cfg)["draft"], ["dspark", "none"])   # (the drafter is built into the pack)
+        self.assertTrue(M.choices(cfg)["images"])
+        self.assertEqual(M.quant_label(cfg, path), "Strata SQ-20")
+        self.assertIsNone(M.missing(cfg))
+        self.assertEqual(M.apply(cfg, {}), cfg)                                 # (a save that changes nothing)
+        self.assertEqual(M.apply(cfg, M.settings_of(cfg)), cfg)
+        # Images: the --vision file is dropped, and named again from the setup's record
+        off = M.apply(cfg, {"images": False})
+        self.assertIsNone(M.flag(off["args"], "--vision"))
+        self.assertFalse(M.settings_of(off)["images"])
+        on = M.apply(off, {"images": True})
+        self.assertEqual(M.flag(on["args"], "--vision"), cfg["installer"]["strata_vision"])
+        self.assertTrue(M.settings_of(on)["images"])
+        # Drafting: none drops --draft (the engine then loads no drafter); dspark writes it back
+        none = M.apply(cfg, {"draft": "none"})
+        self.assertIsNone(M.flag(none["args"], "--draft"))
+        self.assertEqual(M.settings_of(none)["draft"], "none")
+        back = M.apply(none, {"draft": "dspark"})
+        self.assertEqual(M.flag(back["args"], "--draft"), "dspark")
+        self.assertEqual(M.settings_of(back)["draft"], "dspark")
+        with self.assertRaises(ValueError):
+            M.apply(cfg, {"draft": "auto"})                                     # (no measured auto on this engine)
+        # the cache: --kv follows the setting, in the engine's own spelling
+        fp8 = M.apply(cfg, {"kv": "fp8"})
+        self.assertEqual(M.flag(fp8["args"], "--kv"), "fp8")
+        self.assertEqual(fp8["env"], {"IK2_KV": "fp8"})
+        self.assertEqual(M.settings_of(fp8)["kv"], "fp8")
+        m = M.describe(path, None)
+        self.assertEqual((m["family"], m["model"], m["quant"], m["ok"]),
+                         ("ik2", "inkling-2-mini-strata", "Strata SQ-20", True))
+        self.assertEqual(m["settings"]["images"], True)
+        self.assertEqual(m["settings"]["draft"], "dspark")
+
     def test_ik2_images_on_and_off(self):
         """The setup's "vision" entry (maya-vision and the mmproj, no text model): Images off keeps it as "vision_off",
         on puts it back; the engine's arguments are the same either way (the plan holds no room for pictures)."""
