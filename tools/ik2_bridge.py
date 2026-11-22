@@ -150,13 +150,14 @@ class SegmentServer:
             if not name or not isinstance(args, dict):
                 return
 
-            def esc(s) -> str:
-                return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-            parts = [f"<tool_call><function={esc(name)}>"]
+            # Raw values, exactly as the native families emit them: serve's
+            # parser does not unescape, so escaping here corrupts the call -
+            # a shell command's && arrived at the client as &amp;&amp; and
+            # bash rejected every chained command (DSH's tool failures).
+            parts = [f"<tool_call><function={name}>"]
             for k, v in args.items():
                 val = v if isinstance(v, str) else json.dumps(v)
-                parts.append(f"<parameter={esc(k)}>{esc(val)}</parameter>")
+                parts.append(f"<parameter={k}>{val}</parameter>")
             parts.append("</function></tool_call>")
             text = "".join(parts)
         except Exception:  # noqa: BLE001 - an unparseable call is dropped, never mangled into the answer
