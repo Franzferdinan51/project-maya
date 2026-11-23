@@ -143,6 +143,8 @@ class Dashboard(unittest.TestCase):
             ({"engine_kind": "qwen", "mtp": 1, "lookup": 3}, {}, ["MTP", "Lookup"]),
             ({"engine_kind": "qwen", "mtp": 0, "lookup": 0}, {}, []),
             ({"engine_kind": "mm3", "dspark": 1}, {}, ["DSpark"]),
+            ({"engine_kind": "ik2", "drafter": "dspark"}, {}, ["DSpark"]),               # (strata-inkling's INFO: drafter=dspark)
+            ({"engine_kind": "ik2", "drafter": "none"}, {}, []),
             ({"engine_kind": "mm3", "dspark": 0}, {}, []),
             ({"engine_kind": "hy4", "dspark": 0, "mtp": 0}, {}, []),                   # (maya-hy4: drafting off)
             ({"engine_kind": "hy4", "dspark": 0, "mtp": 0, "dfly2": 1}, {}, ["DFly2"]),

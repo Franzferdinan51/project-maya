@@ -2862,6 +2862,8 @@ def speculation_modes(info: dict, dspark=None, lookup=None) -> list:
     ds = dspark if dspark is not None else info.get("dspark")
     if on(ds):
         modes.append("DSpark")
+    elif info.get("drafter") == "dspark":   # (strata-inkling's INFO says drafter=dspark, not dspark=1: without
+        modes.append("DSpark")              #  this its Monitor read "off" while DSpark ran)
     if on(info.get("dflash")):
         modes.append("DFlash2")
     elif on(info.get("mtp")):
