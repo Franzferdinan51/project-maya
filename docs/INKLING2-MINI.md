@@ -63,6 +63,8 @@ To pick the card, set `CUDA_VISIBLE_DEVICES` before the command.
 
 All 4 are in [`docs/inkling2-mini/`](inkling2-mini/).
 
+Measured speeds for every build of this model that we run (MLX, Strata and GGUF routes, on an M5 Max) live in [`inkling2-mini/MODELS-AND-SPEEDS.md`](inkling2-mini/MODELS-AND-SPEEDS.md).
+
 | Config | Context | Drafter | Image encoder | VRAM |
 |---|---:|---|---|---:|
 | `ik2-mini.json` | 262,144 | yes | CPU | 23.8 GiB |
