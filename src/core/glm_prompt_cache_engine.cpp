@@ -1,10 +1,11 @@
-// src/core/glm_prompt_cache_engine.cpp - glm-dsa B14.14: the prompt cache's engine glue (include/strata/core/
+// src/core/glm_prompt_cache_engine.cpp - glm-dsa B14.14: the prompt cache's engine glue (include/maya/core/
 // glm_prompt_cache.hpp, engine_put / engine_take).  One store per loaded model, opened at its first use with the
 // model's identity (Glm5Model::pcache_identity); saves go through Maya's Glm5Model::slot_save, restores through
 // Glm5Model::slot_load_prefix (src/core/glm_prompt_cache_model.cu).
-#include "strata/core/glm_prompt_cache.hpp"
+#include "maya/core/glm_prompt_cache.hpp"
 
-#include "strata/core/glm_model.hpp"
+#include "maya/core/glm_env.hpp"
+#include "maya/core/glm_model.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -13,7 +14,7 @@
 #include <memory>
 #include <mutex>
 
-namespace strata::core::glmpc {
+namespace maya::core::glmpc {
 
 namespace {
 
@@ -25,7 +26,7 @@ Store* store_of(Glm5Model& model) {
     static std::map<const Glm5Model*, std::unique_ptr<Store>> stores;
     const char* dir = std::getenv("MAYA_GLM_PROMPT_CACHE_DIR");
     if (dir == nullptr || dir[0] == '\0' || !model.fast() || model.geometry().arch != GlmArch::GlmDsa) return nullptr;
-    if (std::getenv("MAYA_GLM_NO_REUSE") != nullptr) {
+    if (maya::glmenv::no_reuse_env()) {
         static bool said = false;
         if (!said) std::fprintf(stderr, "glm prompt cache: off (MAYA_GLM_NO_REUSE)\n");
         said = true;
@@ -97,4 +98,4 @@ size_t engine_take(Glm5Model& model, const std::vector<int32_t>& prompt, bool te
     return n;
 }
 
-}  // namespace strata::core::glmpc
+}  // namespace maya::core::glmpc

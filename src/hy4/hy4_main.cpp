@@ -736,9 +736,10 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
     for (const auto& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
     const auto& st0 = m.stats();
     std::printf("INFO engine=hy4 engine_kind=hy4 model=Hy4-flash ctx=%lld vram_gb=%.2f dspark=0 mtp=%d experts=%d "
-                "vram_slots=%d\n",
+                "vram_slots=%d expert_slots=%d\n",
                 (long long) m.max_ctx(), st0.vram_gb, m.has_mtp() && n_draft > 0 ? 1 : 0, st0.experts_all,
-                st0.experts_vram);
+                st0.experts_vram, st0.experts_vram);
+    for (const auto& l : m.vram_lines()) std::printf("%s\n", l.c_str());   // (the web app's map of the GPUs)
     if (m.has_dfly2()) std::printf("INFO dfly2=%d draft=%d\n", n_draft > 0 ? 1 : 0, n_draft);
     if (!m.room_report().empty()) std::printf("INFO %s\n", m.room_report().c_str());   // (--room-report)
     if (const hy4::VisionGeo* vg = m.vision())   // (serve/hy4_vision.py's Geometry.from_info)
@@ -829,7 +830,17 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
             if (x.start < (long long) from &&
                 std::none_of(held.begin(), held.end(), [&](const Held& q) { return x.start == q.start && x.hash == q.hash; }))
                 from = (size_t) x.start;
-        if (from > 0 && !m.resumable((int64_t) from)) from = 0;   // (the windows before it gone: read it all again)
+        if (from > 0 && !m.resumable((int64_t) from)) {   // (the windows before it gone: a restore point, else from 0)
+            const size_t shared = from;
+            const int64_t at = m.restore(r.ids.data(), (int64_t) from, err);
+            from = at > 0 ? (size_t) at : 0;
+            if (at > 0)
+                std::fprintf(stderr, "maya hy4 serve: restore point %zu of %zu shared tokens\n", from, shared);
+            else if (!err.empty()) {
+                std::fprintf(stderr, "maya hy4 serve: restore point: %s - read from 0\n", err.c_str());
+                err.clear();
+            }
+        }
         state.resize(from);
         held.clear();
         {
@@ -858,8 +869,14 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
         }();
         const bool alone = r.ids.size() - from > 1 && last_alone;
         const size_t body = alone ? r.ids.size() - 1 : r.ids.size();
-        for (size_t a = from; a < r.ids.size();) {
-            const int T = (int) std::min<size_t>((size_t) C, (a < body ? body : r.ids.size()) - a);
+        // (HY4_PP: a body of more than a chunk that Model::forward would pipeline reads in one forward, its chunks
+        //  overlapped over the two GPUs, then the last token alone as before; cancel looked at before and after it -
+        //  a pipelined body is not stopped part way.  Unset, or not pipelined: a chunk a call as before)
+        const bool pp_body = body > from && body - from > (size_t) C && m.pipelines((int) (body - from));
+        if (pp_body && in.stop.load()) cancel = true;
+        for (size_t a = from; !cancel && a < r.ids.size();) {
+            const int T = pp_body && a == from ? (int) (body - from)
+                                               : (int) std::min<size_t>((size_t) C, (a < body ? body : r.ids.size()) - a);
             const bool last = a + (size_t) T == r.ids.size();
             if (!m.forward(r.ids.data() + a, T, (int64_t) a, last ? 1 : 0, last ? lg.data() : nullptr, err)) {
                 ok = false;
@@ -1050,8 +1067,10 @@ int serve(hy4::Model& m, const std::vector<int>& eos, int n_draft, float floor0,
         if (spec && d_off > 0) std::fprintf(stderr, "maya hy4 serve: %s kept %lld of %lld drafts\n", m.has_dfly2() ? "DFly2" : "MTP", d_acc, d_off);
         stat_line();
         const double t2 = now() * 1e3;
-        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, r.ids.size(), t1 - t0, t2 - t1, finish,
-                    d_acc, d_off, from);
+        // (its last two: the routed experts the answer ran in VRAM, of all it ran - the web app's VRAM hit)
+        const long long d_ex = (long long) m.stats().experts - ex0, d_cpu = (long long) m.stats().cpu_experts - cpu0;
+        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu %lld %lld\n", produced, r.ids.size(), t1 - t0, t2 - t1,
+                    finish, d_acc, d_off, from, std::max(0LL, d_ex - d_cpu), std::max(0LL, d_ex));
         std::fflush(stdout);
         {
             // (HY4_HOT: the routes of the rows a plain decode reads - the prompt's and the answer's tokens but its
@@ -1687,6 +1706,7 @@ int main(int argc, char** argv) {
         else if (a == "--gen") gen = std::atoi(next().c_str());
         else if (a == "--gpus") o.gpus = parse_list(next());
         else if (a == "--max-context") o.max_ctx = std::atoll(next().c_str());
+        else if (a == "--snap-every") o.snap_every = std::max(0, std::atoi(next().c_str()));   // (restore points)
         else if (a == "--layer-split") {   // (the server's "auto": each GPU filled in turn)
             const std::string v = next();
             o.layer_split = v == "auto" ? std::vector<int>{} : parse_list(v);
@@ -1786,7 +1806,7 @@ int main(int argc, char** argv) {
         o.vision = true;
         o.vision_auto = false;
     }
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
+#if defined(_WIN32) && defined(MAYA_USE_HIP)
     // (first, so a log of a start that fails has it too)
     std::fprintf(stderr, "INFO experimental platform: an AMD GPU under Windows (HIP) - Hy4-Flash has not been tested "
                          "there by Maya's team; please include this log when reporting a problem\n");
@@ -1880,6 +1900,7 @@ int main(int argc, char** argv) {
         extra.n_more = n_more;
         extra.need = need;
         double t_draft = 0, t_verify = 0;
+        const double eg0 = m.stats().engram_ms;
         // (a row's top: the GPUs' where they found it - Model::row_top - else the walk over its logits)
         auto top_of = [&](const float* row, int r) {
             const int t = m.row_top(r);
@@ -1930,9 +1951,10 @@ int main(int argc, char** argv) {
             if (!m.save_profile(perr)) std::fprintf(stderr, "maya-hy4: the expert profile: %s\n", perr.c_str());
         }
         std::fprintf(stderr, "decode: %zu tokens in %.2f s (%.2f tok/s); %lld rounds, %s kept %lld of %lld drafts "
-                     "(%.1f tokens a round); a round: drafts %.1f ms, verify %.1f ms\n", out.size(), t2 - t1,
-                     out.size() / (t2 - t1), rounds, m.has_dfly2() ? "DFly2" : "MTP", acc, off, rounds ? (double) out.size() / rounds : 0.0,
-                     rounds ? 1e3 * t_draft / rounds : 0.0, rounds ? 1e3 * t_verify / rounds : 0.0);
+                     "(%.1f tokens a round); a round: drafts %.1f ms, verify %.1f ms (Engram lookups %.2f ms)\n",
+                     out.size(), t2 - t1, out.size() / (t2 - t1), rounds, m.has_dfly2() ? "DFly2" : "MTP", acc, off,
+                     rounds ? (double) out.size() / rounds : 0.0, rounds ? 1e3 * t_draft / rounds : 0.0,
+                     rounds ? 1e3 * t_verify / rounds : 0.0, rounds ? (m.stats().engram_ms - eg0) / rounds : 0.0);
         return 0;
     }
     for (int i = 0; i < gen; ++i) {

@@ -67,7 +67,7 @@ class ResidentSkip(unittest.TestCase):
         glm = (self.ROOT / "src/kernels/cuda/glm_fast.cu").read_text(encoding="utf-8")
         self.assertIn("const bool out = rank != 0 &&", glm)
         self.assertIn("if (a.norm_w && drop != 0u) inv =", glm)                   # (renormalised only where the model does)
-        self.assertIn("resident_ok", (self.ROOT / "include/strata/kernels/glm_fast.hpp").read_text(encoding="utf-8"))
+        self.assertIn("resident_ok", (self.ROOT / "include/maya/kernels/glm_fast.hpp").read_text(encoding="utf-8"))
 
     def test_off_in_a_config_without_turbo(self):
         d = Path(tempfile.mkdtemp())
@@ -228,6 +228,7 @@ class TurboServer(unittest.TestCase):
 
     def tearDown(self):
         self.httpd.shutdown()
+        self.httpd.server_close()                       # (its sampler ends too)
         shutil.rmtree(self.d, ignore_errors=True)
 
     def call(self, path, body=None):

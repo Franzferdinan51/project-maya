@@ -1,7 +1,7 @@
 // src/hy4/hy4_lane.cpp - maya-hy4's CPU lane (hy4_lane.hpp).
 #include "hy4_lane.hpp"
 
-#include "strata/kernels/cpu/pool.hpp"
+#include "maya/kernels/cpu/pool.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -38,15 +38,15 @@
 #include <cpuid.h>
 #endif
 
-#include "strata/platform/commit.hpp"
-#include "strata/platform/dedicated.hpp"
+#include "maya/platform/commit.hpp"
+#include "maya/platform/dedicated.hpp"
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
 
 namespace hy4 {
 
-namespace iqc = strata::ds4::gguf;
+namespace iqc = maya::ds4::gguf;
 
 namespace {
 std::string read_file(const std::string& p) {
@@ -107,7 +107,7 @@ std::vector<std::vector<int>> node_cores() {
     }
 #endif
     if (nodes.empty()) {
-        std::vector<int> all = strata::kernels::cpu::physical_cores(false);
+        std::vector<int> all = maya::kernels::cpu::physical_cores(false);
         nodes.push_back(all);
     }
     return nodes;
@@ -211,7 +211,7 @@ struct Lane::Impl {
         if (local_done > 0) done.fetch_add(local_done, std::memory_order_release);
     }
     void loop(int idx, int core, int node) {
-        if (core >= 0) strata::kernels::cpu::pin_current_thread(core);
+        if (core >= 0) maya::kernels::cpu::pin_current_thread(core);
 #if defined(__linux__)
         else {   // (a worker beyond the cores: the process's CPUs, not the mask of the thread that started it)
             cpu_set_t all;
@@ -448,7 +448,7 @@ void Lane::parallel_for(int n, const std::function<void(int)>& f, const std::vec
     if (p->caller_core >= 0) {   // (the thread that brings the jobs: pinned once)
         thread_local const Impl* pinned_for = nullptr;
         if (pinned_for != p.get()) {
-            strata::kernels::cpu::pin_current_thread(p->caller_core);
+            maya::kernels::cpu::pin_current_thread(p->caller_core);
             pinned_for = p.get();
         }
     }
@@ -528,6 +528,7 @@ struct Scratch {
     std::vector<float> h, y;          // the entries' h and down outputs
     std::vector<uint8_t> xq, hq;      // the tokens' quantized activations, the entries' quantized h
     std::vector<int> toks, order;     // the tokens that have entries; the entries by expert
+    std::vector<int> t_off, t_cur, t_ent;   // per-token entry index lists for parallel reduction
 };
 
 }  // namespace
@@ -615,14 +616,14 @@ uint64_t gpu_own_free(int domain, int bus, int dev) {
 #endif
 }
 
-uint64_t gpu_dedicated(const void* luid) { return strata::platform::dedicated_bytes(luid); }
+uint64_t gpu_dedicated(const void* luid) { return maya::platform::dedicated_bytes(luid); }
 
 uint64_t commit_available() {
 #if defined(_WIN32)
     MEMORYSTATUSEX s{};
     s.dwLength = sizeof(s);
     return GlobalMemoryStatusEx(&s)
-               ? (uint64_t) s.ullAvailPageFile + strata::platform::commit_growth((uint64_t) s.ullTotalPhys)
+               ? (uint64_t) s.ullAvailPageFile + maya::platform::commit_growth((uint64_t) s.ullTotalPhys)
                : 0;
 #else
     return 0;
@@ -781,12 +782,31 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
             iqc::iq_cpu_down(f, ex.D((size_t) gr.e), hq, gr.c, y, r0, r1);
     }, dn_node.empty() ? nullptr : &dn_node);
     const double tp3 = clk();
-    // each token's weighted sum, in its entries' order
-    for (int i = 0; i < n; ++i) {
-        const CpuEntry& e = entries[(size_t) i];
-        float* o = out + (size_t) e.t * E;
-        const float* y = sc.y.data() + (size_t) i * E;
-        for (int d = 0; d < E; ++d) o[d] += e.w * y[d];
+    // each token's weighted sum, in its entries' order (parallel across tokens when several tokens are present)
+    if (nq >= 4) {
+        sc.t_off.assign((size_t) T + 1, 0);
+        for (int i = 0; i < n; ++i) ++sc.t_off[(size_t) entries[(size_t) i].t + 1];
+        for (int t = 0; t < T; ++t) sc.t_off[(size_t) t + 1] += sc.t_off[(size_t) t];
+        sc.t_cur.assign(sc.t_off.begin(), sc.t_off.begin() + T);
+        sc.t_ent.resize((size_t) n);
+        for (int i = 0; i < n; ++i) sc.t_ent[(size_t) sc.t_cur[(size_t) entries[(size_t) i].t]++] = i;
+        lane.parallel_for(nq, [&](int ti) {
+            const int t = sc.toks[(size_t) ti];
+            float* o = out + (size_t) t * E;
+            for (int p = sc.t_off[(size_t) t]; p < sc.t_off[(size_t) t + 1]; ++p) {
+                const int i = sc.t_ent[(size_t) p];
+                const float w = entries[(size_t) i].w;
+                const float* y = sc.y.data() + (size_t) i * E;
+                for (int d = 0; d < E; ++d) o[d] += w * y[d];
+            }
+        });
+    } else {
+        for (int i = 0; i < n; ++i) {
+            const CpuEntry& e = entries[(size_t) i];
+            float* o = out + (size_t) e.t * E;
+            const float* y = sc.y.data() + (size_t) i * E;
+            for (int d = 0; d < E; ++d) o[d] += e.w * y[d];
+        }
     }
     {
         long long nq = 0;

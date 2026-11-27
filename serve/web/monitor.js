@@ -263,10 +263,18 @@ const TIER_SETS = {
     {key: "ram_fetch", label: "From RAM", unit: "/tok", digits: 2, tone: "info", sub: "experts the GPU fetched from pinned RAM"},
     {key: "cpu", label: "On the CPU", unit: "/tok", digits: 2, sub: "experts the CPU lane computed from RAM"},
   ],
+  // Ling-3.2-air (maya-ling's STAT lines): the experts VRAM does not hold, taken from RAM (computed on the CPU or copied
+  // to the GPU), those read from the SSD, and those moved into VRAM - a token
+  ling: [
+    {key: "ram_fetch", label: "From RAM", unit: "/tok", digits: 2, tone: "info", sub: "experts taken from RAM, computed on the CPU or copied to the GPU"},
+    {key: "disk", label: "From SSD", unit: "/tok", digits: 2, tone: "warn", sub: "experts read from the SSD"},
+    {key: "promo", label: "Promoted", unit: "/tok", digits: 2, sub: "experts moved into VRAM"},
+  ],
 };
 export const tierSet = (eng) => TIER_SETS[eng && eng.engine_kind === "ds4" ? "ds4" : eng && eng.engine_kind === "mm3" ? "mm3"
                                            : eng && eng.engine_kind === "qwen" ? "qwen"
                                            : eng && eng.engine_kind === "ik2" ? "ik2"
+                                           : eng && eng.engine_kind === "ling" ? "ling"
                                            : eng && eng.engine_kind === "hy4" ? "hy4" : "glm"];
 // the card's advice, from the live reading n (stale: the last answer's), the SSD-only share (disk: experts with no home
 // in VRAM or RAM) and the helper pool.  The "more RAM" advice only where experts really live on the SSD alone: a model
@@ -274,6 +282,7 @@ export const tierSet = (eng) => TIER_SETS[eng && eng.engine_kind === "ds4" ? "ds
 export function tierTip(n, eng, {stale = false, disk = 0, helper = false} = {}) {
   const ds4 = !!(eng && eng.engine_kind === "ds4"), mm3 = !!(eng && eng.engine_kind === "mm3");
   const qwen = !!(eng && eng.engine_kind === "qwen"), hy4 = !!(eng && eng.engine_kind === "hy4");
+  const ling = !!(eng && eng.engine_kind === "ling");
   if (stale) return "";
   if (ds4) {
     if (n.disk_mb != null && n.disk_mb >= 500) return "Much of every token is read from the SSD: more RAM keeps more of the model's experts cached, and answers get faster.";
@@ -284,7 +293,7 @@ export function tierTip(n, eng, {stale = false, disk = 0, helper = false} = {}) 
   }
   if (n.disk != null && n.disk >= 3 && disk > 0)
     return "Many experts are read from the SSD for every token: more RAM, a smaller model or a shorter context makes answers faster.";
-  if (mm3 || qwen || hy4) {   // (MiniMax, Qwen, Hy4: the CPU computes the experts VRAM does not hold)
+  if (mm3 || qwen || hy4 || ling) {   // (MiniMax, Qwen, Hy4, Ling: the CPU computes the experts VRAM does not hold)
     return n.vram_hit != null && n.vram_hit < 0.5 ? "Most experts run on the CPU: more VRAM (or a second GPU) keeps more of them on the card." : "";
   }
   if (n.vram_hit != null && n.vram_hit < 0.85 && (n.ram_fetch || 0) >= 4)
@@ -292,12 +301,15 @@ export function tierTip(n, eng, {stale = false, disk = 0, helper = false} = {}) 
   return "";
 }
 function Tiers({t, eng}) {
-  if (!t || !t.now) return null;
+  const hy4 = !!(eng && eng.engine_kind === "hy4");
+  // (Hy4-Flash: where its experts live is its start's placement (INFO experts / vram_slots) - shown from the start, before
+  //  an answer's readings; the others' from their STAT lines)
+  if (!(t && t.now) && !(hy4 && +eng.experts > 0)) return null;
   // (STAT lines with no expert tiers - an engine's drafting figures alone: nothing to show here)
-  if (!(eng && eng.engine_kind === "hy4") && t.now.vram_used == null && t.now.ram_used == null) return null;
-  const ds4 = !!(eng && eng.engine_kind === "ds4"), hy4 = !!(eng && eng.engine_kind === "hy4");
+  if (!hy4 && t.now.vram_used == null && t.now.ram_used == null) return null;
+  const ds4 = !!(eng && eng.engine_kind === "ds4");
   const set = tierSet(eng);
-  const n = t.now, h = t.history || {};
+  const n = (t && t.now) || {}, h = (t && t.history) || {};
   const helper = ds4 && ((n.helper_held || 0) > 0 || (n.helper || 0) > 0 || +eng.helper_allocated_bytes > 0);
   const helperHeld = n.helper_held != null ? n.helper_held : +eng.helper_slots || 0;
   const age = n.time ? Math.max(0, Date.now() / 1000 - n.time) : null;
@@ -312,7 +324,7 @@ function Tiers({t, eng}) {
   const pc = (x) => (100 * x) / total;
   return html`<section class=${`card${stale ? " is-stale" : ""}`} aria-label="Where the experts live">
     <div class="card__head"><span class="card__title">${helper ? "Primary cache and RAM backing" : "Where the experts live"}</span>
-      <span class="card__sub">${age == null ? "" : stale ? `last reading ${ago(age)} ago, from the last answer` : unified ? `live · ${fmt(vramGb, 1)} GB resident` : `live · ${fmt(total)} routed experts`}</span></div>
+      <span class="card__sub">${age == null ? (hy4 ? `${fmt(total)} routed experts · no answer yet` : "") : stale ? `last reading ${ago(age)} ago, from the last answer` : unified ? `live · ${fmt(vramGb, 1)} GB resident` : `live · ${fmt(total)} routed experts`}</span></div>
     ${unified ? html`<div class="tierbar" role="img" aria-label="All of the experts resident in unified memory">
       <span class="tierbar__vram" style="flex-grow:1"></span></div>
     <div class="legend">
