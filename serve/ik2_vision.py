@@ -69,3 +69,22 @@ class Vision(mm3_vision.Vision):
         if k != len(pictures):
             raise ValueError("the prompt and its images do not match")
         return out, starts
+
+
+class FileVision(Vision):
+    """The server's side of strata-inkling's pictures: that engine reads picture FILES itself (its own
+    tower, in-process, from its --vision file) - the GEN line carries an image=<path> key per picture and
+    the engine expands the template's one placeholder per picture into the picture's span.  So there is no
+    GENI file and no expansion here: the resized picture (this module's geometry, so the span the server
+    counts is the span the engine makes) is written as a PNG the engine opens, and the ids keep their
+    placeholders."""
+
+    def write_png(self, pic: Picture, name: str) -> Path:
+        """The picture as a PNG file in the vision directory (the engine opens it by path)."""
+        try:
+            from PIL import Image
+        except ImportError:
+            raise ValueError("pictures need Pillow and numpy (python -m pip install pillow numpy)") from None
+        path = self.dir / name
+        Image.frombytes("RGB", (pic.width, pic.height), pic.rgb).save(path, format="PNG")
+        return path

@@ -51,7 +51,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator, Protocol
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -1679,20 +1679,24 @@ class StrataEngine:
         so a line without the key is the line - and the answer - as before).  An engine without a direction ignores it."""
         return " ablate=1" if sampling.get("ablate") is True else ""
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, images=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         if self.multi:
-            yield from self._generate_multi(ids, max_new, sampling, cancel, embeddings)
+            yield from self._generate_multi(ids, max_new, sampling, cancel, embeddings, images)
             return
         ends0 = self._asked_end()                         # (_ended_itself: what the server asked of the engine)
         self.__dict__.setdefault("_paused", set()).discard(None)
         self.progress = None
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
-        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
-            f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        # (strata-inkling reads picture files itself: an image=<path> key per picture, percent-encoded - the
+        # engine opens each file and expands the prompt's placeholders in its own process)
+        keys = self.sampling_keys(sampling or {}) + \
+            "".join(f" image={quote(str(p), safe='')}" for p in images or [])
+        head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else \
+            f"GEN {int(max_new)}{keys}"
         try:
             turn_mark("gen_start")
             if prompt_memo_on():
@@ -1882,7 +1886,7 @@ class StrataEngine:
         except OSError:
             pass
 
-    def _generate_multi(self, ids, max_new, sampling, cancel, embeddings=None):
+    def _generate_multi(self, ids, max_new, sampling, cancel, embeddings=None, images=None):
         """generate() on an engine that runs several conversations: this request's GEN carries rid=<id>, its lines come
         back through its own queue (_route), and STOP <id> ends it alone."""
         rid = next(self._rids)
@@ -1893,7 +1897,8 @@ class StrataEngine:
         self._tls.rid = rid
         self.progress = None
         self.prefill_tok_s_mean = None
-        keys = self.sampling_keys(sampling or {}) + f" rid={rid}"
+        keys = self.sampling_keys(sampling or {}) + \
+            "".join(f" image={quote(str(p), safe='')}" for p in images or []) + f" rid={rid}"
         head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else f"GEN {int(max_new)}{keys}"
         done = False
         try:
@@ -2932,6 +2937,7 @@ class Service:
         self.fifo = FairLock()
         self.stopping = False            # the server is ending: a request still queued is refused, not started
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
+        self.image_files = threading.local()          # the current request's picture files (strata-inkling's image=<path>)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         self.response_limits = limits_from_env()
         self.responses = ResponseStore.from_limits(self.response_limits)
@@ -4157,6 +4163,7 @@ class Service:
             messages = hy4_tool_pictures_noted(messages)   # (a tool result's picture: a text note, not a 400)
         ids = self._as_written(self.render_ids(messages, tools, kwargs, prefill))   # (Qwen3.x: the model's own ids)
         self.embeddings.path = None
+        self.image_files.paths = None
         media = media_of(messages)
         if media and self.text_only() and getattr(self.template, "glm_dsa", False) and \
                 not media_of([m for m in messages if m.get("role") != "tool"]):
@@ -4166,13 +4173,33 @@ class Service:
             media = []
         images = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
                   else [src for kind, src in media if kind == "image"])
+        img_extra = 0          # (strata-inkling: the tokens its pictures' placeholders stand for, at the room check)
         if isinstance(self.vision, ENGINE_VISION) and any(kind == "video" for kind, _ in media):
             # the engines' own vision towers (DeepSeek, MiniMax, Hy4) read pictures only: say so instead of dropping
             # the video (with a picture next to it) or failing on a missing video encoder (without one)
             raise ValueError(("Hy4-flash" if isinstance(self.vision, hy4_vision.Vision) else
                               "Inkling 2 Mini" if isinstance(self.vision, ik2_vision.Vision) else "MiniMax-M3.1" if isinstance(self.vision, mm3_vision.Vision) else "DeepSeek-V4.1-Flash")
                              + " reads pictures, not videos")
-        if images and isinstance(self.vision, ENGINE_VISION):
+        if images and isinstance(self.vision, ik2_vision.FileVision):
+            # strata-inkling: the engine reads the pictures itself (its own tower, in-process), so the resized
+            # pictures are written as PNG files the engine opens (the GEN line's image=<path> keys) and the ids
+            # keep the template's one placeholder per picture - the engine expands it into the picture's span.
+            # The server's resize (multiples of 40, the ik2 bounds) makes the engine's grid the span counted
+            # here: img_extra is what the placeholders stand for, for the context room below.
+            pics = []
+            for src in images:
+                if cancel is not None and cancel.is_set():
+                    raise ValueError("image preparation was cancelled")
+                pics.append(self.vision.picture(src))
+            if cancel is not None and cancel.is_set():
+                raise ValueError("image preparation was cancelled")
+            if sum(1 for t in ids if t == self.vision.g.image_token) != len(pics):
+                raise ValueError("the prompt and its images do not match")
+            stem = uuid.uuid4().hex[:12]
+            self.image_files.paths = [self.vision.write_png(pic, f"req-{stem}-{k}.png")
+                                      for k, pic in enumerate(pics)]
+            img_extra = sum(pic.n - 1 for pic in pics)
+        elif images and isinstance(self.vision, ENGINE_VISION):
             # DeepSeek: the engine encodes the pictures itself; each placeholder the template wrote (user text's are
             # plain text, see render_ids) becomes its picture's span, the resized pixels go in the GENI file
             pics = []
@@ -4288,7 +4315,7 @@ class Service:
             self.embeddings.path = combined
         if self.engine.max_context <= 0:   # (a reload / /models/load: the start has not reported its context yet)
             raise BadBody(503, "the model is starting; try again in a moment")
-        room = self.context_room(len(ids))
+        room = self.context_room(len(ids) + img_extra)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
                 raise ContextOverflow(f"maximum context length is {self.engine.max_context} tokens; prompt "
@@ -4710,7 +4737,7 @@ class Service:
             c[{loop_guard.PENALTY: "penalised", loop_guard.CLOSE_THINKING: "thinking_closed",
                loop_guard.STOP: "stopped"}[act.kind]] += 1
 
-    def _sliced(self, ids, max_new, sampling, cancel, emb, hold, stat, guard=None) -> Iterator[int | None]:
+    def _sliced(self, ids, max_new, sampling, cancel, emb, hold, stat, guard=None, imgs=None) -> Iterator[int | None]:
         """engine.generate(), in fair slices (MAYA_FAIR_SLICE_S): once this answer has been decoding that long and
         another request waits for the engine, the engine stops here, the FIFO goes to the next request and this one
         queues behind it.  Back in turn, it goes on with prompt + what it already wrote as the new prompt: the
@@ -4738,8 +4765,8 @@ class Service:
         while True:
             last0 = getattr(self.engine, "last", None)
             smp_call, n_call = guard.sampling(smp, len(produced), left) if guard is not None else (smp, left)
-            gen = self.engine.generate(cur, n_call, smp_call, cancel, embeddings=emb) if emb else \
-                self.engine.generate(cur, n_call, smp_call, cancel)
+            gen = self.engine.generate(cur, n_call, smp_call, cancel, embeddings=emb, images=imgs) \
+                if emb or imgs else self.engine.generate(cur, n_call, smp_call, cancel)
             slice_s, t0, cut, pausing, claimed = fair_slice_seconds(), None, False, False, False
             act, got, closed = None, 0, False           # the loop guard's action; this call's tokens; a soft close
             try:
@@ -4949,6 +4976,7 @@ class Service:
                     lp_wait.clear()
             return evs
         emb = getattr(self.embeddings, "path", None)
+        imgs = getattr(self.image_files, "paths", None)
         # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
         # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
         engine_last0 = getattr(self.engine, "last", None)
@@ -5070,7 +5098,7 @@ class Service:
                                                          piece=self._guard_piece()) \
                             if guard_on else None       # (serve/loop_guard.py; a fresh one for a run again; leaves tool calls alone)
                         guards[:] = [guard] if guard is not None else []
-                        sliced, got = self._sliced(prompt, left, sampling, cancel, emb, hold, stat, guard), 0
+                        sliced, got = self._sliced(prompt, left, sampling, cancel, emb, hold, stat, guard, imgs), 0
                         try:
                             for t in sliced:
                                 got += t is not None
@@ -8007,6 +8035,19 @@ def main() -> int:
                                        Path(tempfile.mkdtemp(prefix="maya-ik2-pictures-")), Vision.load)
             print(f"[maya] images: the model's vision tower runs in the engine, up to {vision.g.max_pixels} pixels "
                   f"({vision.g.max_tokens} tokens) a picture", flush=True)
+        elif vision is None and not vcfg and engine.info.get("images") == 1 and models._ik2_strata_images(cfg):
+            # strata-inkling: its INFO speaks the engine's own dialect (images=1 image_pad=<token>), not the
+            # bridge's vision=ik2 - its tower runs in the engine's process from its --vision file, and the
+            # pictures reach it as files (the GEN line's image=<path> keys), so the handler is ik2_vision's
+            # file-writing one, with the placeholder token the engine itself names
+            geo = dict(engine.info)
+            if isinstance(geo.get("image_pad"), int):
+                geo["image_token"] = geo["image_pad"]
+            vision = ik2_vision.FileVision(ik2_vision.Geometry.from_info(geo),
+                                           Path(tempfile.mkdtemp(prefix="maya-ik2-pictures-")), Vision.load)
+            print(f"[maya] images: the model's vision tower runs in the engine (it reads the picture files "
+                  f"itself), up to {vision.g.max_pixels} pixels ({vision.g.max_tokens} tokens) a picture",
+                  flush=True)
         elif vision is None and not vcfg and engine.info.get("vision") == "off":
             # (DeepSeek-V4.1: its tower did not load - the engine's NOTE line above says why; no pictures offered)
             print("[maya] images: OFF - pictures are refused until the vision tower loads (see the line above)",
