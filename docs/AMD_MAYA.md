@@ -224,6 +224,25 @@ text (`MAYA_GLM_MTP_DECODE`, on by default on `gfx115x` only). On the Gorgon Hal
 
 Linux limits how much of the RAM a GPU may take (by default about half). The setup reads the limit and says so when a size does not fit under it; the engine then keeps the most-routed experts on the GPU and computes the rest on the CPU, slower. To let the GPU take more, set the kernel parameter `ttm.pages_limit` (in 4 KiB pages: GiB x 262144) and restart - for example `ttm.pages_limit=14680064` (56 GiB) on a 64 GB PC. Older kernels take `amdgpu.gttsize` (in MiB). Run on a 192 GB Gorgon Halo (Radeon 8065S, Ubuntu 26.04, kernel 7.0, ROCm 7.14) with `ttm.pages_limit=46137344`; the kernel's default limit has not been run. Windows on a Halo: not tested for Hy4-Flash yet.
 
+### Inkling-2-Mini
+
+`./maya.sh --setup --backend hip --model inkling-2-mini` (Linux). Its engine (`maya-ik2`) runs on an RDNA 3 / 3.5 / 4
+GPU (gfx11 / gfx12) with 12 GB of VRAM or more - under 24 GB the experts the card does not hold stay in RAM (about 9 GB
+of RAM with a 12 GB card) - or a Strix Halo / Gorgon Halo, whose memory is the RAM and holds the whole model (the
+setup counts what the system leaves, less max(8 GB, 10%)). Run by Maya's team on a
+Radeon 8065S (Gorgon Halo, Ubuntu, ROCm 7.1): text, thinking, tool calls and pictures, the same greedy answers over
+starts; Radeon RX 7000 / 9000 cards build the same engine but have not been run here yet. Older AMD GPUs and AMD
+under Windows are refused by the setup in one line. docs/INKLING2.md has the engine's AMD paths.
+
+### Ling-3.2-air
+
+`./maya.sh --setup --backend hip --model ling-3.2-air-maya-s` (Linux). Its engine (`maya-ling`) runs on one RDNA 3 /
+3.5 / 4 GPU (gfx11 / gfx12) of 8 GB or more - the experts the card does not hold are computed from RAM, as on NVIDIA -
+or a Strix Halo / Gorgon Halo, whose memory is the RAM (the setup counts what the system leaves, less max(8 GB, 10%),
+and the engine keeps that much free beside its expert pool). Run by Maya's team on a Radeon 8065S (Gorgon Halo,
+Ubuntu, ROCm 7.14); Radeon RX 7000 / 9000 cards build the same engine but have not been run here yet. Several AMD GPUs,
+older AMD GPUs and AMD under Windows are refused by the setup in one line. docs/LING.md has the rest.
+
 ## Instinct MI300X / MI325X
 
 AMD Instinct MI300X / MI325X (`gfx942`, CDNA3) is accepted as experimental, on one GPU. Like the MI100 it is a wave64

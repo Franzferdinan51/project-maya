@@ -1,11 +1,13 @@
 // src/hy4/hy4_tp.cpp - maya-hy4's tensor parallel: the host's threads (see hy4_tp.hpp).
 #include "hy4_tp.hpp"
+#include "hy4_lane.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <vector>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -32,29 +34,51 @@
 namespace hy4 {
 
 // ---------------------------------------------------------------- Crew
-Crew::Crew(int n) {
+Crew::Crew(int n, double spin_s) {
+    if (const char* se = std::getenv("HY4_CREW_SPIN_MS")) spin_s = std::atof(se) * 1e-3;
     for (int i = 0; i < n; ++i)
-        th_.emplace_back([this, i] {
+        th_.emplace_back([this, i, spin_s] {
+            unpin_this_thread();   // (not the lane caller's one core, when it starts the crew)
             unsigned seen = 0;
             for (;;) {
-                std::function<void(int)> f;
-                {
-                    std::unique_lock<std::mutex> lk(mu_);
-                    cv_.wait(lk, [&] { return quit_ || gen_ != seen; });
-                    if (quit_) return;
-                    seen = gen_;
-                    f = f_;
+                // (a start soon after the last: seen while spinning - no sleep, and no lock every thread would queue
+                //  for at once; f_ is whole before gen_ moves, and is not written again until every thread is done)
+                bool got = false;
+                if (spin_s > 0) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    for (;;) {
+                        if (quit_.load(std::memory_order_relaxed)) return;
+                        const unsigned gg = gen_.load(std::memory_order_acquire);
+                        if (gg != seen) {
+                            seen = gg;
+                            got = true;
+                            break;
+                        }
+                        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() >= spin_s) break;
+                        for (int k = 0; k < 16; ++k) {   // (a start seen within a pause, as the sums' helpers)
+                            HY4_PAUSE();
+                            if (gen_.load(std::memory_order_acquire) != seen) break;
+                        }
+                    }
                 }
-                f(i);
-                std::lock_guard<std::mutex> lk(mu_);
-                if (--left_ == 0) done_cv_.notify_all();
+                if (!got) {
+                    std::unique_lock<std::mutex> lk(mu_);
+                    cv_.wait(lk, [&] { return quit_.load() || gen_.load() != seen; });
+                    if (quit_.load()) return;
+                    seen = gen_.load();
+                }
+                f_(i);
+                if (left_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    std::lock_guard<std::mutex> lk(mu_);   // (no waiter between its check and its sleep)
+                    done_cv_.notify_all();
+                }
             }
         });
 }
 Crew::~Crew() {
     {
         std::lock_guard<std::mutex> lk(mu_);
-        quit_ = true;
+        quit_.store(true);
     }
     cv_.notify_all();
     for (auto& t : th_) t.join();
@@ -63,20 +87,26 @@ void Crew::start(const std::function<void(int)>& f) {
     {
         std::lock_guard<std::mutex> lk(mu_);
         f_ = f;
-        left_ = (int) th_.size();
-        ++gen_;
+        left_.store((int) th_.size(), std::memory_order_release);
+        gen_.fetch_add(1, std::memory_order_release);
     }
     cv_.notify_all();
 }
 void Crew::wait() {
+    for (int k = 0; k < 4096; ++k) {   // (most waits: the threads done, or about to be)
+        if (left_.load(std::memory_order_acquire) == 0) return;
+        HY4_PAUSE();
+    }
     std::unique_lock<std::mutex> lk(mu_);
-    done_cv_.wait(lk, [&] { return left_ == 0; });
+    done_cv_.wait(lk, [&] { return left_.load() == 0; });
 }
 
 // ---------------------------------------------------------------- Summer
 namespace {
 constexpr size_t kTile = 1024;   // (values a pass of the parts: an accumulator in L1)
-constexpr size_t kPerThread = 2048;   // (values a thread takes at least: below it fewer threads join)
+const char* const kPerEnv = std::getenv("HY4_SUM_PER");
+const size_t kPerThread = kPerEnv ? (size_t) std::atol(kPerEnv) : (size_t) 2048;   // (values a thread takes at least:
+                                                                                    //  below it fewer threads join)
 constexpr double kSpinS = 0.005;      // (a helper spins this long after its last sum, then sleeps)
 constexpr size_t kAddTeam = 65536;    // (add(): values from which the helpers join)
 }  // namespace
@@ -92,7 +122,12 @@ Summer::Summer(int helpers, const std::vector<int>& cpus) {
                 if (quit_.load(std::memory_order_relaxed)) return;
                 if (gg == seen) {
                     if (std::chrono::duration<double>(std::chrono::steady_clock::now() - last).count() < kSpinS) {
-                        for (int i = 0; i < 64; ++i) HY4_PAUSE();
+                        // (the next sum seen within a pause: 64 pauses between looks are 4 us on a Skylake Xeon, whose
+                        //  PAUSE is ~140 cycles - longer than a token window's whole sum, which waits for the last helper)
+                        for (int i = 0; i < 64; ++i) {
+                            HY4_PAUSE();
+                            if (gen_.load(std::memory_order_acquire) != seen) break;
+                        }
                         continue;
                     }
                     std::unique_lock<std::mutex> lk(mu_);
@@ -242,9 +277,72 @@ void Summer::sum16(uint16_t* out, float* osc, const uint16_t* parts, const float
     go(rows);
     mode_ = 0;
 }
+// stream()'s work on values [a0, a1): the parts in order, each when its flag has come.  The caller's thread (a0 0)
+// asks `stop` now and then; the others watch stop_
+void Summer::run_stream(size_t a0, size_t a1) const {
+    const size_t m = a1 > a0 ? a1 - a0 : 0;
+    if (m == 0) return;   // (a thread past the values: the caller's waits for every flag)
+    static thread_local std::vector<float> accv;
+    if (accv.size() < m) accv.resize(m);
+    float* acc = accv.data();
+    const bool caller = a0 == 0;
+    const int total = n_parts_ + n_extra_;
+    for (int j = 0; j < total; ++j) {
+        const volatile unsigned* f = flags_ + (size_t) j * fstride_;
+        for (long spin = 0; (int) (*f - v_) < 0; ++spin) {
+            HY4_PAUSE();
+            if ((spin & 0xfff) == 0xfff) {
+                if (stop_.load(std::memory_order_relaxed)) return;
+                if (caller && (spin & 0xffff) == 0xffff && (*stopf_)()) {
+                    stop_.store(true, std::memory_order_relaxed);
+                    return;
+                }
+            }
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (caller && j == total - 1)
+            t_last_ = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        const float* pj = parts_ + (size_t) j * stride_ + a0;
+        if (j == 0) {
+            std::memcpy(acc, pj, m * sizeof(float));
+        } else if (j < n_parts_) {
+            for (size_t k = 0; k < m; ++k) acc[k] += pj[k];
+        } else if (a0 < n_short_) {
+            const size_t ms = std::min(m, n_short_ - a0);
+            for (size_t k = 0; k < ms; ++k) acc[k] += pj[k];
+        }
+    }
+    std::memcpy(dst_ + a0, acc, m * sizeof(float));
+}
+bool Summer::stream(float* dst, const float* parts, int n_parts, size_t stride, size_t n, int n_extra, size_t n_short,
+                    const volatile unsigned* flags, size_t fstride, unsigned v, const std::function<bool()>& stop,
+                    double* t_last) {
+    mode_ = 4;
+    dst_ = dst;
+    parts_ = parts;
+    n_parts_ = n_parts;
+    n_extra_ = n_extra;
+    n_short_ = std::min(n_short, n);
+    stride_ = stride;
+    n_ = n;
+    flags_ = flags;
+    fstride_ = fstride;
+    v_ = v;
+    stopf_ = &stop;
+    stop_.store(false, std::memory_order_relaxed);
+    t_last_ = 0.0;
+    go(n);
+    mode_ = 0;
+    if (t_last != nullptr) *t_last = t_last_;
+    return !stop_.load(std::memory_order_relaxed);
+}
 void Summer::run(size_t a0, size_t a1) const {
     if (mode_ == 3) {
         run16(a0, a1);
+        return;
+    }
+    if (mode_ == 4) {
+        run_stream(a0, a1);
         return;
     }
     if (mode_ != 0) {   // (add(): dst = src, or dst += src)
@@ -296,9 +394,12 @@ void Summer::sum(float* dst, const float* parts, int n_parts, size_t stride, siz
     n_ = n;
     go(n);
 }
+void Summer::windows_solo(bool on) {
+    solo_ = on && kPerEnv == nullptr;   // (HY4_SUM_PER, when set, decides alone)
+}
 void Summer::go(size_t n) {
     const int threads = (int) th_.size() + 1;
-    if (th_.empty() || (mode_ != 3 && n < 2 * kPerThread) || (mode_ == 3 && n < 4)) {   // (a token's few thousand values: the caller alone)
+    if (th_.empty() || (mode_ == 4 && solo_) || (mode_ != 3 && n < 2 * kPerThread) || (mode_ == 3 && n < 4)) {   // (a token's few thousand values: the caller alone)
         per_ = n;
         run(0, n);
         return;

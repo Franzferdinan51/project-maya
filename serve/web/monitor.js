@@ -78,11 +78,16 @@ function Throughput({m}) {
   // prefill: the engine's rate over the tokens it read (not the reused prefix): the peak of the reading this page saw
   // (prefillPeak), else live while a request runs, else the last request's final rate
   const pk = prefillPeak(m);
-  const prefill = pk && pk.rate != null ? pk.rate : live.state !== "idle" ? live.prefill_tok_s_mean
-    : last ? (last.prefill_tok_s != null ? last.prefill_tok_s
+  const lastPre = last ? (last.prefill_tok_s != null ? last.prefill_tok_s
               : last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null)
     : null;
-  const pwhat = live.state === "reading" ? "reading now" : pk && pk.label ? pk.label : gen ? "this request" : last ? "last request" : "waiting";
+  // (an engine that reports no prompt progress - the ik2 bridge - leaves the live rate null while it
+  //  generates: the tile then keeps the last request's rate, labelled as such, instead of a dash)
+  const prefill = pk && pk.rate != null ? pk.rate : live.state === "reading" ? live.prefill_tok_s_mean
+    : live.prefill_tok_s_mean != null ? live.prefill_tok_s_mean : lastPre;
+  const pwhat = live.state === "reading" ? "reading now" : pk && pk.label ? pk.label
+    : gen && live.prefill_tok_s_mean == null && lastPre != null ? "last request"
+    : gen ? "this request" : last ? "last request" : "waiting";
   const fresh = tn && tn.time && Date.now() / 1000 - tn.time <= 30;
   const ms = gen && tn && tn.ms_tok ? tn.ms_tok : speed ? 1000 / speed : null;
   const hit = fresh && tn.vram_hit != null ? 100 * tn.vram_hit : last && last.hit_rate != null ? 100 * last.hit_rate : null;
@@ -247,13 +252,29 @@ const TIER_SETS = {
   // RAM or read from the model file - its "disk" counts every expert read from the file, through the page cache or from
   // the SSD (the engine cannot tell which); the drafts' windows count too
   qwen: [
+    {key: "promo", label: "Promoted", unit: "/tok", digits: 2, sub: "completed expert moves into VRAM per generated token"},
     {key: "ram_fetch", label: "From RAM", unit: "/tok", digits: 1, tone: "info", sub: "experts the CPU computed from RAM"},
     {key: "disk", label: "From the model file", unit: "/tok", digits: 2, tone: "warn",
      sub: "experts read from the model file (page cache or SSD)"},
   ],
+  // Inkling 2 (maya-ik2): every expert in VRAM (the resident path), or a tier of them with the rest in pinned RAM -
+  // fetched over PCIe by the GPU or computed by the CPU lane (the offload path)
+  ik2: [
+    {key: "ram_fetch", label: "From RAM", unit: "/tok", digits: 2, tone: "info", sub: "experts the GPU fetched from pinned RAM"},
+    {key: "cpu", label: "On the CPU", unit: "/tok", digits: 2, sub: "experts the CPU lane computed from RAM"},
+  ],
+  // Ling-3.2-air (maya-ling's STAT lines): the experts VRAM does not hold, taken from RAM (computed on the CPU or copied
+  // to the GPU), those read from the SSD, and those moved into VRAM - a token
+  ling: [
+    {key: "ram_fetch", label: "From RAM", unit: "/tok", digits: 2, tone: "info", sub: "experts taken from RAM, computed on the CPU or copied to the GPU"},
+    {key: "disk", label: "From SSD", unit: "/tok", digits: 2, tone: "warn", sub: "experts read from the SSD"},
+    {key: "promo", label: "Promoted", unit: "/tok", digits: 2, sub: "experts moved into VRAM"},
+  ],
 };
 export const tierSet = (eng) => TIER_SETS[eng && eng.engine_kind === "ds4" ? "ds4" : eng && eng.engine_kind === "mm3" ? "mm3"
                                            : eng && eng.engine_kind === "qwen" ? "qwen"
+                                           : eng && eng.engine_kind === "ik2" ? "ik2"
+                                           : eng && eng.engine_kind === "ling" ? "ling"
                                            : eng && eng.engine_kind === "hy4" ? "hy4" : "glm"];
 // the card's advice, from the live reading n (stale: the last answer's), the SSD-only share (disk: experts with no home
 // in VRAM or RAM) and the helper pool.  The "more RAM" advice only where experts really live on the SSD alone: a model
@@ -261,6 +282,7 @@ export const tierSet = (eng) => TIER_SETS[eng && eng.engine_kind === "ds4" ? "ds
 export function tierTip(n, eng, {stale = false, disk = 0, helper = false} = {}) {
   const ds4 = !!(eng && eng.engine_kind === "ds4"), mm3 = !!(eng && eng.engine_kind === "mm3");
   const qwen = !!(eng && eng.engine_kind === "qwen"), hy4 = !!(eng && eng.engine_kind === "hy4");
+  const ling = !!(eng && eng.engine_kind === "ling");
   if (stale) return "";
   if (ds4) {
     if (n.disk_mb != null && n.disk_mb >= 500) return "Much of every token is read from the SSD: more RAM keeps more of the model's experts cached, and answers get faster.";
@@ -271,7 +293,7 @@ export function tierTip(n, eng, {stale = false, disk = 0, helper = false} = {}) 
   }
   if (n.disk != null && n.disk >= 3 && disk > 0)
     return "Many experts are read from the SSD for every token: more RAM, a smaller model or a shorter context makes answers faster.";
-  if (mm3 || qwen || hy4) {   // (MiniMax, Qwen, Hy4: the CPU computes the experts VRAM does not hold)
+  if (mm3 || qwen || hy4 || ling) {   // (MiniMax, Qwen, Hy4, Ling: the CPU computes the experts VRAM does not hold)
     return n.vram_hit != null && n.vram_hit < 0.5 ? "Most experts run on the CPU: more VRAM (or a second GPU) keeps more of them on the card." : "";
   }
   if (n.vram_hit != null && n.vram_hit < 0.85 && (n.ram_fetch || 0) >= 4)
@@ -279,10 +301,15 @@ export function tierTip(n, eng, {stale = false, disk = 0, helper = false} = {}) 
   return "";
 }
 function Tiers({t, eng}) {
-  if (!t || !t.now) return null;
-  const ds4 = !!(eng && eng.engine_kind === "ds4"), hy4 = !!(eng && eng.engine_kind === "hy4");
+  const hy4 = !!(eng && eng.engine_kind === "hy4");
+  // (Hy4-Flash: where its experts live is its start's placement (INFO experts / vram_slots) - shown from the start, before
+  //  an answer's readings; the others' from their STAT lines)
+  if (!(t && t.now) && !(hy4 && +eng.experts > 0)) return null;
+  // (STAT lines with no expert tiers - an engine's drafting figures alone: nothing to show here)
+  if (!hy4 && t.now.vram_used == null && t.now.ram_used == null) return null;
+  const ds4 = !!(eng && eng.engine_kind === "ds4");
   const set = tierSet(eng);
-  const n = t.now, h = t.history || {};
+  const n = (t && t.now) || {}, h = (t && t.history) || {};
   const helper = ds4 && ((n.helper_held || 0) > 0 || (n.helper || 0) > 0 || +eng.helper_allocated_bytes > 0);
   const helperHeld = n.helper_held != null ? n.helper_held : +eng.helper_slots || 0;
   const age = n.time ? Math.max(0, Date.now() / 1000 - n.time) : null;
@@ -297,7 +324,7 @@ function Tiers({t, eng}) {
   const pc = (x) => (100 * x) / total;
   return html`<section class=${`card${stale ? " is-stale" : ""}`} aria-label="Where the experts live">
     <div class="card__head"><span class="card__title">${helper ? "Primary cache and RAM backing" : "Where the experts live"}</span>
-      <span class="card__sub">${age == null ? "" : stale ? `last reading ${ago(age)} ago, from the last answer` : unified ? `live · ${fmt(vramGb, 1)} GB resident` : `live · ${fmt(total)} routed experts`}</span></div>
+      <span class="card__sub">${age == null ? (hy4 ? `${fmt(total)} routed experts · no answer yet` : "") : stale ? `last reading ${ago(age)} ago, from the last answer` : unified ? `live · ${fmt(vramGb, 1)} GB resident` : `live · ${fmt(total)} routed experts`}</span></div>
     ${unified ? html`<div class="tierbar" role="img" aria-label="All of the experts resident in unified memory">
       <span class="tierbar__vram" style="flex-grow:1"></span></div>
     <div class="legend">
@@ -305,7 +332,7 @@ function Tiers({t, eng}) {
     : html`<div class="tierbar" role="img" aria-label=${hy4 ? `${fmt(pc(vu), 0)}% of the experts in VRAM, ${fmt(pc(ru), 0)}% in RAM, computed on the CPU`
       : `${fmt(pc(vu), 0)}% of the experts in VRAM, ${fmt(pc(ru), 0)}% in ${ds4 ? "RAM" : "pinned RAM"}, ${fmt(pc(disk), 0)}% on the SSD only`}>
       <span class="tierbar__vram" style=${`flex-grow:${vu}`}></span><span class="tierbar__ram" style=${`flex-grow:${ru}`}></span>
-      <span class="tierbar__disk" style=${`flex-grow:${disk}`}></span></div>
+      <span class="tierbar__disk" style=${`flex-grow:${disk}`}></span></div>`}
     ${hy4 ? html`<div class="legend">
       <span><i class="sw sw--vram"></i>VRAM <b class="num">${fmt(vu)}</b></span>
       <span><i class="sw sw--ram"></i>RAM, computed on the CPU <b class="num">${fmt(ru)}</b></span></div>` : html`<div class="legend">
@@ -521,8 +548,11 @@ const METRICS = [
   {key: "temp", label: "GPU temp", unit: "°C", series: "gpu_temp", tone: "warn"},
   {key: "pcie", label: "PCIe", series: "gpu_pcie_rx_mb", tone: "info"},
   {key: "cpu", label: "CPU", unit: "%", series: "cpu", max: 100},
-  {key: "ram", label: "System RAM", series: "ram_used", tone: "info"},
-  {key: "disk", label: "Disk read", series: "disk_read_mb", tone: "info"},
+  {key: "cputemp", label: "CPU temp", unit: "°C", series: "cpu_temp", max: 100, tone: "warn"},
+  {key: "ram", label: "System RAM", series: "ram_used", tone: "info",
+   tip: "The memory programs use. The file cache is not counted: model files the system keeps in RAM after a read (the n-gram table among them) are given back whenever a program needs the memory."},
+  {key: "disk", label: "Disk read", series: "disk_read_mb", tone: "info",
+   tip: "What the drives read this second. A file the system already holds in RAM (its file cache) needs no read, so a model or n-gram table read before shows 0."},
 ];
 function Hardware({m, gpuEach}) {
   const hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
@@ -547,6 +577,7 @@ function Hardware({m, gpuEach}) {
            each ? per((g) => `${sameLink ? "" : `${link(g)} `}${rate(g.pcie_rx_mb)}`)
                 : hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${rate(hw.gpu_pcie_rx_mb)}` + (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : "")],
     cpu: [hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : ""],
+    cputemp: [hw.cpu_temp == null ? null : fmt(hw.cpu_temp), "°C", hw.cpu_temp == null ? "no CPU sensor" : "the hottest sensor"],
     ram: [hw.ram_used == null ? null : gb(hw.ram_used), hw.ram_total ? `/ ${gb(hw.ram_total, 0)} GB` : "GB", eng.ram_gb ? `${fmt(+eng.ram_gb, 1)} GB pinned for experts` : ""],
     disk: hw.disk_read_mb == null ? [null, "", st.psutil ? "" : "needs psutil (setup installs it)"]
       : [big ? fmt(hw.disk_read_mb / 1024, 2) : fmt(hw.disk_read_mb, hw.disk_read_mb < 10 ? 1 : 0), big ? "GB/s" : "MB/s",

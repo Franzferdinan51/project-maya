@@ -77,6 +77,48 @@ class Engine(unittest.TestCase):
         for k, (n, got) in out.items():
             self.assertEqual(got, n, k)
 
+    def test_each_request_reads_its_own_progress(self):
+        """A request waiting for the engine behind another's prompt read gets heartbeats (None) while it waits, and the
+        server's prompt_progress for it is own_progress() at each: it carried the engine's latest PP line, the other
+        request's read (a 17K prompt showed a 600K read as its own, and its own count once that one was cancelled).
+        The long read is held open (FAKE_MULTI_GATE) until the short request's wait heartbeat came, then let end: a
+        read sized in sleeps ended before that heartbeat on a fast PC, or outlasted the short one's quiet limit (10 s,
+        it was stopped) on a slow one."""
+        import serve.server as srv
+        tmp = tempfile.mkdtemp(prefix="maya-test-gate-")
+        gate = Path(tmp) / "go"
+        os.environ["FAKE_MULTI_INTERLEAVE"] = "20"        # one prompt read at a time, 20 ids a PP line
+        os.environ["FAKE_MULTI_GATE"] = str(gate)         # each read held one piece before its end until `gate` exists
+        quiet0, srv.REQUEST_QUIET_S = srv.REQUEST_QUIET_S, 10.0   # a heartbeat after 5 s of quiet (not 10)
+        try:
+            engine = StrataEngine(script_exe(FAKE), ["2"])
+        finally:
+            del os.environ["FAKE_MULTI_GATE"]
+        try:
+            seen: dict[str, list] = {}
+
+            def one(name, n, delay):
+                time.sleep(delay)
+                got = seen.setdefault(name, [])
+                for t in engine.generate(list(range(n)), 3, {}, threading.Event()):
+                    if t is None:
+                        got.append(engine.own_progress())
+                        if name == "short" and not gate.exists():
+                            gate.touch()                  # its wait's heartbeat came: the long read may end
+
+            ths = [threading.Thread(target=one, args=("long", 34000, 0.0)),
+                   threading.Thread(target=one, args=("short", 800, 0.3))]
+            [t.start() for t in ths]
+            [t.join(60) for t in ths]
+        finally:
+            engine.close()
+            srv.REQUEST_QUIET_S = quiet0
+            del os.environ["FAKE_MULTI_INTERLEAVE"]
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertEqual({p[1] for p in seen["long"] if p}, {34000})
+        self.assertEqual({p[1] for p in seen["short"] if p}, {800})
+        self.assertIsNone(seen["short"][0])               # its wait's heartbeat: no read of its own yet
+
     def test_a_restart_does_not_hand_out_a_number_a_request_already_has(self):
         """restart() rebuilt the rid counter (from 1) and the routing table while the old engine's requests were still
         unwinding: a request that came in then took an old rid, the engine's lines for it went into THAT request's
@@ -311,6 +353,69 @@ class AWedgedRequest(unittest.TestCase):
         started = time.monotonic()
         gen.close()                                                # the client went away: STOP, then drain to DONE
         self.assertLess(time.monotonic() - started, 5.0)           # DRAIN_S, not forever
+        self.assertEqual(self.engine._routes, {})
+
+
+# --parallel, a long prompt read in one piece: no line of the request until the read ends - here never - but its STOP
+# ends it at once (DONE ... cancel), as the DeepSeek engine's read stops at its next chunk (#1057)
+QUIET_READ_ENGINE = '''\
+#!/usr/bin/env python3
+import sys, threading, time
+quit_ = threading.Event()
+
+def out(s):
+    sys.stdout.write(s + "\\n")
+    sys.stdout.flush()
+
+def reader():
+    for line in sys.stdin:
+        f = line.split()
+        if f and f[0] == "QUIT":
+            break
+        if f and f[0] == "GEN":
+            keys = dict(x.split("=", 1) for x in f[2:-1] if "=" in x)
+            out("PP %s 1 100000 1.0 1000.0" % keys.get("rid", "0"))   # the read begun; then quiet until its STOP
+        if f and f[0] == "STOP" and len(f) > 1:
+            out("DONE %s 0 100000 1.0 0.0 cancel 0 0 0" % f[1])
+    quit_.set()
+
+threading.Thread(target=reader, daemon=True).start()
+out("READY 4096 stop multi=2")
+while not quit_.wait(0.05):
+    pass
+'''
+
+
+class ACancelDuringAQuietRead(unittest.TestCase):
+    """#1057: a client gone away during a long one-piece prompt read - no line of its request comes until the read
+    ends - sends its STOP at once, not at the next 10 s wait's end; meanwhile the next request (the same conversation
+    sent again) was placed beside it and read its prompt from the shared start."""
+
+    def setUp(self):
+        import serve.server as srv
+        self.srv = srv
+        self.old = srv.REQUEST_QUIET_S
+        srv.REQUEST_QUIET_S = 0                                    # (the 10 s wait, as a server runs by default)
+        self.path = Path(tempfile.mkdtemp()) / "quiet-read-engine.py"
+        self.path.write_text(QUIET_READ_ENGINE)
+        self.path.chmod(0o755)
+        self.engine = StrataEngine(script_exe(self.path), [])
+
+    def tearDown(self):
+        self.srv.REQUEST_QUIET_S = self.old
+        self.engine.close()
+        shutil.rmtree(self.path.parent, ignore_errors=True)
+
+    def test_the_stop_goes_out_as_the_client_goes_away(self):
+        cancel = threading.Event()
+        gen = self.engine.generate(list(range(10)), 10, {}, cancel)
+        self.assertIsNone(next(gen))                               # its PP line: the read is running
+        threading.Timer(0.2, cancel.set).start()                   # the client goes away during the read
+        started = time.monotonic()
+        rest = list(gen)                                           # (the request's end: STOP, its DONE drained)
+        self.assertLess(time.monotonic() - started, 3.0)           # not the 10 s wait
+        self.assertEqual(rest, [])
+        self.assertEqual(self.engine.last.get("finish"), "cancel")  # the engine got the STOP and ended it
         self.assertEqual(self.engine._routes, {})
 
 

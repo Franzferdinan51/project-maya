@@ -1,10 +1,12 @@
 // src/hy4/hy4_lane.cpp - maya-hy4's CPU lane (hy4_lane.hpp).
 #include "hy4_lane.hpp"
 
-#include "strata/kernels/cpu/pool.hpp"
+#include "maya/kernels/cpu/pool.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <string>
+#include <vector>
 #include <fstream>
 #include <sstream>
 #if defined(_WIN32)
@@ -14,24 +16,37 @@
 #include <windows.h>
 #endif
 #if defined(__linux__)
+#include <fcntl.h>
+#include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <map>
+#include <ctime>
 #include <mutex>
 #include <thread>
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <intrin.h>   // (__cpuid: the CPU's name in the 4-bit copies' verdict key)
+#elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+#include <cpuid.h>
+#endif
+
+#include "maya/platform/commit.hpp"
+#include "maya/platform/dedicated.hpp"
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
 
 namespace hy4 {
 
-namespace iqc = strata::ds4::gguf;
+namespace iqc = maya::ds4::gguf;
 
 namespace {
 std::string read_file(const std::string& p) {
@@ -52,14 +67,28 @@ std::vector<int> cpu_list(const std::string& s) {   // "0-3,8,10-11"
     }
     return v;
 }
+#if defined(__linux__)
+// the CPUs this process may run on, read once - at the first lane, before its caller pins itself: on Linux
+// sched_getaffinity(0) reads the calling thread's own mask, and the caller's is one core after its first job (a lane
+// made after that saw that one core: every worker unpinned on it, beside the caller - and a thread the caller starts
+// inherits the mask, so a worker left unpinned takes this one instead)
+bool process_mask(cpu_set_t& out) {
+    static cpu_set_t m;
+    static const bool ok = [] {
+        CPU_ZERO(&m);
+        return sched_getaffinity(0, sizeof m, &m) == 0;
+    }();
+    out = m;
+    return ok;
+}
+#endif
 // each NUMA node's physical cores (their first logical CPU), only those this process may run on; one node of every
 // core when the host has no NUMA information
 std::vector<std::vector<int>> node_cores() {
     std::vector<std::vector<int>> nodes;
 #if defined(__linux__)
     cpu_set_t allowed;
-    CPU_ZERO(&allowed);
-    const bool mask = sched_getaffinity(0, sizeof allowed, &allowed) == 0;
+    const bool mask = process_mask(allowed);
     auto ok = [&](int c) { return c >= 0 && (!mask || (c < CPU_SETSIZE && CPU_ISSET(c, &allowed))); };
     for (int n = 0; n < 64; ++n) {
         const std::string cl = read_file("/sys/devices/system/node/node" + std::to_string(n) + "/cpulist");
@@ -78,7 +107,7 @@ std::vector<std::vector<int>> node_cores() {
     }
 #endif
     if (nodes.empty()) {
-        std::vector<int> all = strata::kernels::cpu::physical_cores(false);
+        std::vector<int> all = maya::kernels::cpu::physical_cores(false);
         nodes.push_back(all);
     }
     return nodes;
@@ -113,30 +142,97 @@ struct Lane::Impl {
     std::mutex mu;
     std::condition_variable cv;
     const std::function<void(int)>* f = nullptr;
+    int direct_n = 0;                    // >0: single-node fast path (indices 0..direct_n-1, no items[] copy)
     std::vector<int> items[kMaxNodes];   // the job's items, by node
-    std::atomic<int> next[kMaxNodes];
-    std::atomic<int> busy{0};
-    std::atomic<uint64_t> gen{0};
-    std::atomic<int> sleepers{0};
+    alignas(64) std::atomic<int> next[kMaxNodes];
+    alignas(64) std::atomic<int> done{0};
+    alignas(64) std::atomic<int> active{0};
+    alignas(64) std::atomic<bool> open{false};
+    alignas(64) std::atomic<uint64_t> gen{0};
+    alignas(64) std::atomic<int> sleepers{0};
     std::atomic<bool> quit{false};
+    // the core reserve (hy4_lane.hpp LaneReserve): the workers from `limit` on are parked - asleep on park_cv, out of
+    // the jobs - while other programs run.  Which workers take part never changes an item's work, only who does it
+    alignas(64) std::atomic<int> limit{0};
+    std::condition_variable park_cv;
+    std::atomic<int> parked{0};
+    int reserve = 0, reserve_mode = LaneReserve::kNever;
+    int reserve_log = 0;   // (1: each switch printed, 2: each sample)
+    LoadWatch watch;   // (the caller's, like the samples)
+    double s_all = 0.0, s_self = 0.0;
+    std::chrono::steady_clock::time_point s_at{};
+    static constexpr int64_t kSampleUs = 250000;   // the samples' least spacing
+
+    void set_limit(int v) {
+        std::lock_guard<std::mutex> lk(mu);   // (a parked worker checks it under the lock: no lost wake-up)
+        limit.store(v);
+        park_cv.notify_all();
+    }
+    // at a job's start (the caller): a sample once kSampleUs have passed since the last one - at the first job after
+    // a pause, and every kSampleUs while the jobs come (the system's counters move in 10 ms steps: no shorter
+    // window); the reserve switched by what the other programs used in the window
+    void watch_load(std::chrono::steady_clock::time_point t) {
+        const double w = std::chrono::duration<double, std::micro>(t - s_at).count();
+        if (w < (double) kSampleUs) return;
+        double a = 0.0, s = 0.0;
+        if (!cpu_times(a, s)) return;
+        const double others = std::max(0.0, (a - s_all) - (s - s_self)) / w;
+        const bool was = watch.on;
+        const bool flip = watch.update(others, w) != was;
+        if (flip) set_limit((int) th.size() - (watch.on ? reserve : 0));
+        if (reserve_log >= 2 || (flip && reserve_log))
+            std::fprintf(stderr, "hy4 lane: other programs %.2f CPUs over %.0f ms - %d of %d workers, %s\n", others,
+                         w / 1e3, (int) th.size() - (watch.on ? reserve : 0), (int) th.size(),
+                         watch.on ? "busy" : "idle");
+        s_all = a;
+        s_self = s;
+        s_at = t;
+    }
 
     void work(int node) {
-        for (int k = 0; k < n_nodes; ++k) {
-            const int q = (node + k) % n_nodes;
-            const std::vector<int>& v = items[q];
-            const int nn = (int) v.size();
-            for (int i; (i = next[q].fetch_add(1, std::memory_order_relaxed)) < nn;) (*f)(v[(size_t) i]);
+        int local_done = 0;
+        if (direct_n > 0) {
+            const int nn = direct_n;
+            for (int i; (i = next[0].fetch_add(1, std::memory_order_relaxed)) < nn;) {
+                (*f)(i);
+                ++local_done;
+            }
+        } else {
+            for (int k = 0; k < n_nodes; ++k) {
+                const int q = (node + k) % n_nodes;
+                const std::vector<int>& v = items[q];
+                const int nn = (int) v.size();
+                for (int i; (i = next[q].fetch_add(1, std::memory_order_relaxed)) < nn;) {
+                    (*f)(v[(size_t) i]);
+                    ++local_done;
+                }
+            }
         }
+        if (local_done > 0) done.fetch_add(local_done, std::memory_order_release);
     }
-    void loop(int core, int node) {
-        if (core >= 0) strata::kernels::cpu::pin_current_thread(core);
+    void loop(int idx, int core, int node) {
+        if (core >= 0) maya::kernels::cpu::pin_current_thread(core);
+#if defined(__linux__)
+        else {   // (a worker beyond the cores: the process's CPUs, not the mask of the thread that started it)
+            cpu_set_t all;
+            if (process_mask(all)) pthread_setaffinity_np(pthread_self(), sizeof all, &all);
+        }
+#endif
         uint64_t seen = 0;
         for (;;) {
+            if (idx >= limit.load(std::memory_order_relaxed)) {   // (in the reserve: parked until it is off)
+                std::unique_lock<std::mutex> lk(mu);
+                parked.fetch_add(1);
+                park_cv.wait(lk, [&] { return idx < limit.load() || quit.load(); });
+                parked.fetch_sub(1);
+                if (quit.load()) return;
+            }
             auto t0 = std::chrono::steady_clock::now();
             uint64_t g;
             for (int k = 0;; ++k) {   // (spin, then sleep)
                 g = gen.load(std::memory_order_acquire);
                 if (g != seen || quit.load(std::memory_order_relaxed)) break;
+                if (idx >= limit.load(std::memory_order_relaxed)) break;
                 cpu_relax();
                 if ((k & 1023) == 1023 && std::chrono::steady_clock::now() - t0 >
                                               std::chrono::microseconds(spin_us.load(std::memory_order_relaxed))) {
@@ -148,9 +244,11 @@ struct Lane::Impl {
                 }
             }
             if (quit.load()) return;
+            if (idx >= limit.load(std::memory_order_relaxed)) continue;   // (the job, if one came, is the others')
             seen = g;
-            work(node);
-            busy.fetch_sub(1, std::memory_order_acq_rel);
+            active.fetch_add(1, std::memory_order_seq_cst);
+            if (open.load(std::memory_order_seq_cst)) work(node);
+            active.fetch_sub(1, std::memory_order_release);
         }
     }
 };
@@ -181,6 +279,70 @@ LaneWaits lane_waits() {
     return lane_waits(windows, [](const char* k) -> const char* { return std::getenv(k); });
 }
 
+LaneReserve lane_reserve(int lane_cores, bool auto_size, const std::function<const char*(const char*)>& env) {
+    LaneReserve r;
+    r.cores = lane_cores >= 12 ? std::min(4, lane_cores / 8) : 0;
+    r.mode = auto_size ? LaneReserve::kMeasured : LaneReserve::kNever;   // (a lane of a size asked for: that size)
+    if (const char* e = env("HY4_LANE_RESERVE"); e && *e) {
+        if (!std::strcmp(e, "0")) r.mode = LaneReserve::kNever;
+        else if (!std::strcmp(e, "1")) r.mode = LaneReserve::kAlways;
+        else if (!std::strcmp(e, "auto")) r.mode = LaneReserve::kMeasured;
+    }
+    if (const char* e = env("HY4_LANE_RESERVE_CORES"); e && *e) r.cores = std::max(0, std::atoi(e));
+    if (const char* e = env("HY4_LANE_RESERVE_LOG")) r.log = std::max(0, std::atoi(e));
+    return r;
+}
+
+bool LoadWatch::update(double others, double window_us) {
+    if (others >= kOn) {
+        busy_us += window_us;
+        quiet_us = 0.0;
+        if (busy_us >= kBusyUs) on = true;
+    } else if (others < kOff) {
+        quiet_us += window_us;
+        busy_us = 0.0;
+        if (quiet_us >= kQuietUs) on = false;
+    } else {
+        busy_us = quiet_us = 0.0;   // (between the levels: as it is)
+    }
+    return on;
+}
+
+bool cpu_times(double& all_us, double& self_us) {
+#if defined(__linux__)
+    // /proc/stat's first line: every CPU's user, nice and system time (interrupts left out: a device's - this
+    // process's GPU and disk's - are no other program's work)
+    static const double tick_us = 1e6 / (double) std::max(1L, sysconf(_SC_CLK_TCK));
+    char b[256];
+    const int fd = ::open("/proc/stat", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    const ssize_t r = ::read(fd, b, sizeof b - 1);
+    ::close(fd);
+    if (r <= 0) return false;
+    b[r] = 0;
+    unsigned long long u = 0, ni = 0, sy = 0;
+    if (std::sscanf(b, "cpu %llu %llu %llu", &u, &ni, &sy) != 3) return false;
+    timespec ts{};
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) != 0) return false;
+    all_us = (double) (u + ni + sy) * tick_us;
+    self_us = (double) ts.tv_sec * 1e6 + (double) ts.tv_nsec / 1e3;
+    return true;
+#elif defined(_WIN32)
+    FILETIME idle, kern, user, c0, c1, pk, pu;
+    if (!GetSystemTimes(&idle, &kern, &user) || !GetProcessTimes(GetCurrentProcess(), &c0, &c1, &pk, &pu)) return false;
+    const auto us = [](const FILETIME& f) {   // (100 ns units)
+        return (double) (((uint64_t) f.dwHighDateTime << 32) | f.dwLowDateTime) / 10.0;
+    };
+    all_us = us(kern) - us(idle) + us(user);   // (the system's kernel time holds its idle time)
+    self_us = us(pk) + us(pu);
+    return true;
+#else
+    (void) all_us;
+    (void) self_us;
+    return false;
+#endif
+}
+
 Lane::Lane(int threads) : p(new Impl) {
     const std::vector<std::vector<int>> nodes = node_cores();
     p->n_nodes = std::max(1, std::min((int) nodes.size(), Impl::kMaxNodes));
@@ -196,7 +358,19 @@ Lane::Lane(int threads) : p(new Impl) {
     for (size_t i = 0; i < most; ++i)
         for (int q = 0; q < p->n_nodes; ++q)
             if (i < nodes[(size_t) q].size() && !(q == 0 && i == 0)) order.push_back({nodes[(size_t) q][i], q});
+    const bool auto_size = threads < 0;
     if (threads < 0) threads = (int) order.size();
+    // the core reserve: the last workers (the nodes' last cores) parked while other programs run - always, never or
+    // by the load measured from here on (the first sample now)
+    const LaneReserve lr = lane_reserve(threads + 1, auto_size, [](const char* k) -> const char* { return std::getenv(k); });
+    p->reserve = std::min(std::max(0, lr.cores), threads);
+    p->reserve_mode = p->reserve > 0 ? lr.mode : (int) LaneReserve::kNever;
+    p->reserve_log = lr.log;
+    if (p->reserve_mode == LaneReserve::kMeasured) {
+        p->s_at = std::chrono::steady_clock::now();
+        if (!cpu_times(p->s_all, p->s_self)) p->reserve_mode = LaneReserve::kNever;   // (not known here: idle)
+    }
+    p->limit.store(threads - (p->reserve_mode == LaneReserve::kAlways ? p->reserve : 0));
     // the caller's core: node 0's first, the one no worker takes (not pinned: the caller left where the system runs
     // it - beside a worker, on its core's second thread, when it comes back from a wait)
     if (threads > 0 && !nodes[0].empty() && lw.pin_caller) p->caller_core = nodes[0][0];
@@ -204,7 +378,7 @@ Lane::Lane(int threads) : p(new Impl) {
         const int core = i < (int) order.size() ? order[(size_t) i].first : -1;
         const int node = i < (int) order.size() ? order[(size_t) i].second : 0;
         p->wnode.push_back(node);
-        p->th.emplace_back([this, core, node] { p->loop(core, node); });
+        p->th.emplace_back([this, i, core, node] { p->loop(i, core, node); });
     }
 }
 Lane::~Lane() {
@@ -213,9 +387,13 @@ Lane::~Lane() {
         p->quit.store(true);
     }
     p->cv.notify_all();
+    p->park_cv.notify_all();
     for (auto& t : p->th) t.join();
 }
 int Lane::threads() const { return (int) p->th.size(); }
+bool Lane::idle() const {
+    return !p->th.empty() && p->sleepers.load() + p->parked.load() == (int) p->th.size();
+}
 int Lane::nodes() const { return p->n_nodes; }
 
 int Lane::node_of_page(const void* ptr) {
@@ -252,18 +430,25 @@ void Lane::parallel_for(int n, const std::function<void(int)>& f, const std::vec
         for (int i = 0; i < n; ++i) f(i);
         return;
     }
-    for (int q = 0; q < p->n_nodes; ++q) {
-        p->items[q].clear();
-        p->next[q].store(0, std::memory_order_relaxed);
-    }
-    for (int i = 0; i < n; ++i) {
-        const int q = node_of && (*node_of)[(size_t) i] >= 0 ? (*node_of)[(size_t) i] % p->n_nodes : i % p->n_nodes;
-        p->items[q].push_back(i);
+    if (p->reserve_mode == LaneReserve::kMeasured) p->watch_load(std::chrono::steady_clock::now());
+    if (p->n_nodes == 1 && !node_of) {
+        p->direct_n = n;
+        p->next[0].store(0, std::memory_order_relaxed);
+    } else {
+        p->direct_n = 0;
+        for (int q = 0; q < p->n_nodes; ++q) {
+            p->items[q].clear();
+            p->next[q].store(0, std::memory_order_relaxed);
+        }
+        for (int i = 0; i < n; ++i) {
+            const int q = node_of && (*node_of)[(size_t) i] >= 0 ? (*node_of)[(size_t) i] % p->n_nodes : i % p->n_nodes;
+            p->items[q].push_back(i);
+        }
     }
     if (p->caller_core >= 0) {   // (the thread that brings the jobs: pinned once)
         thread_local const Impl* pinned_for = nullptr;
         if (pinned_for != p.get()) {
-            strata::kernels::cpu::pin_current_thread(p->caller_core);
+            maya::kernels::cpu::pin_current_thread(p->caller_core);
             pinned_for = p.get();
         }
     }
@@ -277,14 +462,17 @@ void Lane::parallel_for(int n, const std::function<void(int)>& f, const std::vec
         }
     }
     p->f = &f;
-    p->busy.store((int) p->th.size(), std::memory_order_relaxed);
-    {
+    p->done.store(0, std::memory_order_relaxed);
+    p->open.store(true, std::memory_order_release);
+    p->gen.fetch_add(1, std::memory_order_seq_cst);
+    if (p->sleepers.load(std::memory_order_seq_cst) > 0) {
         std::lock_guard<std::mutex> lk(p->mu);   // (a sleeper checks gen under the lock: no lost wake-up)
-        p->gen.fetch_add(1, std::memory_order_release);
+        p->cv.notify_all();
     }
-    if (p->sleepers.load() > 0) p->cv.notify_all();
     p->work(p->caller_node);
-    while (p->busy.load(std::memory_order_acquire) > 0) cpu_relax();
+    while (p->done.load(std::memory_order_acquire) < n) cpu_relax();
+    p->open.store(false, std::memory_order_seq_cst);
+    while (p->active.load(std::memory_order_seq_cst) > 0) cpu_relax();
     p->f = nullptr;
     if (!p->spin_fixed) p->last_end = std::chrono::steady_clock::now();
 }
@@ -292,14 +480,35 @@ void Lane::parallel_for(int n, const std::function<void(int)>& f, const std::vec
 // ---------------------------------------------------------------- the experts
 bool CpuExperts::init(int tg, int td, int n_embd, int n_ff, std::string& err) {
     if (!iqc::iq_cpu_fmt(tg, td, n_embd, n_ff, f, err)) return false;
+    iqc::iq_cpu_row_hint(n_embd);   // (the row forms timed on this length)
     g_stride = f.gu_row * (size_t) n_ff;
     d_stride = f.d_row * (size_t) n_embd;
     return true;
 }
 
+bool CpuExperts::q4x_can() {
+    if (!iqc::iq_cpu_q4x_ok(f.tg) || !iqc::iq_cpu_q4x_ok(f.td) || f.n_embd % 256 || f.n_ff % 256) return false;
+    q4x_gu = iqc::iq_cpu_q4x_row_bytes(f.n_embd) * (size_t) f.n_ff;
+    q4x_d = iqc::iq_cpu_q4x_row_bytes(f.n_ff) * (size_t) f.n_embd;
+    return true;
+}
+
+bool CpuExperts::q4x_make(int e) {
+    if (!q4x || q4x_gu == 0 || q4x->p[(size_t) e].load(std::memory_order_acquire) != nullptr) return false;
+    std::unique_ptr<uint8_t[]> m(new (std::nothrow) uint8_t[2 * q4x_gu + q4x_d + 32]);
+    if (!m) return false;
+    uint8_t* b = (uint8_t*) (((uintptr_t) m.get() + 31) & ~(uintptr_t) 31);   // (32-byte rows)
+    iqc::iq_cpu_q4x_convert(G((size_t) e), f.gu_row, f.n_ff, f.n_embd, b);
+    iqc::iq_cpu_q4x_convert(U((size_t) e), f.gu_row, f.n_ff, f.n_embd, b + q4x_gu);
+    iqc::iq_cpu_q4x_convert(D((size_t) e), f.d_row, f.n_embd, f.n_ff, b + 2 * q4x_gu);
+    q4x->owned.push_back(std::move(m));
+    q4x->p[(size_t) e].store(b, std::memory_order_release);
+    return true;
+}
+
 namespace {
 
-constexpr int kMaxNt = 64;       // tokens one call's rows take at most (a group's: its weights read once for them)
+constexpr int kMaxNt = 64;      // tokens one call's rows take at most (a group's: its weights read once for them)
 int group_nt() {                 // (HY4_LANE_NT: a group's tokens, 1 .. kMaxNt; default 32)
     static const int v = [] {
         const char* e = std::getenv("HY4_LANE_NT");
@@ -308,29 +517,40 @@ int group_nt() {                 // (HY4_LANE_NT: a group's tokens, 1 .. kMaxNt;
     }();
     return v;
 }
-constexpr int kRowChunk = 128;   // rows a work item
+constexpr int kRowChunk = 128;   // rows a work item (64 and 32: slower on Sun's Zen 5)
 
+struct Grp {
+    int e, a, c;                    // the expert, its first entry in Scratch::order, how many
+    const uint8_t* q4 = nullptr;    // (the expert's 4-bit copy when it has one: the same bits, faster)
+};
 struct Scratch {
-    std::vector<float> h, y;   // the entries' h and down outputs
+    std::vector<Grp> groups;          // the entries by expert, a group up to kMaxNt of them
+    std::vector<float> h, y;          // the entries' h and down outputs
+    std::vector<uint8_t> xq, hq;      // the tokens' quantized activations, the entries' quantized h
+    std::vector<int> toks, order;     // the tokens that have entries; the entries by expert
+    std::vector<int> t_off, t_cur, t_ent;   // per-token entry index lists for parallel reduction
 };
 
 }  // namespace
+
+LaneCount& lane_count() {
+    static LaneCount c;
+    return c;
+}
 
 LaneProf& lane_prof() {
     static LaneProf p;
     return p;
 }
 
-// Two passes (each a parallel_for): gate / up (each item its tokens' activations quantized itself - a few
-// microseconds, saved a barrier), then down (each item its entries' h quantized itself).
 void place_experts(const CpuExperts& ex, const std::vector<int>& experts, int nodes, const std::atomic<bool>& stop) {
     if (nodes < 2) return;
     for (int e : experts) {
         if (stop.load(std::memory_order_relaxed)) return;
         const int want = e % nodes;
-        const uint8_t* g = ex.gate + (size_t) e * ex.g_stride;
-        const uint8_t* u = ex.up + (size_t) e * ex.g_stride;
-        const uint8_t* d = ex.down + (size_t) e * ex.d_stride;
+        const uint8_t* g = ex.G((size_t) e);
+        const uint8_t* u = ex.U((size_t) e);
+        const uint8_t* d = ex.D((size_t) e);
         if (Lane::node_of_page(g) == want && Lane::node_of_page(d) == want) continue;   // (there already)
         volatile uint8_t sink = 0;   // (mapped into this process first: move_pages takes mapped pages)
         for (size_t b = 0; b < ex.g_stride; b += 4096) sink ^= g[b] ^ u[b];
@@ -345,9 +565,9 @@ void warm_experts(const CpuExperts& ex, const std::vector<int>& experts, const s
     volatile uint8_t sink = 0;
     for (int e : experts) {
         if (stop.load(std::memory_order_relaxed)) return;
-        const uint8_t* g = ex.gate + (size_t) e * ex.g_stride;
-        const uint8_t* u = ex.up + (size_t) e * ex.g_stride;
-        const uint8_t* d = ex.down + (size_t) e * ex.d_stride;
+        const uint8_t* g = ex.G((size_t) e);
+        const uint8_t* u = ex.U((size_t) e);
+        const uint8_t* d = ex.D((size_t) e);
         for (size_t b = 0; b < ex.g_stride; b += 4096) sink = sink ^ g[b] ^ u[b];
         for (size_t b = 0; b < ex.d_stride; b += 4096) sink = sink ^ d[b];
     }
@@ -365,6 +585,21 @@ uint64_t ram_available() {
 #endif
 }
 
+void unpin_this_thread() {
+#if defined(__linux__)
+    cpu_set_t all;
+    if (process_mask(all)) pthread_setaffinity_np(pthread_self(), sizeof all, &all);
+#endif
+}
+
+void lower_this_thread() {
+#if defined(_WIN32)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#elif defined(__linux__)
+    (void) nice(10);   // (Linux: a thread's own nice value)
+#endif
+}
+
 uint64_t gpu_own_free(int domain, int bus, int dev) {
 #if defined(__linux__)
     char p[96];
@@ -378,6 +613,48 @@ uint64_t gpu_own_free(int domain, int bus, int dev) {
     (void) bus;
     (void) dev;
     return 0;
+#endif
+}
+
+uint64_t gpu_dedicated(const void* luid) { return maya::platform::dedicated_bytes(luid); }
+
+uint64_t commit_available() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX s{};
+    s.dwLength = sizeof(s);
+    return GlobalMemoryStatusEx(&s)
+               ? (uint64_t) s.ullAvailPageFile + maya::platform::commit_growth((uint64_t) s.ullTotalPhys)
+               : 0;
+#else
+    return 0;
+#endif
+}
+
+void* ram_alloc(size_t bytes) {
+    if (bytes == 0) return nullptr;
+#if defined(_WIN32)
+    return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#elif defined(__linux__)
+    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return nullptr;
+#if defined(MADV_HUGEPAGE)
+    madvise(p, bytes, MADV_HUGEPAGE);
+#endif
+    return p;
+#else
+    return std::calloc(1, bytes);
+#endif
+}
+void ram_free(void* p, size_t bytes) {
+    if (p == nullptr) return;
+#if defined(_WIN32)
+    (void) bytes;
+    VirtualFree(p, 0, MEM_RELEASE);
+#elif defined(__linux__)
+    munmap(p, bytes);
+#else
+    (void) bytes;
+    std::free(p);
 #endif
 }
 
@@ -404,67 +681,146 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
         return lp.on ? std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count() : 0.0;
     };
     const double tp0 = clk();
+    LaneCount& lcm = lane_count();
+    const int qmode = lcm.q4x_mode.load(std::memory_order_relaxed);
+    const bool trial = qmode == 2 && T == 1;
+    const bool use_q4 = qmode == 1 || (trial && (++lcm.trial_tick & 1));
+    const auto tt0 = trial ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     thread_local Scratch tls;
     Scratch& sc = tls;   // (the caller's: the workers use it through this reference, never their own thread_local)
     sc.h.resize((size_t) n * F);
     sc.y.resize((size_t) n * E);
-    // the entries grouped by expert, a group up to kMaxNt of them (an expert's rows read once for its tokens)
-    std::map<int, std::vector<int>> by;
-    for (int i = 0; i < n; ++i) by[entries[(size_t) i].e].push_back(i);
-    std::vector<std::pair<int, std::vector<int>>> groups;
-    const size_t gn = (size_t) group_nt();
-    for (auto& [e, v] : by)
-        for (size_t a = 0; a < v.size(); a += gn)
-            groups.push_back({e, std::vector<int>(v.begin() + (long) a, v.begin() + (long) std::min(v.size(), a + gn))});
+    // each token's activations quantized once - the same bytes for all of its experts (each work item quantized its
+    // own tokens' before: a decode's 16 experts did a token 12 times over, a row chunk each) - few tokens on the
+    // caller, more over the lane
+    sc.xq.resize((size_t) T * f.act_bytes);
+    sc.toks.clear();
+    {
+        thread_local std::vector<char> seen;
+        seen.assign((size_t) T, 0);
+        for (const CpuEntry& c : entries)
+            if (!seen[(size_t) c.t]) {
+                seen[(size_t) c.t] = 1;
+                sc.toks.push_back(c.t);
+            }
+    }
+    const auto qx = [&](int i) {
+        const int t = sc.toks[(size_t) i];
+        iqc::iq_cpu_quant(f.gu_act, x + (size_t) t * E, E, sc.xq.data() + (size_t) t * f.act_bytes);
+    };
+    const int nq = (int) sc.toks.size();
+    if (nq <= 2)
+        for (int i = 0; i < nq; ++i) qx(i);
+    else
+        lane.parallel_for(nq, qx);
+    // the entries grouped by expert (ascending; in each, the entries' order), a group up to kMaxNt of them: an
+    // expert's rows read once for its tokens
+    std::vector<Grp>& groups = sc.groups;   // (the caller's, as sc: a worker's own thread_local would be another)
+    groups.clear();
+    sc.order.resize((size_t) n);
+    for (int i = 0; i < n; ++i) sc.order[(size_t) i] = i;
+    std::stable_sort(sc.order.begin(), sc.order.end(),
+                     [&](int i, int j) { return entries[(size_t) i].e < entries[(size_t) j].e; });
+    const int gn = group_nt();
+    for (int i = 0; i < n;) {
+        const int e = entries[(size_t) sc.order[(size_t) i]].e;
+        int j = i;
+        while (j < n && entries[(size_t) sc.order[(size_t) j]].e == e) ++j;
+        const uint8_t* q4 = ex.q4x && use_q4 ? ex.q4x->p[(size_t) e].load(std::memory_order_acquire) : nullptr;
+        for (int a = i; a < j; a += gn) groups.push_back({e, a, std::min(gn, j - a), q4});
+        i = j;
+    }
     const int gu_chunks = (F + kRowChunk - 1) / kRowChunk, dn_chunks = (E + kRowChunk - 1) / kRowChunk;
     // each group's expert's NUMA node - e % nodes, where place_experts puts its pages - the work items routed by it
     std::vector<int> gu_node, dn_node;
     if (lane.nodes() > 1)
-        for (const auto& [e, ids] : groups) {
-            const int q = e % lane.nodes();
+        for (const Grp& gr : groups) {
+            const int q = gr.e % lane.nodes();
             for (int c = 0; c < gu_chunks; ++c) gu_node.push_back(q);
             for (int c = 0; c < dn_chunks; ++c) dn_node.push_back(q);
         }
     const double tp1 = clk();
     lane.parallel_for((int) groups.size() * gu_chunks, [&](int it) {
-        const auto& [e, ids] = groups[(size_t) (it / gu_chunks)];
+        const Grp& gr = groups[(size_t) (it / gu_chunks)];
         const int r0 = (it % gu_chunks) * kRowChunk, r1 = std::min(F, r0 + kRowChunk);
-        thread_local std::vector<uint8_t> abuf;
-        abuf.resize((size_t) kMaxNt * f.act_bytes);
         const void* act[kMaxNt];
         float* ff[kMaxNt];
-        for (size_t k = 0; k < ids.size(); ++k) {
-            uint8_t* a = abuf.data() + k * f.act_bytes;
-            iqc::iq_cpu_quant(f.gu_act, x + (size_t) entries[(size_t) ids[k]].t * E, E, a);
-            act[k] = a;
-            ff[k] = sc.h.data() + (size_t) ids[k] * F;
+        for (int k = 0; k < gr.c; ++k) {
+            const int id = sc.order[(size_t) (gr.a + k)];
+            act[k] = sc.xq.data() + (size_t) entries[(size_t) id].t * f.act_bytes;
+            ff[k] = sc.h.data() + (size_t) id * F;
         }
-        iqc::iq_cpu_gate_up(f, ex.gate + (size_t) e * ex.g_stride, ex.up + (size_t) e * ex.g_stride, act,
-                            (int) ids.size(), ff, r0, r1, ex.limit);
+        if (gr.q4)
+            iqc::iq_cpu_q4x_gate_up(f, gr.q4, gr.q4 + ex.q4x_gu, act, gr.c, ff, r0, r1, ex.limit);
+        else
+            iqc::iq_cpu_gate_up(f, ex.G((size_t) gr.e), ex.U((size_t) gr.e), act,
+                                gr.c, ff, r0, r1, ex.limit);
     }, gu_node.empty() ? nullptr : &gu_node);
+    // each entry's h quantized once (each down item quantized its entries' h before: 12 times over in a decode)
+    sc.hq.resize((size_t) n * f.h_bytes);
+    const auto qh = [&](int i) {
+        iqc::iq_cpu_quant(f.d_act, sc.h.data() + (size_t) i * F, F, sc.hq.data() + (size_t) i * f.h_bytes);
+    };
+    if (n <= 2)
+        for (int i = 0; i < n; ++i) qh(i);
+    else
+        lane.parallel_for(n, qh);
     const double tp2 = clk();
     lane.parallel_for((int) groups.size() * dn_chunks, [&](int it) {
-        const auto& [e, ids] = groups[(size_t) (it / dn_chunks)];
+        const Grp& gr = groups[(size_t) (it / dn_chunks)];
         const int r0 = (it % dn_chunks) * kRowChunk, r1 = std::min(E, r0 + kRowChunk);
-        thread_local std::vector<uint8_t> hbuf;
-        hbuf.resize((size_t) kMaxNt * f.h_bytes);
         const void* hq[kMaxNt];
         float* y[kMaxNt];
-        for (size_t k = 0; k < ids.size(); ++k) {
-            uint8_t* h = hbuf.data() + k * f.h_bytes;
-            iqc::iq_cpu_quant(f.d_act, sc.h.data() + (size_t) ids[k] * F, F, h);
-            hq[k] = h;
-            y[k] = sc.y.data() + (size_t) ids[k] * E;
+        for (int k = 0; k < gr.c; ++k) {
+            const int id = sc.order[(size_t) (gr.a + k)];
+            hq[k] = sc.hq.data() + (size_t) id * f.h_bytes;
+            y[k] = sc.y.data() + (size_t) id * E;
         }
-        iqc::iq_cpu_down(f, ex.down + (size_t) e * ex.d_stride, hq, (int) ids.size(), y, r0, r1);
+        if (gr.q4)
+            iqc::iq_cpu_q4x_down(f, gr.q4 + 2 * ex.q4x_gu, hq, gr.c, y, r0, r1);
+        else
+            iqc::iq_cpu_down(f, ex.D((size_t) gr.e), hq, gr.c, y, r0, r1);
     }, dn_node.empty() ? nullptr : &dn_node);
     const double tp3 = clk();
-    // each token's weighted sum, in its entries' order
-    for (int i = 0; i < n; ++i) {
-        const CpuEntry& e = entries[(size_t) i];
-        float* o = out + (size_t) e.t * E;
-        const float* y = sc.y.data() + (size_t) i * E;
-        for (int d = 0; d < E; ++d) o[d] += e.w * y[d];
+    // each token's weighted sum, in its entries' order (parallel across tokens when several tokens are present)
+    if (nq >= 4) {
+        sc.t_off.assign((size_t) T + 1, 0);
+        for (int i = 0; i < n; ++i) ++sc.t_off[(size_t) entries[(size_t) i].t + 1];
+        for (int t = 0; t < T; ++t) sc.t_off[(size_t) t + 1] += sc.t_off[(size_t) t];
+        sc.t_cur.assign(sc.t_off.begin(), sc.t_off.begin() + T);
+        sc.t_ent.resize((size_t) n);
+        for (int i = 0; i < n; ++i) sc.t_ent[(size_t) sc.t_cur[(size_t) entries[(size_t) i].t]++] = i;
+        lane.parallel_for(nq, [&](int ti) {
+            const int t = sc.toks[(size_t) ti];
+            float* o = out + (size_t) t * E;
+            for (int p = sc.t_off[(size_t) t]; p < sc.t_off[(size_t) t + 1]; ++p) {
+                const int i = sc.t_ent[(size_t) p];
+                const float w = entries[(size_t) i].w;
+                const float* y = sc.y.data() + (size_t) i * E;
+                for (int d = 0; d < E; ++d) o[d] += w * y[d];
+            }
+        });
+    } else {
+        for (int i = 0; i < n; ++i) {
+            const CpuEntry& e = entries[(size_t) i];
+            float* o = out + (size_t) e.t * E;
+            const float* y = sc.y.data() + (size_t) i * E;
+            for (int d = 0; d < E; ++d) o[d] += e.w * y[d];
+        }
+    }
+    {
+        long long nq = 0;
+        for (const Grp& gr : groups)
+            if (gr.q4) nq += gr.c;
+        LaneCount& lc = lane_count();
+        lc.entries.fetch_add(n, std::memory_order_relaxed);
+        if (nq) lc.q4x.fetch_add(nq, std::memory_order_relaxed);
+        if (trial) {
+            const int k = use_q4 ? 1 : 0;
+            lc.trial_s[k] += std::chrono::duration<double>(std::chrono::steady_clock::now() - tt0).count();
+            lc.trial_entries[k] += n;
+            ++lc.trial_calls[k];
+        }
     }
     if (lp.on) {
         lp.prep_s += tp1 - tp0;
@@ -474,6 +830,175 @@ void cpu_experts(Lane& lane, const CpuExperts& ex, const std::vector<CpuEntry>& 
         ++lp.calls;
         lp.entries += n;
     }
+}
+
+bool q4x_probe(Lane& lane, const CpuExperts& ex0, int n_expert, double& ms_file, double& ms_q4x) {
+    ms_file = ms_q4x = 0.0;
+    CpuExperts ex = ex0;   // (the same file rows; copies of its own)
+    if (!ex.q4x_can() || n_expert < 16) return false;
+    // up to 64 experts spread over the layer (the file's rows read once first: the page cache timed, not the disk)
+    const int n_exp = std::min(64, n_expert);
+    std::vector<int> pick((size_t) n_exp);
+    for (int i = 0; i < n_exp; ++i) pick[(size_t) i] = (int) ((int64_t) i * n_expert / n_exp);
+    ex.q4x = std::make_shared<Q4xSet>(n_expert);
+    volatile uint8_t sink = 0;
+    for (int e : pick) {
+        for (size_t b = 0; b < ex.g_stride; b += 4096) sink = sink ^ ex.G((size_t) e)[b] ^ ex.U((size_t) e)[b];
+        for (size_t b = 0; b < ex.d_stride; b += 4096) sink = sink ^ ex.D((size_t) e)[b];
+        if (!ex.q4x_make(e)) return false;
+    }
+    const int E = ex.f.n_embd;
+    std::vector<float> x((size_t) E), out((size_t) E);
+    uint32_t s = 2463534242u;
+    auto rnd = [&s] {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        return s;
+    };
+    for (float& v : x) v = ((float) (rnd() % 2001) - 1000.0f) * 1e-3f;
+    std::vector<CpuEntry> ent;
+    double best[2] = {1e30, 1e30};
+    const std::shared_ptr<Q4xSet> set = ex.q4x;
+    for (int r = 0; r < 24; ++r) {
+        if (r % 2 == 0) {   // (the same 16 experts for both forms)
+            std::vector<int> p = pick;
+            for (int i = 0; i < 16 && i < n_exp; ++i) std::swap(p[(size_t) i], p[(size_t) (i + rnd() % (uint32_t) (n_exp - i))]);
+            ent.clear();
+            for (int i = 0; i < 16 && i < n_exp; ++i) ent.push_back({0, p[(size_t) i], 0.25f});
+        }
+        const int form = r % 2;
+        ex.q4x = form ? set : nullptr;
+        const auto t0 = std::chrono::steady_clock::now();
+        cpu_experts(lane, ex, ent, x.data(), 1, out.data());
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (r >= 4) best[form] = std::min(best[form], ms);
+    }
+    ms_file = best[0];
+    ms_q4x = best[1];
+    return true;
+}
+
+// ------------------------------------------------------------------------------------- the 4-bit copies' verdict
+#ifndef HY4_LANE_KERNELS
+#define HY4_LANE_KERNELS unknown
+#endif
+#define HY4_STR2(x) #x
+#define HY4_STR(x) HY4_STR2(x)
+const char* lane_kernels_id() { return HY4_STR(HY4_LANE_KERNELS); }
+
+namespace {
+
+// the CPU's own name (x86: its brand string; else Linux's cpuinfo), tabs and line ends out
+std::string cpu_brand() {
+    std::string s;
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    int r[4] = {0, 0, 0, 0};
+    __cpuid(r, (int) 0x80000000);
+    if ((unsigned) r[0] >= 0x80000004u)
+        for (int leaf = 0; leaf < 3; ++leaf) {
+            __cpuid(r, (int) (0x80000002u + leaf));
+            s.append((const char*) r, 16);
+        }
+#elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+    unsigned w[4] = {0, 0, 0, 0};
+    if (__get_cpuid(0x80000000u, &w[0], &w[1], &w[2], &w[3]) && w[0] >= 0x80000004u)
+        for (unsigned leaf = 0x80000002u; leaf <= 0x80000004u; ++leaf)
+            if (__get_cpuid(leaf, &w[0], &w[1], &w[2], &w[3])) s.append((const char*) w, 16);
+#endif
+#if defined(__linux__)
+    if (s.find_first_not_of(std::string(" \0", 2)) == std::string::npos) {
+        const std::string info = read_file("/proc/cpuinfo");
+        for (const char* k : {"model name", "Hardware", "CPU part"}) {
+            const size_t at = info.find(k);
+            if (at == std::string::npos) continue;
+            const size_t colon = info.find(':', at), end = info.find('\n', at);
+            if (colon != std::string::npos && colon < end) s = info.substr(colon + 1, end - colon - 1);
+            break;
+        }
+    }
+#endif
+    std::string out;
+    for (char ch : s) {
+        if (ch == '\0') break;
+        out += (ch == '\t' || ch == '\n' || ch == '\r') ? ' ' : ch;
+    }
+    const size_t b0 = out.find_first_not_of(' '), b1 = out.find_last_not_of(' ');
+    return b0 == std::string::npos ? std::string("cpu") : out.substr(b0, b1 - b0 + 1);
+}
+
+std::vector<std::string> split_tabs(const std::string& line) {
+    std::vector<std::string> f;
+    size_t a = 0;
+    for (size_t t; (t = line.find('\t', a)) != std::string::npos; a = t + 1) f.push_back(line.substr(a, t - a));
+    f.push_back(line.substr(a));
+    return f;
+}
+
+}  // namespace
+
+std::string q4x_memo_key(const std::string& model, int lane_threads) {
+    char buf[160];
+    std::snprintf(buf, sizeof buf, "|threads %u|RAM %.0f GB|lane %d threads|", std::thread::hardware_concurrency(),
+                  (double) ram_total() / 1e9, lane_threads);
+    std::string k = cpu_brand() + buf + model + "|lane kernels " + lane_kernels_id();
+    for (char& ch : k)
+        if (ch == '\t' || ch == '\n' || ch == '\r') ch = ' ';
+    return k;
+}
+
+Q4xMemo q4x_memo_get(const std::string& path, const std::string& key) {
+    Q4xMemo m;
+    std::ifstream f(path);
+    for (std::string line; f && std::getline(f, line);) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        const std::vector<std::string> v = split_tabs(line);   // key, kept|dropped, us with, us without, date
+        if (v.size() < 5 || v[0] != key || (v[1] != "kept" && v[1] != "dropped")) continue;
+        m.found = true;
+        m.kept = v[1] == "kept";
+        m.us_with = std::atof(v[2].c_str());
+        m.us_without = std::atof(v[3].c_str());
+        m.date = v[4];
+    }
+    return m;
+}
+
+bool q4x_memo_put(const std::string& path, const std::string& key, Q4xMemo m) {
+    if (path.empty()) return false;
+    std::vector<std::string> keep;
+    {
+        std::ifstream f(path);
+        for (std::string line; f && std::getline(f, line);) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty() || line[0] == '#' || split_tabs(line)[0] == key) continue;
+            keep.push_back(line);
+        }
+    }
+    const std::time_t now = std::time(nullptr);
+    char day[16] = "?";
+    std::tm tmv{};
+#if defined(_WIN32)
+    if (localtime_s(&tmv, &now) == 0) std::strftime(day, sizeof day, "%Y-%m-%d", &tmv);
+#else
+    if (localtime_r(&now, &tmv)) std::strftime(day, sizeof day, "%Y-%m-%d", &tmv);
+#endif
+    m.date = day;
+    char nums[64];
+    std::snprintf(nums, sizeof nums, "%.1f\t%.1f\t", m.us_with, m.us_without);
+    keep.push_back(key + "\t" + (m.kept ? "kept" : "dropped") + "\t" + nums + m.date);
+    const std::string tmp = path + ".new";
+    {
+        std::ofstream o(tmp, std::ios::trunc);
+        if (!o) return false;
+        o << "# maya-hy4: the CPU lane's 4-bit expert copies, measured on this PC - a line a PC, model and lane kernels\n"
+             "# (key, kept / dropped, an expert run's us with them and without, date); delete a line, or run\n"
+             "# maya --speed-calibration, to measure again\n";
+        for (const std::string& l : keep) o << l << "\n";
+        if (!o.flush()) return false;
+    }
+    std::remove(path.c_str());   // (Windows: rename does not replace)
+    return std::rename(tmp.c_str(), path.c_str()) == 0;
 }
 
 }  // namespace hy4

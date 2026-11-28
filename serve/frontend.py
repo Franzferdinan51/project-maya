@@ -32,6 +32,11 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 from serve.response_schema import json_instruction, with_system_note
 from serve.glm_dsa_template import effort_dialect
 
+# What the chat template refuses a request with (its `raise_exception` global, ChatTemplate below).  jinja2's exception
+# is no ValueError, so an uncaught one escapes the server's except clauses and the connection is dropped with no answer:
+# the handler catches it and answers a 400 with its message.
+TemplateError = jinja2.exceptions.TemplateError
+
 
 # ------------------------------------------------------------------------------------------------ template
 class ChatTemplate:
@@ -48,6 +53,10 @@ class ChatTemplate:
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
+        # (transformers' {% generation %} marks the span a reply is generated into and emits its body unchanged;
+        #  plain Jinja has no such tag.  Inkling 2's template as the Strata packs ship it wraps each assistant turn
+        #  in one, so the markers come out before the compile - the turn's own {{- -}} carry its whitespace)
+        self.source = re.sub(r"\{%-?\s*(?:end)?generation\s*-?%\}", "", self.source)
         self.template = env.from_string(self.source)
         # GLM-5.x: the template knows reasoning_effort "low" and "high" only - anything else, an absent one included,
         # is "Max", its most verbose - and it always opens <think> (no enable_thinking).  The server's levels are
@@ -87,20 +96,28 @@ class ChatTemplate:
         hytk = re.search(r"set\s+HYTK\s*=\s*'([^']*)'", self.source)
         self.hy4 = bool(hytk) and "reasoning_mode" in self.source and "hy_start" in self.source
         self.hy4_tag = hytk.group(1) if hytk else ""
+        # Inkling 2 (thinkingmachines' own template, tools/ik2/chat_template.jinja): typed segments in place of tags -
+        # <|content_thinking|>, <|content_text|>, a tool call <|message_model|>NAME<|content_invoke_tool_json|>{"name",
+        # "args"}<|end_message|> - which InklingRewriter turns into what OutputParser reads; reasoning_effort by name
+        # (none .. max, its effort_map) or a number; tool call arguments must be objects
+        self.inkling = "<|content_invoke_tool_json|>" in self.source and "effort_map" in self.source
+        self.ling = "<|role_end|>" in self.source and "detailed thinking on" in self.source
+        if self.ling:   # (Ling's sets enable_thinking = true only as its default when none is given: not CYBER-FROST's)
+            self.forced_thinking = False
 
     def effort_shown(self, value) -> str | None:
-        """Hy4-flash: a thinking level as given (a config's, a client's) -> the level this model really runs it at, in
-        the server's words: "none", or "high" for every other level (render's rule) - what /health and the start's
-        line report.  None for another model's template, or a value that is no level."""
-        level = effort_level(value) if self.hy4 else None
+        """Hy4-flash / Ling-3.2-air: a thinking level as given (a config's, a client's) -> the level this model really
+        runs it at, in the server's words: "none", or "high" for every other level (render's rule) - what /health and
+        the start's line report.  None for another model's template, or a value that is no level."""
+        level = effort_level(value) if (self.hy4 or self.ling) else None
         if level is None:
             return None
         return "none" if level == "none" else "high"
 
     def thinking_levels(self) -> list | None:
-        """Hy4-flash: the two levels it is made for, in the server's words (none / high) - /health's
+        """Hy4-flash / Ling-3.2-air: the two levels they are made for, in the server's words (none / high) - /health's
         "thinking_levels".  None for every other model."""
-        return ["none", "high"] if self.hy4 else None
+        return ["none", "high"] if (self.hy4 or self.ling) else None
 
     def opens_thinking(self, prompt: str) -> bool:
         """Whether a rendered prompt ends in an open thinking block (Hy4-flash: its suffixed <think:..>)."""
@@ -159,6 +176,30 @@ class ChatTemplate:
             elif level in EFFORT_NAMES:
                 kwargs["reasoning_effort"] = level
             # (its template reads tool.function: the server's flat tools go back into OpenAI's form)
+            tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
+            return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
+                                        **kwargs)
+        if self.inkling:
+            # thinking off is effort "none" (the template's 0); a level it knows by name goes as it is; none named:
+            # the template's default (0.9, its "high")
+            off = kwargs.pop("enable_thinking", None) is False
+            level = kwargs.pop("reasoning_effort", None)
+            level = name or level
+            kwargs.pop("thinking_mode", None)
+            if level == "minimal":   # (its template's own 0.1, not off: effort_kwargs reads it off for the others)
+                kwargs["reasoning_effort"] = level
+            elif off:
+                kwargs["reasoning_effort"] = "none"
+            elif level in INKLING_EFFORT:
+                kwargs["reasoning_effort"] = level
+            return self.template.render(messages=inkling_messages(messages), tools=tools,
+                                        add_generation_prompt=add_generation_prompt, **kwargs)
+        if self.ling:
+            off = kwargs.pop("enable_thinking", None) is False
+            level = kwargs.pop("reasoning_effort", None)
+            level = name or level
+            kwargs.pop("thinking_mode", None)
+            kwargs["enable_thinking"] = not (off or level in ("none", "no_think", "off", "minimal"))
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
             return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                         **kwargs)
@@ -276,7 +317,8 @@ def effort_kwargs(value) -> dict:
         raise ValueError(f"unknown reasoning effort {value!r}: use {EFFORT_WORDS}")
     level = EFFORT[key]
     if level is None:
-        return {"enable_thinking": False}
+        # (Inkling 2's template has a "minimal" of its own, 0.1: the name rides along for it, the rest read off)
+        return {"enable_thinking": False, "effort_name": "minimal"} if key == "minimal" else {"enable_thinking": False}
     name = effort_name(value)
     return {"reasoning_effort": level} if name == level else {"reasoning_effort": level, "effort_name": name}
 
@@ -662,10 +704,43 @@ def _clear_thinking(req: dict) -> dict:
     return {}
 
 
+_JSON_KINDS = {str: "a string", bool: "a boolean", int: "a number", float: "a number", list: "a list",
+               type(None): "null"}
+
+
+def check_messages(req: dict, key: str = "messages", nonempty: bool = False) -> None:
+    """A request's list of messages (`messages`; the Responses API's `input`, which may also be one string) has the
+    right shape: a list of objects, and with `nonempty` at least one of them.  Else a ValueError with plain words -
+    the server answers 400 with them, where reading the list would stop at the first item with an AttributeError.
+
+    `nonempty` is for the routes that always answer with a completion (OpenAI's Chat Completions, Anthropic's
+    messages): an absent or empty list reaches the chat template, which refuses it with a
+    TemplateError ('No messages provided.') that no except clause covered, so the connection simply closed - a client
+    probing the route (M3 Code asks every protocol path `POST {}` and reads only the status code) took the missing
+    400 for "this server does not serve Chat Completions".  /api/chat leaves it off: there an empty list is Maya's model
+    API's preload/unload, a call of its own that answers 200."""
+    msgs = req.get(key)
+    if key == "input" and isinstance(msgs, str):
+        return
+    if msgs is None:
+        if nonempty:
+            raise ValueError(f"`{key}` must be a nonempty array of messages")
+        return
+    if not isinstance(msgs, list):
+        raise ValueError(f"`{key}` must be a list of messages, not {_JSON_KINDS.get(type(msgs), 'an object')}")
+    if nonempty and not msgs:
+        raise ValueError(f"`{key}` must be a nonempty array of messages")
+    for i, m in enumerate(msgs):
+        if not isinstance(m, dict):
+            raise ValueError(f"`{key}[{i}]` must be an object (a message with its role and content), not "
+                             f"{_JSON_KINDS.get(type(m), 'that')}")
+
+
 def openai_to_messages(req: dict, deepseek: bool = False,
                        glm_dsa: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs).  glm_dsa (GLM-5.3's template,
     ChatTemplate.glm_dsa): the tool call ids and clear_thinking go to the template too."""
+    check_messages(req)
     if deepseek:
         from serve.ds41_encoding import _tool_name_for_encoding, tools_from_openai_format
         messages = copy.deepcopy(req.get("messages", []))
@@ -771,6 +846,7 @@ def openai_to_messages(req: dict, deepseek: bool = False,
 def anthropic_to_messages(req: dict, deepseek: bool = False,
                           glm_dsa: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs).  glm_dsa: as openai_to_messages."""
+    check_messages(req)
     messages = []
     system = req.get("system")
     if system:
@@ -1305,13 +1381,277 @@ class MinimaxRewriter:
         return {n: v for n, v in items}
 
 
+INKLING_EFFORT = ("none", "minimal", "low", "medium", "high", "xhigh", "max")   # (its template's effort_map)
+
+
+def inkling_messages(messages: list[dict]) -> list[dict]:
+    """The messages as Inkling 2's template takes them: a tool call's arguments an object (it refuses a JSON string),
+    no None content, a developer message a system one, reasoning as reasoning_content."""
+    out = []
+    for m in messages:
+        m = dict(m)
+        if m.get("content") is None:
+            m["content"] = ""
+        if m.get("role") == "developer":
+            m["role"] = "system"
+        if m.get("reasoning") and not m.get("reasoning_content"):
+            m["reasoning_content"] = m["reasoning"]
+        if m.get("tool_calls"):
+            calls = []
+            for tc in m["tool_calls"]:
+                tc = copy.deepcopy(tc)
+                fn = tc.setdefault("function", {})
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        fn["arguments"] = json.loads(args) if args.strip() else {}
+                    except ValueError:
+                        fn["arguments"] = {"_raw": args}
+                elif args is None:
+                    fn["arguments"] = {}
+                calls.append(tc)
+            m["tool_calls"] = calls
+        out.append(m)
+    return out
+
+
+INK_THINK, INK_TEXT, INK_CALL = "<|content_thinking|>", "<|content_text|>", "<|content_invoke_tool_json|>"
+INK_MODEL, INK_END, INK_EOS = "<|message_model|>", "<|end_message|>", "<|content_model_end_sampling|>"
+INK_OTHER_TEXT = ("<|content_tool_error|>", "<|content_invoke_tool_text|>")
+
+
+class InklingRewriter:
+    """Inkling 2's output rewritten, as it streams, into what OutputParser reads (DeepSeek's and MiniMax's path: GLM's
+    tool-call form with JSON values).  The model writes typed segments: <|content_thinking|> opens reasoning
+    (THINK_AGAIN), <|content_text|> (and the tool-error / text-invoke kinds) opens answer text (</think> while
+    reasoning is open), and a tool call is <|message_model|>NAME<|content_invoke_tool_json|>{"name": .., "args": {..}}
+    <|end_message|>, which goes out as <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>..</tool_call> with V
+    JSON.  The call streams as it is written (_stream): <tool_call>NAME once the name and the opening of "args" are
+    there, then each argument - a string value piece by piece (OutputParser's "jstr" path sends those pieces on as the
+    call's tool_args), any other value once it is whole - so a client sees a long file being written instead of a
+    reasoning that seems to have stalled for minutes.  A body of any other shape goes out whole at its end, as before.
+    What stands between segments (the tool's name after <|message_model|>, <|end_message|>) is dropped.  A mark split
+    across deltas is held until it is whole."""
+
+    MARKS = (INK_THINK, INK_TEXT, INK_CALL, INK_MODEL, INK_END, INK_EOS) + INK_OTHER_TEXT
+
+    def __init__(self, thinking: bool = True):
+        self.buf = ""
+        self.mode = "lead"           # lead (before any segment) | think | text | name | call | between
+        self.open = thinking         # the parser is in its reasoning state (it starts there when thinking)
+        self.name = ""
+        self.body = ""
+        self.streamed_calls = 0      # calls that went out as they were written (_stream)
+        self._reset_stream()
+
+    def _reset_stream(self):
+        self.sp = 0                  # how much of self.body the streaming scan has consumed
+        self.st = "head"             # head -> akey -> acolon -> aval -> astr -> ... -> after | off (whole at its end) | broken
+        self.streamed = False        # <tool_call>NAME has gone out: the call is being streamed
+        self.akey = ""               # the argument whose value comes next
+        self.esc = False             # (astr) the last character was a backslash
+
+    def feed(self, text: str) -> str:
+        self.buf += text
+        out = []
+        while self.buf:
+            hits = [(i, m) for m in self.MARKS for i in (self.buf.find(m),) if i >= 0]
+            if not hits:
+                keep = max((n for m in self.MARKS for n in range(1, len(m)) if self.buf.endswith(m[:n])), default=0)
+                out.append(self._text(self.buf[:len(self.buf) - keep]))
+                self.buf = self.buf[len(self.buf) - keep:]
+                break
+            i, m = min(hits)
+            if i:
+                out.append(self._text(self.buf[:i]))
+            self.buf = self.buf[i + len(m):]
+            out.append(self._mark(m))
+        return "".join(out)
+
+    def _text(self, s: str) -> str:
+        if self.mode == "name":
+            self.name += s
+            return ""
+        if self.mode == "call":
+            self.body += s
+            return self._stream()
+        if self.mode == "lead":      # (no segment opened: a model that answers plainly)
+            self.mode = "text" if s.strip() else "lead"
+            return (self._close() + s) if self.mode == "text" else ""
+        return s if self.mode in ("think", "text") else ""
+
+    def _close(self) -> str:
+        if self.open:
+            self.open = False
+            return "</think>"
+        return ""
+
+    def _mark(self, m: str) -> str:
+        if m == INK_THINK:
+            self.mode = "think"
+            if self.open:
+                return ""
+            self.open = True
+            return THINK_AGAIN
+        if m == INK_TEXT or m in INK_OTHER_TEXT:
+            self.mode = "text"
+            return self._close()
+        if m == INK_MODEL:
+            self.mode, self.name = "name", ""
+            return ""
+        if m == INK_CALL:
+            self.mode, self.body = "call", ""
+            self._reset_stream()
+            return ""
+        out = self._end_call(final=False) if self.mode == "call" else ""
+        self.mode = "between"          # <|end_message|> / the end of sampling: the segment is over
+        return out
+
+    def finish(self) -> str:
+        """The end of the answer: a mark's partial text held back is text; a call still open goes out as far as it is
+        whole (an unfinished one as its text - or, already streaming, left open for OutputParser.finish, which ends a
+        call that was announced the way it ends any model's)."""
+        rest, self.buf = self.buf, ""
+        out = self._text(rest)
+        if self.mode == "call":
+            out += self._end_call(final=True)
+            self.mode = "between"
+        return out
+
+    # The streaming scan of a call body (see the class docstring).  It starts on the usual shape only - the name first,
+    # then , "args": and its opening brace; on anything else the body waits for its end and _call reads it whole.
+    _HEAD = re.compile(r'\s*\{\s*"name"\s*:\s*"((?:[^"\\]|\\.)*)"')
+    _ARGS_OPEN = re.compile(r'\s*,\s*"args"\s*:\s*\{')
+    _STR = re.compile(r'"(?:[^"\\]|\\.)*"')
+    _WS = " \t\r\n"
+
+    def _stream(self) -> str:
+        b, out = self.body, []
+        dec = json.JSONDecoder()
+        while True:
+            if self.st == "head":
+                m = self._HEAD.match(b)
+                if m is None:
+                    if len(b) > 256 or (b.lstrip() and not b.lstrip().startswith("{")):
+                        self.st = "off"          # not the usual head: the whole body at its end
+                    return ""
+                a = self._ARGS_OPEN.match(b, m.end())
+                if a is None:
+                    if len(b) - m.end() > 32:    # (', "args": {' is far shorter: another shape)
+                        self.st = "off"
+                    return ""
+                name = json.loads('"' + m.group(1) + '"') or self.name.strip()
+                if not name:
+                    self.st = "off"
+                    return ""
+                out.append(self._close() + CALL_START + name)
+                self.streamed, self.sp, self.st = True, a.end(), "akey"
+                self.streamed_calls += 1
+            elif self.st == "akey":
+                while self.sp < len(b) and (b[self.sp] in self._WS or b[self.sp] == ","):
+                    self.sp += 1
+                if self.sp >= len(b):
+                    break
+                if b[self.sp] == "}":
+                    self.sp += 1
+                    self.st = "after"
+                    break
+                k = self._STR.match(b, self.sp)
+                if k is None:
+                    if b[self.sp] != '"':
+                        self.st = "broken"
+                    break                        # (a key still arriving)
+                try:
+                    self.akey = json.loads(k.group())
+                except ValueError:
+                    self.st = "broken"
+                    break
+                self.sp, self.st = k.end(), "acolon"
+            elif self.st == "acolon":
+                while self.sp < len(b) and b[self.sp] in self._WS:
+                    self.sp += 1
+                if self.sp >= len(b):
+                    break
+                if b[self.sp] != ":":
+                    self.st = "broken"
+                    break
+                self.sp, self.st = self.sp + 1, "aval"
+            elif self.st == "aval":
+                while self.sp < len(b) and b[self.sp] in self._WS:
+                    self.sp += 1
+                if self.sp >= len(b):
+                    break
+                head = ARG_KEY + self.akey + ARG_KEY_END + ARG_VAL
+                if b[self.sp] == '"':            # a string: its JSON goes out as it is written
+                    out.append(head + '"')
+                    self.sp, self.st, self.esc = self.sp + 1, "astr", False
+                    continue
+                try:                             # anything else whole, once what ends a member follows it: "1500" may
+                    v, e = dec.raw_decode(b, self.sp)   # still become 1500.5, "tr" true (a prefix decodes, or fails)
+                except ValueError:
+                    break
+                j = e
+                while j < len(b) and b[j] in self._WS:
+                    j += 1
+                if j >= len(b) or b[j] not in ",}":
+                    break
+                out.append(head + json.dumps(v, ensure_ascii=False).replace("<", "\\u003c") + ARG_VAL_END)
+                self.sp, self.st = e, "akey"
+            elif self.st == "astr":
+                j, esc = self.sp, self.esc
+                while j < len(b):
+                    c = b[j]
+                    if esc:
+                        esc = False
+                    elif c == "\\":
+                        esc = True
+                    elif c == '"':
+                        break
+                    j += 1
+                # "<" only ever stands in a string: as \u003c it can never be read as the start of a tag
+                out.append(b[self.sp:j].replace("<", "\\u003c"))
+                self.esc = esc
+                if j >= len(b):
+                    self.sp = j
+                    break
+                out.append('"' + ARG_VAL_END)
+                self.sp, self.st = j + 1, "akey"
+            else:                                # after / off / broken: nothing more streams
+                break
+        return "".join(out)
+
+    def _end_call(self, final: bool) -> str:
+        """The call's segment is over (<|end_message|>, or the end of the answer when `final`)."""
+        if not self.streamed:
+            return self._call()                  # the whole body, as before: a call, or its text
+        out = self._stream()
+        if final:
+            return out                           # (cut off inside: OutputParser.finish closes the announced call)
+        if self.st == "astr":
+            out += '"' + ARG_VAL_END             # (the message ended inside a string: it ends there)
+        return out + CALL_END
+
+    def _call(self) -> str:
+        try:
+            j = json.loads(self.body)
+            name = (j.get("name") if isinstance(j, dict) else None) or self.name.strip()
+            args = (j.get("args") if isinstance(j, dict) else None) or {}
+            if not name or not isinstance(args, dict):
+                raise ValueError(self.body)
+        except ValueError:
+            return self._close() + self.body   # (not a call the parser can read: its text, as the answer's)
+        val = lambda v: json.dumps(v, ensure_ascii=False).replace("<", "\\u003c")   # ("<" occurs in strings only)
+        return (self._close() + CALL_START + name +
+                "".join(ARG_KEY + k + ARG_KEY_END + ARG_VAL + val(v) + ARG_VAL_END for k, v in args.items()) + CALL_END)
+
+
 class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False,
-                 token_only_end: bool = False, unions: bool = False):
+                 token_only_end: bool = False, unions: bool = False, inkling: bool = False):
         self.state = "reasoning" if thinking else "content"
         # token_only_end: the vocabulary has the end of thinking as a token (DeepSeek's), so only that token closes the
         # reasoning - the text "</think>" in it does not (a model that quotes the tag while it talks about it, as in
@@ -1322,11 +1662,12 @@ class OutputParser:
         self.unions = unions   # GLM-5.3 (glm_dsa): a parameter whose schema allows a string stays one (_declared_type)
         # DeepSeek-V4.1's tool calls, read as GLM's (DsmlRewriter); MiniMax-M3.1's the same way (MinimaxRewriter):
         # both send JSON values, so the parser takes them without the tools' schemas
-        self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else None
+        self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else \
+            InklingRewriter(thinking) if inkling else None   # (Inkling 2: its typed segments, InklingRewriter)
         self.buf = ""
         self._call_resume = 0        # where the CALL_END search in call state resumes (see _feed)
         self.lead = False
-        self.schemas = {} if dsml or minimax else {t.get("name"): t for t in tools or []}
+        self.schemas = {} if dsml or minimax or inkling else {t.get("name"): t for t in tools or []}
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees

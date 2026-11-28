@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 import os
-import sys as _sys   # (an older STRATA_X counts as MAYA_X: tools/maya_names.py makes it so on import)
+import sys as _sys   # (an older MAYA_X counts as MAYA_X: tools/maya_names.py makes it so on import)
 _sys.path.append(os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../tools')))
 import maya_names  # noqa: E402,F401
 import queue
@@ -155,7 +155,7 @@ log("maya generate: session is up (engine fake-glm-dsa)")
 threading.Thread(target=reader, daemon=True).start()
 out(f"INFO context={ctx} kv=int8 kv_resident=0 expert_slots=100 expert_cache_mib=61440 engine_kind=glm-fast "
     f"experts=19200 vram_slots=100 vram_gb=60.0 ram_slots=400 ram_gb={ram_gb} mtp=1 dflash=0 vision_lend=0 "
-    "cpu_threads=36 cpu_threads_max=36 pcie_share=0.50 logit_bias=1")
+    "cpu_threads=36 cpu_threads_max=36 pcie_share=0.50 logit_bias=1 prefill_batched=0")
 out(f"READY {ctx} stop pause")
 log("maya generate: glm-dsa serve (fake): GEN <max_new> [keys] <ids>, STOP, WRAP, QUIT")
 while True:

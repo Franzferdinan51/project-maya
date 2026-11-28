@@ -29,11 +29,16 @@ def crash():
     getattr(faulthandler, "_sigsegv", os.abort)()     # a real access violation / SIGSEGV
     os.abort()
 
+def boom(name):
+    raise ValueError(name + " gave what the reading could not take")
+
 class Fake:
     def __getattribute__(self, name):
         f = object.__getattribute__(self, name)
         if name in spec.get("crash", []):
             return lambda *a: crash()
+        if name in spec.get("raise", []):      # a Python error in a reading, outside any call (its "~" written)
+            return lambda *a: boom(name)
         if name in spec.get("hang", []):
             return lambda *a: time.sleep(3600)
         if name in spec.get("slow", {}):
@@ -83,6 +88,14 @@ class Fake:
 if spec.get("die"):                  # a reader that ends at its first request, outside any NVML call
     sys.stdin.readline()
     os._exit(3)
+if spec.get("die_idle"):             # a reader that answers once, then ends between two requests (a Python error)
+    _readline, _n = sys.stdin.readline, [0]
+    def _next_line():
+        _n[0] += 1
+        if _n[0] > 1:
+            raise RuntimeError("gone between two requests")
+        return _readline()
+    sys.stdin = type("In", (), {"readline": staticmethod(_next_line)})()
 if spec.get("absent"):               # no NVML library on this machine (not the real one either)
     T._open_nvml = lambda: None
     T._child_main(sys.argv[2:])
@@ -184,6 +197,104 @@ class ReaderProcess(unittest.TestCase):
         self.assertEqual(r.crashes, r.MAX_CRASHES)
         self.assertIn("the GPU readings are off", out.getvalue())
 
+    # each reading's calls (the info's: name, PCI address; the read's: the rest; the handle: every reading of the card)
+    READ_CALLS = {"nvmlDeviceGetUtilizationRates": "util", "nvmlDeviceGetMemoryInfo": "mem_used",
+                  "nvmlDeviceGetTemperature": "temp", "nvmlDeviceGetPowerUsage": "power",
+                  "nvmlDeviceGetEnforcedPowerLimit": "power_limit", "nvmlDeviceGetCurrPcieLinkGeneration": "pcie_gen",
+                  "nvmlDeviceGetMaxPcieLinkGeneration": "pcie_gen_max", "nvmlDeviceGetCurrPcieLinkWidth": "pcie_width",
+                  "nvmlDeviceGetPcieThroughput": "pcie_rx_mb", "nvmlDeviceGetComputeRunningProcesses_v3": "procs"}
+
+    def test_a_python_error_in_any_reading_leaves_that_value_out_and_the_reader_goes_on(self):
+        """The report's crash loop (a Tesla P4 + a V100): a reading that raises a Python error once its NVML call has
+        returned ended the reader with no call open - the server could not name a culprit, started it again, and it
+        ended again until the readings went off.  Now the value is None, the error is said once, the reader stays."""
+        for call, key in self.READ_CALLS.items():
+            with self.subTest(call=call):
+                r = self.keep(reader(**{"raise": [call]}))
+                with quiet() as out:
+                    gs = r.call({"op": "read", "idx": [0, 1]})["gpus"]
+                    pid = r.proc.pid
+                    again = r.call({"op": "read", "idx": [0, 1]})["gpus"]
+                self.assertEqual((r.crashes, r.off, r.skip, r.proc.pid), (0, False, set(), pid))   # (the same reader)
+                for g in gs + again:
+                    self.assertIsNone(g.get(key))
+                    if key != "util":
+                        self.assertEqual(g["util"], 42)                     # (the others read)
+                    if key != "temp":
+                        self.assertIn(g["temp"], (60, 61))
+                said = out.getvalue()
+                n = 2 if call == "nvmlDeviceGetPcieThroughput" else 1         # (its rx and tx readings)
+                self.assertEqual(said.count("a GPU reading failed"), 2 * n, said)   # (once a GPU, not each read)
+                self.assertIn("a GPU reading failed on GPU 1 (Fake V100): ", said)
+                self.assertIn(f"ValueError: {call} gave what", said)
+                self.assertIn("left out", said)
+                self.assertEqual({e["gpu"] for e in r.errors}, {0, 1})
+
+    def test_a_python_error_in_the_info_and_the_process_list(self):
+        for call, gone in (("nvmlDeviceGetName", "name"), ("nvmlDeviceGetPciInfo_v3", "pci"),
+                           ("nvmlDeviceGetHandleByIndex_v2", "ok")):
+            with self.subTest(call=call):
+                r = self.keep(reader(**{"raise": [call]}))
+                with quiet() as out:
+                    info = r.call({"op": "info", "idx": [0, 1]})
+                    pids = r.call({"op": "pids"})
+                self.assertEqual((r.crashes, r.off), (0, False))
+                self.assertEqual([bool(g[gone]) for g in info["gpus"]], [False, False])
+                self.assertIn("a GPU reading failed on GPU 0", out.getvalue())
+                if gone == "ok":                                   # (no handle: nothing on the card is read)
+                    self.assertIsNone(pids["pids"])
+                else:
+                    self.assertEqual(info["gpus"][0]["ok"], True)
+                    self.assertEqual(pids["pids"], [4242])
+
+    def test_a_reader_that_ended_between_two_requests_says_how(self):
+        """The report's line - "its pipe broke ([Errno 32] Broken pipe)" - with no hint of why: it now says how the
+        reader ended and its last words (a Python error and where, or a native crash's fatal error)."""
+        r = self.keep(reader(die_idle=True))
+        self.assertEqual(r.call({"op": "read", "idx": [0]})["gpus"][0]["util"], 42)
+        r.proc.wait(timeout=30)                                    # (it has ended before the next request is sent)
+        with quiet() as out:
+            g = r.call({"op": "read", "idx": [0]})["gpus"][0]      # (started again: answered)
+        said = out.getvalue()
+        self.assertEqual(g["util"], 42)
+        self.assertEqual(r.crashes, 1)
+        self.assertIn("it had ended, exit code 1", said)
+        self.assertIn("its last words: RuntimeError: gone between two requests (in _next_line", said)
+
+    def test_a_crash_says_its_last_words(self):
+        r = self.keep(reader(crash=["nvmlDeviceGetPowerUsage"]))
+        with quiet() as out:
+            r.call({"op": "read", "idx": [0]})
+        self.assertRegex(out.getvalue(), r"nvmlDeviceGetPowerUsage crashed their reader \(it ended, .*; its last words: "
+                                         r"(Fatal Python error|Windows fatal exception)")
+
+    def test_the_report_names_the_failed_reading(self):
+        text = T.readings_report(reader(**{"raise": ["nvmlDeviceGetPowerUsage"]}))
+        lines = text.splitlines()
+        self.assertEqual(len(lines), 2, text)
+        self.assertTrue(lines[0].startswith("GPU 0 Fake V100 (0000:01:00): 10 of 11 readings given; not given: power; "
+                                            "FAILED: power (ValueError: nvmlDeviceGetPowerUsage gave what"), text)
+        self.assertTrue(lines[1].startswith("GPU 1 Fake V100 (0000:02:00): 10 of 11"), text)
+        ok = T.readings_report(reader())
+        self.assertEqual(ok.splitlines()[0], "GPU 0 Fake V100 (0000:01:00): 11 of 11 readings given")
+        crash = T.readings_report(reader(crash=["nvmlDeviceGetCurrPcieLinkGeneration"]))
+        self.assertIn("not given: pcie_gen", crash)
+        self.assertIn("left out by the reader (crashed or hung it): nvmlDeviceGetCurrPcieLinkGeneration", crash)
+        self.assertEqual(T.readings_report(reader(absent=True)), "no NVML here (no NVIDIA driver): nothing to read")
+
+    def test_last_words(self):
+        tb = ["Traceback (most recent call last):", '  File "/m/serve/telemetry.py", line 600, in <module>',
+              '  File "/m/serve/telemetry.py", line 290, in read', "TypeError: unsupported operand"]
+        self.assertEqual(T._last_words(tb), "TypeError: unsupported operand (in read, telemetry.py line 290)")
+        fh = ["Fatal Python error: Segmentation fault", "", "Current thread 0x7f (most recent call first):",
+              '  File "/m/serve/telemetry.py", line 223 in _uint', '  File "/m/serve/telemetry.py", line 280 in read']
+        self.assertEqual(T._last_words(fh), "Fatal Python error: Segmentation fault (in _uint, telemetry.py line 223)")
+        self.assertEqual(T._last_words(["", "something else"]), "something else")
+        self.assertEqual(T._last_words([]), "")
+        if os.name != "nt":
+            self.assertEqual(T._ended(-9), "killed by SIGKILL (the system's out-of-memory killer, or another program)")
+        self.assertEqual(T._ended(3), "exit code 3")
+
 
 class Sampler(unittest.TestCase):
     def test_sample_through_the_reader(self):
@@ -199,6 +310,7 @@ class Sampler(unittest.TestCase):
         self.assertEqual([(v["index"], v["pci"], v["procs"]) for v in s["vram"]],
                          [(0, "0000:01:00", {4242: 1 << 30}), (1, "0000:02:00", {4242: 1 << 30})])
         self.assertNotIn("gpu_procs", s)
+        self.assertIn("cpu_temp", s)
         json.dumps(t.snapshot())
 
     def test_without_nvml(self):
@@ -237,18 +349,22 @@ class Sampler(unittest.TestCase):
             t = T.Telemetry(gpu_index=0, reader=r, start=False, busy=lambda: False, extra=lambda: {"tok_s": 7.0})
             time.sleep(0.01)
             threading.Thread(target=t._loop, daemon=True).start()
-            time.sleep(0.2)
-            n = len(t.hist["tok_s"])                           # (the first reading; then it pauses IDLE_S)
+            for _ in range(500):                               # (the first reading; then it pauses IDLE_S - a loaded
+                if t.hist["tok_s"]:                            # box can take longer than a fixed 0.2 s to get there)
+                    break
+                time.sleep(0.01)
+            time.sleep(0.05)
+            n = len(t.hist["tok_s"])
             self.assertGreaterEqual(n, 1)
             self.assertTrue(t._slow)
             t0 = time.monotonic()
             t.touch()                                          # a request: the next reading comes now, not in 3 s
-            for _ in range(100):
+            for _ in range(200):
                 if len(t.hist["tok_s"]) > n:
                     break
                 time.sleep(0.01)
             self.assertGreater(len(t.hist["tok_s"]), n)
-            self.assertLess(time.monotonic() - t0, 0.5)
+            self.assertLess(time.monotonic() - t0, 2.0)        # (well under the 3 s pause)
 
 
     def test_gpu_pids(self):
@@ -259,6 +375,115 @@ class Sampler(unittest.TestCase):
         r2 = reader(absent=True)
         with mock.patch.object(T, "_READER", r2):
             self.assertIsNone(T.gpu_pids())
+
+    def test_cpu_temperature_from_hwmon(self):
+        """The CPU's own hwmon chip (k10temp here): its hottest sensor; another chip's reading is not the CPU's, and
+        the ACPI zone is not used while the CPU's own chip answers."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for hwmon, chip, values in (("hwmon0", "nvme", ("90000",)), ("hwmon1", "k10temp", ("52500", "55000")),
+                                        ("hwmon2", "acpitz", ("80000",))):
+                (root / "class/hwmon" / hwmon).mkdir(parents=True)
+                (root / "class/hwmon" / hwmon / "name").write_text(chip + "\n", encoding="utf-8")
+                for i, value in enumerate(values, 1):
+                    (root / "class/hwmon" / hwmon / f"temp{i}_input").write_text(value + "\n", encoding="utf-8")
+            (root / "class/thermal/thermal_zone0").mkdir(parents=True)
+            (root / "class/thermal/thermal_zone0/type").write_text("x86_pkg_temp\n", encoding="utf-8")
+            (root / "class/thermal/thermal_zone0/temp").write_text("48000\n", encoding="utf-8")
+            self.assertEqual(T.cpu_temp([d]), 55.0)
+
+    def test_cpu_temperature_from_kernel_thermal_zone(self):
+        """A Xeon whose DTS is only a thermal zone: Maya reads x86_pkg_temp directly; a PCH zone is not the CPU."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for zone, kind, value in (("thermal_zone0", "pch_skylake", "38000"),
+                                      ("thermal_zone1", "x86_pkg_temp", "48000")):
+                (root / "class/thermal" / zone).mkdir(parents=True)
+                (root / "class/thermal" / zone / "type").write_text(kind + "\n", encoding="utf-8")
+                (root / "class/thermal" / zone / "temp").write_text(value + "\n", encoding="utf-8")
+            self.assertEqual(T.cpu_temp([d]), 48.0)
+
+    def test_cpu_temperature_can_be_simulated_from_another_root(self):
+        """MAYA_CPU_SENSOR_ROOT lets a VM read a sensor tree the host shares (here one simulated coretemp chip)."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as sim, tempfile.TemporaryDirectory() as real:
+            chip = Path(sim) / "hwmon" / "hwmon0"
+            chip.mkdir(parents=True)
+            (chip / "name").write_text("coretemp\n", encoding="utf-8")
+            (chip / "temp1_input").write_text("42000\n", encoding="utf-8")
+            with mock.patch.object(T, "CPU_SENSOR_ROOT", sim), mock.patch.object(T, "SYSFS", real):
+                self.assertEqual(T.cpu_temp(), 42.0)
+
+    def test_no_cpu_sensor_reads_no_other_chip(self):
+        """A Linux box whose sysfs has no CPU sensor (a CI runner, a VM) - only an NVMe drive's: None, without reading
+        the drive's temperature and without psutil's scan of every chip (each second, in every server's sampler: the
+        drive reads queued up in the kernel and a test server ended minutes after SIGTERM - v1.1.82's CI)."""
+        import builtins
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            chip = Path(d) / "class/hwmon/hwmon0"
+            chip.mkdir(parents=True)
+            (chip / "name").write_text("nvme\n", encoding="utf-8")
+            (chip / "temp1_input").write_text("41000\n", encoding="utf-8")
+            zone = Path(d) / "class/thermal/thermal_zone0"
+            zone.mkdir(parents=True)
+            (zone / "type").write_text("iwlwifi_1\n", encoding="utf-8")
+            (zone / "temp").write_text("39000\n", encoding="utf-8")
+            read = []
+            real_open = builtins.open
+
+            def spy(path, *a, **kw):
+                read.append(str(path))
+                return real_open(path, *a, **kw)
+            scan = mock.Mock(side_effect=AssertionError("psutil.sensors_temperatures() was called"))
+            with mock.patch("builtins.open", spy), \
+                    mock.patch.dict(sys.modules, {"psutil": mock.Mock(sensors_temperatures=scan)}):
+                self.assertIsNone(T.cpu_temp([d]))
+            scan.assert_not_called()
+            self.assertEqual([p for p in read if p.endswith(("temp1_input", os.sep + "temp"))], [])
+
+    def test_cpu_temperature_from_the_acpi_zone_or_a_device_folder(self):
+        """What psutil's scan found before (it is no longer used on Linux): a board with only an ACPI thermal zone, and
+        an older kernel's chip whose files are in hwmonN/device/."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            for zone, kind, value in (("thermal_zone0", "acpitz", "51000"), ("thermal_zone1", "iwlwifi_1", "70000")):
+                (Path(d) / "class/thermal" / zone).mkdir(parents=True)
+                (Path(d) / "class/thermal" / zone / "type").write_text(kind + "\n", encoding="utf-8")
+                (Path(d) / "class/thermal" / zone / "temp").write_text(value + "\n", encoding="utf-8")
+            self.assertEqual(T.cpu_temp([d]), 51.0)
+        with tempfile.TemporaryDirectory() as d:
+            dev = Path(d) / "class/hwmon/hwmon0/device"
+            dev.mkdir(parents=True)
+            (dev / "name").write_text("coretemp\n", encoding="utf-8")
+            (dev / "temp1_input").write_text("63000\n", encoding="utf-8")
+            self.assertEqual(T.cpu_temp([d]), 63.0)
+
+    def test_without_sysfs_psutil_answers(self):
+        """No /sys at all (another OS): psutil's sensors, as before."""
+        import tempfile
+        row = mock.Mock(current=47.0)
+        ps = mock.Mock(sensors_temperatures=mock.Mock(return_value={"coretemp": [row]}))
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(sys.modules, {"psutil": ps}):
+            self.assertEqual(T.cpu_temp([d]), 47.0)
+
+    def test_stop_ends_the_sampler_thread(self):
+        """stop(): the sampler's thread ends within its pause (a closed server's sampler no longer reads each second)."""
+        import threading
+        import time
+        r = T._Reader()
+        self.addCleanup(r._stop)
+        before = set(threading.enumerate())
+        t = T.Telemetry(gpu_index=0, reader=r)
+        mine = [th for th in threading.enumerate() if th not in before and th.name != "nvml-reader"
+                and th.name != "nvml-reader-err"]
+        t.stop()
+        end = time.monotonic() + 10
+        while any(th.is_alive() for th in mine) and time.monotonic() < end:
+            time.sleep(0.05)
+        self.assertEqual([th for th in mine if th.is_alive()], [])
 
     def test_this_machine(self):
         """The real reader on this machine (NVML or none): it answers or says there is nothing - never raises."""

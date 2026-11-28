@@ -7,6 +7,7 @@ engine, no GPU.
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import sys
@@ -102,8 +103,12 @@ class Settings(unittest.TestCase):
         # (Hy4-Flash's cards: 1 GB or more in use on each - the most the setup counts - unless a test reads its own)
         self.used = mock.patch.object(M, "hy4_used", side_effect=lambda gpus: {i: 1024 for i in gpus})
         self.used.start()
+        # (... and no RAM figure - the VRAM alone, no KV streaming - unless a test gives one)
+        self.ram = mock.patch.object(M, "hy4_ram_gb", return_value=None)
+        self.ram.start()
 
     def tearDown(self):
+        self.ram.stop()
         self.used.stop()
         self.tmp.cleanup()
 
@@ -334,6 +339,264 @@ class Settings(unittest.TestCase):
             M.apply(bare, {"draft": "dspark"})
         self.assertEqual(M.quant_label(cfg, Path("maya-mm3.json")), "EXL3 3.5 bpw")
 
+    def ik2_cfg(self, **extra) -> Path:
+        """Inkling-2-Mini as the setup writes it (maya.write_config_ik2): its GGUF in the model's folder, the tokenizer
+        folder beside it (no drafter for it)."""
+        d = self.d / "models" / "Inkling-2-Mini"
+        (d / "maya-ik2" / "tokenizer").mkdir(parents=True, exist_ok=True)
+        (d / "Inkling-2-Mini-UD-Q4_K_XL.gguf").write_bytes(b"x" * 1000)
+        (d / "maya-ik2" / "sources.json").write_text(json.dumps(
+            {"files": [{"name": "Inkling-2-Mini-UD-Q4_K_XL.gguf", "size": 1000}]}))
+        args = ["--model", str(d / "Inkling-2-Mini-UD-Q4_K_XL.gguf"), "--max-context", "262144"]
+        cfg = {"exe": "/b/maya-ik2", "args": args, "tokenizer": str(d / "maya-ik2" / "tokenizer"),
+               "model_name": "inkling-2-mini", "gpu": [0], "env": {"IK2_KV": "fp8"},
+               "sampling": {"temperature": 1.0, "top_p": 1.0}, "reasoning_effort": "high",
+               "installer": {"family": "ik2", "quant": "unsloth UD-Q4_K_XL", "ik2_quant": "ud-q4_k_xl",
+                             "models_dir": str(self.d / "models"), "model_dir": str(d), "experimental": True}, **extra}
+        p = self.d / "maya-inkling-2-mini.json"
+        p.write_text(json.dumps(cfg))
+        return p
+
+    def test_ik2_read_and_written_with_its_own_flags(self):
+        """Inkling-2-Mini's preview on the Models page: its context, cache format and one or two GPUs - maya-ik2's own flags
+        only; drafting (auto, the drafter by hand, off); what it does not have yet (answers at once) said, and pictures where the setup
+        left out the image encoder."""
+        cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "RTX 3090", "vram_gb": 24.0},
+                                                                   {"index": 1, "name": "RTX 5090", "vram_gb": 31.5}])
+        cards.start()
+        self.addCleanup(cards.stop)
+        path = self.ik2_cfg()
+        cfg = M.read(path)
+        self.assertEqual(M.family(cfg), "ik2")
+        self.assertEqual(M.settings_of(cfg), {"context": 262144, "gpus": [0], "env": {}, "ablate": False,
+                                              "images": False, "kv": "fp8", "draft": "none", "parallel": 1})
+        self.assertEqual(M.choices(cfg)["draft"], ["auto", "none"])   # (no drafter downloaded: the prompt lookup)
+        self.assertFalse(M.choices(cfg)["images"])
+        self.assertEqual(M.quant_label(cfg, path), "unsloth UD-Q4_K_XL")
+        self.assertIsNone(M.missing(cfg))                                      # (its folder stands for the pack)
+        self.assertEqual(M.apply(cfg, {}), cfg)                                 # (a save that changes nothing)
+        self.assertEqual(M.apply(cfg, M.settings_of(cfg)), cfg)
+        self.assertEqual(M.apply(cfg, {"parallel": 1, "draft": "none"}), cfg)   # (their "off": nothing to say)
+        new = M.apply(cfg, {"context": 131072, "kv": "f16"})
+        self.assertEqual(M.flag(new["args"], "--max-context"), "131072")
+        self.assertEqual(new["env"], {"IK2_KV": "f16"})
+        self.assertEqual(M.apply(cfg, {"gpus": [1]})["gpu"], [1])
+        # maya-ik2 stops at a flag it does not know: only its own
+        self.assertEqual({x for x in M.apply(cfg, {"context": 65536})["args"] if x.startswith("--")},
+                         {"--model", "--max-context"})
+        # (two GPUs: the split, --gpus 2; back to one: no --gpus)
+        two = M.apply(cfg, {"gpus": [0, 1]})
+        self.assertEqual(M.flag(two["args"], "--gpus"), "2")
+        self.assertIsNone(M.flag(M.apply(two, {"gpus": [0]})["args"], "--gpus"))
+        # (Answers at once: --parallel, written where it changes, 1-8)
+        self.assertEqual(M.flag(M.apply(cfg, {"parallel": 2})["args"], "--parallel"), "2")
+        self.assertIsNone(M.flag(M.apply(cfg, {"parallel": 1})["args"], "--parallel"))
+        for bad, why in (({"gpus": [0, 1, 2]}, "one or two GPUs"), ({"parallel": 9}, "Answers at once"),
+                         ({"draft": "dspark"}, "this setup has no drafter"), ({"draft": "mtp"}, "auto, the drafter"),
+                         ({"kv": "int8"}, "FP8 or F16"), ({"images": True}, "set up without its image encoder"),
+                         ({"reserve_mib": 512}, "not a setting")):
+            with self.assertRaises(ValueError, msg=str(bad)) as e:
+                M.apply(cfg, bad)
+            self.assertIn(why, str(e.exception))
+        # drafting: auto (measured once on the PC), the drafter by hand (DSpark: --drafting on) where the setup
+        # downloaded it, or off - its --draft file kept named
+        self.assertEqual(M.flag(M.apply(cfg, {"draft": "auto"})["args"], "--drafting"), "auto")
+        dcfg = dict(cfg, args=cfg["args"] + ["--draft", "/m/mtp.safetensors", "--drafting", "auto"])
+        self.assertEqual(M.choices(dcfg)["draft"], ["auto", "dspark", "none"])
+        self.assertEqual(M.settings_of(dcfg)["draft"], "auto")
+        self.assertEqual(M.apply(dcfg, {}), dcfg)
+        for want, how in (("dspark", "on"), ("none", "off"), ("auto", "auto")):
+            new = M.apply(dcfg, {"draft": want})
+            self.assertEqual((M.flag(new["args"], "--drafting"), M.flag(new["args"], "--draft")),
+                             (how, "/m/mtp.safetensors"), want)
+            self.assertEqual(M.settings_of(new)["draft"], want)
+
+    def test_ik2_drafting_unavailable_without_room(self):
+        """A card whose tier has no room for the drafter: the Drafting setting offers Off only; Volta / Turing draft
+        as the newer cards do."""
+        path = self.ik2_cfg()
+        for gpu, want in (({"arch": "70", "vram_gb": 32.0}, ["auto", "none"]), ({"arch": "86", "vram_gb": 8.0}, ["none"]),
+                          ({"arch": "75", "vram_gb": 24.0}, ["auto", "none"]), ({"arch": "86", "vram_gb": 24.0}, ["auto", "none"])):
+            with mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "GPU", **gpu}]):
+                self.assertEqual(M.choices(M.read(path))["draft"], want, gpu)
+
+    def ik2_strata_cfg(self, **extra) -> Path:
+        """Inkling-2-Mini on the Strata shape engine, as its setup writes it: the .strata pack and its Vision file
+        in the model's folder, the pack's tokenizer beside them, DSpark built into the pack (its --draft)."""
+        d = self.d / "models" / "Inkling-2-Mini-SQ-20"
+        (d / "tokenizer").mkdir(parents=True, exist_ok=True)
+        (d / "Inkling-2-Mini-SQ-20.strata").write_bytes(b"x" * 1000)
+        (d / "Inkling-2-Mini-Vision.strata").write_bytes(b"x" * 100)
+        args = ["--model", str(d / "Inkling-2-Mini-SQ-20.strata"), "--vision", str(d / "Inkling-2-Mini-Vision.strata"),
+                "--max-context", "262144", "--parallel", "1", "--draft", "dspark", "--kv", "fp16"]
+        cfg = {"exe": "/b/strata-inkling", "args": args, "tokenizer": str(d / "tokenizer"),
+               "model_name": "inkling-2-mini-strata", "gpu": [0], "env": {"IK2_KV": "f16"}, "backend": "metal",
+               "sampling": {"temperature": 1.0, "top_p": 1.0}, "reasoning_effort": "high",
+               "installer": {"family": "ik2", "quant": "Strata SQ-20", "ik2_quant": "sq-20",
+                             "models_dir": str(self.d / "models"), "model_dir": str(d), "experimental": True,
+                             "strata_vision": str(d / "Inkling-2-Mini-Vision.strata")}, **extra}
+        p = self.d / "maya-inkling-strata.json"
+        p.write_text(json.dumps(cfg))
+        return p
+
+    def test_ik2_strata_engine_read_and_written_with_its_own_flags(self):
+        """Inkling-2-Mini on the Strata engine: the ik2 family by its installer record (its exe is strata-inkling,
+        not maya-ik2); its settings are the engine's own flags - Images its --vision file, Drafting its --draft,
+        the cache its --kv - and a save that changes nothing changes nothing."""
+        cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "RTX 3090", "vram_gb": 24.0}])
+        cards.start()
+        self.addCleanup(cards.stop)
+        path = self.ik2_strata_cfg()
+        cfg = M.read(path)
+        self.assertEqual(M.family(cfg), "ik2")
+        self.assertEqual(M.settings_of(cfg), {"context": 262144, "gpus": [0], "env": {}, "ablate": False,
+                                              "images": True, "kv": "f16", "draft": "dspark", "parallel": 1})
+        self.assertEqual(M.choices(cfg)["draft"], ["dspark", "none"])   # (the drafter is built into the pack)
+        self.assertTrue(M.choices(cfg)["images"])
+        self.assertEqual(M.quant_label(cfg, path), "Strata SQ-20")
+        self.assertIsNone(M.missing(cfg))
+        self.assertEqual(M.apply(cfg, {}), cfg)                                 # (a save that changes nothing)
+        self.assertEqual(M.apply(cfg, M.settings_of(cfg)), cfg)
+        # Images: the --vision file is dropped, and named again from the setup's record
+        off = M.apply(cfg, {"images": False})
+        self.assertIsNone(M.flag(off["args"], "--vision"))
+        self.assertFalse(M.settings_of(off)["images"])
+        on = M.apply(off, {"images": True})
+        self.assertEqual(M.flag(on["args"], "--vision"), cfg["installer"]["strata_vision"])
+        self.assertTrue(M.settings_of(on)["images"])
+        # Drafting: none drops --draft (the engine then loads no drafter); dspark writes it back
+        none = M.apply(cfg, {"draft": "none"})
+        self.assertIsNone(M.flag(none["args"], "--draft"))
+        self.assertEqual(M.settings_of(none)["draft"], "none")
+        back = M.apply(none, {"draft": "dspark"})
+        self.assertEqual(M.flag(back["args"], "--draft"), "dspark")
+        self.assertEqual(M.settings_of(back)["draft"], "dspark")
+        with self.assertRaises(ValueError):
+            M.apply(cfg, {"draft": "auto"})                                     # (no measured auto on this engine)
+        # the cache: --kv follows the setting, in the engine's own spelling
+        fp8 = M.apply(cfg, {"kv": "fp8"})
+        self.assertEqual(M.flag(fp8["args"], "--kv"), "fp8")
+        self.assertEqual(fp8["env"], {"IK2_KV": "fp8"})
+        self.assertEqual(M.settings_of(fp8)["kv"], "fp8")
+        m = M.describe(path, None)
+        self.assertEqual((m["family"], m["model"], m["quant"], m["ok"]),
+                         ("ik2", "inkling-2-mini-strata", "Strata SQ-20", True))
+        self.assertEqual(m["settings"]["images"], True)
+        self.assertEqual(m["settings"]["draft"], "dspark")
+
+    def test_ik2_images_on_and_off(self):
+        """The setup's "vision" entry (maya-vision and the mmproj, no text model): Images off keeps it as "vision_off",
+        on puts it back; the engine's arguments are the same either way (the plan holds no room for pictures)."""
+        cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "RTX 3090", "vram_gb": 24.0}])
+        cards.start()
+        self.addCleanup(cards.stop)
+        path = self.ik2_cfg()
+        cfg = M.read(path)
+        v = {"exe": "/b/maya-vision", "mmproj": "/m/mmproj-BF16.gguf", "gpu": True}
+        cfg["vision"] = v
+        self.assertTrue(M.settings_of(cfg)["images"])
+        self.assertTrue(M.choices(cfg)["images"])
+        off = M.apply(cfg, {"images": False})
+        self.assertEqual((off.get("vision"), off["vision_off"], off["args"]), (None, v, cfg["args"]))
+        self.assertTrue(M.choices(off)["images"])                       # (it can be switched on again)
+        on = M.apply(off, {"images": True})
+        self.assertEqual((on["vision"], on.get("vision_off"), on["args"]), (v, None, cfg["args"]))
+        self.assertIn(Path(v["mmproj"]), M.vision_files(cfg))
+
+    def test_ik2_described_for_the_page(self):
+        cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "RTX 3090", "vram_gb": 24.0}])
+        cards.start()
+        self.addCleanup(cards.stop)
+        m = M.describe(self.ik2_cfg(env={"IK2_KV": "fp8", "MY_VAR": "1"}), None)
+        self.assertEqual((m["family"], m["model"], m["quant"], m["ok"]), ("ik2", "inkling-2-mini", "unsloth UD-Q4_K_XL", True))
+        self.assertEqual(m["settings"]["env"], {"MY_VAR": "1"})               # (IK2_KV: the KV cache setting)
+        self.assertEqual(m["settings"]["kv"], "fp8")
+        cfg = M.read(self.d / "maya-inkling-2-mini.json")
+        self.assertEqual(M.apply(cfg, {"env": {"IK2_KV": "f16"}})["env"]["IK2_KV"], "f16")   # (typed by hand)
+        self.assertEqual(m["contexts"], [32768, 65536, 131072, 262144, 524288, 1048576])   # (to the trained 1M)
+        self.assertEqual(m["context_range"]["tested"], 262144)
+        self.assertEqual(m["ik2_kv_bytes"], {"fp8": 16384, "f16": 32768})
+        self.assertEqual({k: v for k, v in m["ik2_fit"]["fp8"]["262144"].items() if k in ("resident", "layout")},
+                         {"resident": True, "layout": "resident"})
+        self.assertEqual(m["ik2_fit"]["f16"]["262144"]["layout"], "offload")    # (the experts leave the card first,
+        self.assertFalse(m["ik2_fit"]["fp8"]["1048576"]["kv_streamed"])         #  the whole cache stays in VRAM)
+        self.assertGreaterEqual(m["size"], 1000)                               # (the GGUF)
+        plan = M.delete_plan(self.d, self.d / "maya-inkling-2-mini.json")
+        self.assertTrue(plan["ok"], plan.get("why"))
+        self.assertEqual(Path(plan["folder"]).name, "Inkling-2-Mini")
+
+    def ling_cfg(self, extra=()) -> Path:
+        """Ling-3.2-air as the setup writes it (maya.write_config_ling): its GGUF in the model's folder, maya-ling's own
+        flags, the model's sampling and level."""
+        d = self.d / "models" / "Ling-3.2-air"
+        (d / "maya-ling" / "tokenizer").mkdir(parents=True, exist_ok=True)
+        (d / "Ling-3.2-air-Maya-S-IQ2_XXS.gguf").write_bytes(b"x" * 1000)
+        args = ["--serve", "--gguf", str(d / "Ling-3.2-air-Maya-S-IQ2_XXS.gguf"), "--max-context", "65536", "--kv", "fp16",
+                "--drafting", "auto", "--cal-file", str(d / "maya-ling" / "ling-calibration.txt"), *extra]
+        cfg = {"exe": "/b/maya-ling", "backend": "cuda", "gpu": [0], "args": args, "tokenizer": str(d / "maya-ling" / "tokenizer"),
+               "model_name": "ling-3.2-air", "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+               "reasoning_effort": "high", "installer": {"family": "ling", "quant": "Ling-3.2-air-Maya-S",
+                                                         "ling_quant": "Ling-3.2-air-Maya-S", "drafting": "auto"}}
+        p = self.d / "maya-ling-3.2-air-maya-s.json"
+        p.write_text(json.dumps(cfg))
+        return p
+
+    def test_ling_read_and_written_with_its_own_flags(self):
+        """Ling-3.2-air on the Models page: context, drafting (on / off; the setup's auto shows as on), KV cache (F16 / 8-bit), GPUs, prompt chunk
+        and CPU threads - maya-ling's own flags; a save from the page (every setting sent back) changes nothing it did
+        not change, and writes no --vision (the page offers no pictures for it); one answer at a time."""
+        cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "RTX 3090", "vram_gb": 24.0},
+                                                                   {"index": 1, "name": "RTX 3090", "vram_gb": 24.0}])
+        cards.start()
+        self.addCleanup(cards.stop)
+        cfg = M.read(self.ling_cfg())
+        self.assertEqual(M.family(cfg), "ling")
+        s = M.settings_of(cfg)
+        self.assertEqual(s, {"context": 65536, "gpus": [0], "env": {}, "ablate": False, "images": False, "kv": "f16",
+                             "draft": "on", "parallel": 1, "prefill_chunk": None, "cpu_threads": None})
+        self.assertEqual(M.choices(cfg)["draft"], ["on", "none"])
+        self.assertEqual(M.flag(M.apply(cfg, {"draft": "on"})["args"], "--drafting"), "auto")   # (On: auto stays)
+        self.assertEqual(M.choices(cfg)["kv"], ["f16", "q8"])
+        self.assertFalse(M.choices(cfg)["images"])                  # (no vision file: tools/ling/download.json has none)
+        self.assertEqual(M.apply(cfg, {}), cfg)
+        self.assertEqual(M.apply(cfg, s), cfg)                       # (the page's save: every setting, none changed)
+        new = M.apply(cfg, {**s, "context": 131072, "kv": "q8", "draft": "none", "prefill_chunk": 1024, "cpu_threads": 12})
+        for f, v in (("--max-context", "131072"), ("--kv", "q8"), ("--drafting", "off"), ("--prefill-chunk", "1024"),
+                     ("--cpu-threads", "12")):
+            self.assertEqual(M.flag(new["args"], f), v, f)
+        self.assertNotIn("--vision", new["args"])
+        self.assertEqual({M.settings_of(new)[k] for k in ("kv", "draft")}, {"q8", "none"})
+        back = M.apply(new, {"draft": "on"})                         # (On again: --drafting on, no measuring)
+        self.assertEqual((M.flag(back["args"], "--drafting"), M.settings_of(back)["draft"]), ("on", "on"))
+        self.assertEqual(M.apply(back, M.settings_of(back)), back)
+        for args, want in ((["--drafting", "mtp"], "on"), (["--drafting", "none"], "none"), (["--mtp"], "on"),
+                           (["--spec-k", "2"], "on"), (["--spec-k", "0"], "none"), ([], "none")):
+            self.assertEqual(M.ling_draft_of(args), want, args)
+        two = M.apply(cfg, {**s, "gpus": [0, 1]})
+        self.assertEqual((two["gpu"], M.flag(two["args"], "--gpus")), ([0, 1], "0,1"))
+        for bad, why in (({"parallel": 2}, "one request at a time"), ({"kv": "fp8"}, "f16 or q8"), ({"draft": "auto"}, "on or off"),
+                         ({"prefill_chunk": 32}, "Prefill chunk"), ({"tp": 2}, "not a setting"),
+                         ({"reserve_gb": 1.0}, "not a setting")):
+            with self.assertRaises(ValueError, msg=str(bad)) as e:
+                M.apply(cfg, bad)
+            self.assertIn(why, str(e.exception))
+        # (a vision file the user added by hand: the page's save keeps it as it is)
+        own = M.read(self.ling_cfg(extra=("--mmproj", "/m/mmproj.gguf")))
+        self.assertEqual(M.apply(own, M.settings_of(own)), own)
+
+    def test_ling_described_for_the_page(self):
+        cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "RTX 3090", "vram_gb": 24.0}])
+        cards.start()
+        self.addCleanup(cards.stop)
+        m = M.describe(self.ling_cfg(), None)
+        self.assertEqual((m["family"], m["model"], m["ok"]), ("ling", "ling-3.2-air", True))
+        self.assertEqual(m["contexts"], [8192, 16384, 32768, 65536, 131072, 262144])
+        self.assertEqual(m["context_range"]["tested"], 262144)
+        self.assertEqual(m["ling_kv_bytes"], {"f16": 8064, "q8": 4704})
+        fit = m["ling_fit"]["f16"]["65536"]
+        self.assertTrue({"fits_trunk", "resident", "vram_pct", "ssd_gib"} <= set(fit))   # (what the page's note reads)
+        self.assertEqual(sorted(m["ling_fit"]), ["f16", "q8"])
+
     def test_hy4_read_and_written_with_its_own_flags(self):
         cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": i, "name": "V100", "vram_gb": 16.0}
                                                                    for i in range(4)])
@@ -344,7 +607,7 @@ class Settings(unittest.TestCase):
         self.assertEqual(M.family({"exe": "C:/b/maya-hy4.exe", "args": ["--pack", "/p"]}), "hy4")   # (no installer)
         self.assertEqual(M.settings_of(cfg), {"context": 32768, "gpus": [0, 1], "env": {}, "ablate": False,
                                               "images": False, "draft": "none", "tp": "auto", "cpu_threads": 12,
-                                              "reserve_gb": 0.5, "prefill_chunk": 256})
+                                              "reserve_gb": 0.5, "prefill_chunk": 256, "kv": "auto"})
         self.assertEqual(M.choices(cfg), {"draft": ["none"], "images": False,
                                           "ablate": {"available": False, "why": "not available for this model"}})
         self.assertEqual(M.quant_label(cfg, Path("maya-hy4-flash-maya-xs.json")), "Maya-XS")
@@ -368,11 +631,23 @@ class Settings(unittest.TestCase):
         self.assertEqual((one["gpu"], "--gpus" in one["args"]), ([1], False))
         three = M.apply(cfg, {"gpus": [0, 2, 3]})
         self.assertEqual((three["gpu"], M.flag(three["args"], "--gpus")), ([0, 2, 3], "0,1,2"))
+        # KV cache: auto (no flag, the default) or 8-bit rows (--kv q8: the setup's opt-in faster drafting) - another
+        # setting left as it is; a config's own --kv f16 stays offered, other formats are refused
+        q8 = M.apply(cfg, {"kv": "q8"})
+        self.assertEqual((M.flag(q8["args"], "--kv"), M.settings_of(q8)["kv"]), ("q8", "q8"))
+        self.assertEqual([x for x in q8["args"] if x not in ("--kv", "q8")], before)
+        self.assertEqual(M.apply(M.apply(q8, {"draft": "none"}), {})["args"], q8["args"])   # (drafting: rows kept)
+        self.assertEqual(M.apply(q8, {"kv": "auto"})["args"], before)
+        f16 = {**cfg, "args": before + ["--kv", "f16"]}
+        self.assertEqual(M.flag(M.apply(f16, M.settings_of(f16))["args"], "--kv"), "f16")
+        for bad in ("f16", "int8"):
+            with self.assertRaisesRegex(ValueError, "KV cache: auto or 8-bit"):
+                M.apply(cfg, {"kv": bad})
         # what the engine does not have yet: a plain no, nothing written
         for key, value, why in (("parallel", 2, "one request at a time"), ("draft", "mtp", "this pack has no MTP block"),
-                                ("images", True, "this pack has no vision tower"), ("kv_cache", "fp8", "one cache format"),
-                                ("kv", "int8", "one cache format"), ("kv_streaming", True, "KV streaming: not available"),
-                                ("kv_resident", 8192, "KV streaming: not available"),
+                                ("images", True, "this pack has no vision tower"), ("kv_cache", "fp8", "auto or 8-bit"),
+                                ("kv_streaming", True, "KV streaming: .* by itself"),
+                                ("kv_resident", 8192, "KV streaming: .* by itself"),
                                 ("ablate", True, "Refusal ablation: not available for this model")):
             with self.assertRaisesRegex(ValueError, why):
                 M.apply(cfg, {key: value})
@@ -393,6 +668,22 @@ class Settings(unittest.TestCase):
         # (no VRAM figure: the contexts up to the one the setup wrote - test_hy4_contexts_that_fit)
         self.assertEqual((row["family"], row["quant"], row["contexts"]), ("hy4", "Maya-XS", [4096, 8192, 16384, 32768]))
         self.assertEqual(row["context_range"], {"min": 4096, "max": 32768, "trained": 1048576, "tested": 32768})
+
+    def test_hy4_tensor_parallel_auto_round_trip(self):
+        """#1249: Hy4-Flash shows tp "auto"; saving it (or going back to it) writes no --tp, a number writes one."""
+        cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": i, "name": "V100", "vram_gb": 16.0}
+                                                                   for i in range(4)])
+        cards.start()
+        self.addCleanup(cards.stop)
+        cfg = M.read(hy4_cfg(self.d))
+        self.assertEqual(M.settings_of(cfg)["tp"], "auto")
+        self.assertNotIn("--tp", M.apply(cfg, {"tp": "auto"})["args"])
+        two = M.apply(cfg, {"tp": 2})
+        self.assertEqual((M.flag(two["args"], "--tp"), M.settings_of(two)["tp"]), ("2", 2))
+        back = M.apply(two, {"tp": "auto"})
+        self.assertNotIn("--tp", back["args"])
+        self.assertEqual(M.settings_of(back)["tp"], "auto")
+        self.assertEqual(M.apply(cfg, {"tp": ""})["args"], M.apply(cfg, {"tp": "auto"})["args"])
 
     def test_hy4_a_new_context_gets_the_setups_chunk_again(self):
         """A small-card layout's prompt chunk is the setup's choice for one context (maya.py's hy4_fit: a picture's
@@ -420,22 +711,24 @@ class Settings(unittest.TestCase):
             return c["installer"].get("chunk_by_hand")
         wide = cfg_with(4096, 512)                     # (the setup's on a card with room for both at 4K)
         self.assertTrue(M.settings_of(wide)["images"])
-        with cards(9.5):                               # 8.5 GB for the model: 6.5 + 0.81 + 0.95 at 4K
+        with cards(9.5):                               # 8.5 GB for the model: 6.5 + 0.95 at 4K (pictures take none)
             self.assertEqual(M.apply(wide, M.settings_of(wide)), wide)      # (a save that changes nothing)
             self.assertEqual(chunk(M.apply(wide, {"cpu_threads": 8})), "512")
-            for ctx in (8192, 16384, 32768):           # (8K: 6.8 + 0.81 + 0.95 is more than there is)
+            # (8K: 6.8 + 0.95 fits; 16K and 32K: 7.6 / 7.9 in F16 rows + 0.95 is more than there is)
+            for ctx, want in ((8192, "512"), (16384, "256"), (32768, "256")):
                 new = M.apply(wide, {**M.settings_of(wide), "context": ctx})   # (the page sends all it shows)
-                self.assertEqual((M.flag(new["args"], "--max-context"), chunk(new), by_hand(new)), (str(ctx), "256", None))
-                fit = M.hy4_refit(new)                 # ... and the largest picture's room is there
-                self.assertEqual((fit["vision"], fit["vision_small"], fit["chunk"]), (True, False, 256), ctx)
+                self.assertEqual((M.flag(new["args"], "--max-context"), chunk(new), by_hand(new)), (str(ctx), want, None))
+                fit = M.hy4_refit(new)                 # ... and the largest picture is read either way
+                self.assertEqual((fit["vision"], fit["vision_small"], fit["chunk"]), (True, False, int(want)), ctx)
                 self.assertNotIn("--kv", new["args"])
             at32 = M.apply(wide, {"context": 32768})
-            self.assertEqual(M.hy4_refit(at32)["kv"], "q8")
+            self.assertEqual(M.hy4_refit(at32)["kv"], "f16")   # (no 8-bit rows for a picture's sake)
             # back at 4K: the larger chunk again, as the setup writes it there
             self.assertEqual(chunk(M.apply(at32, {"context": 4096})), "512")
-            # pictures switched off: the room is the chunk's (the setup's --no-vision)
+            # pictures on or off: the same chunk (they take no VRAM of their own)
             self.assertEqual(chunk(M.apply(at32, {"context": 8192, "images": False})), "512")
-            self.assertEqual(chunk(M.apply(at32, {"context": 8192})), "256")
+            self.assertEqual(chunk(M.apply(at32, {"context": 8192})), "512")
+            self.assertEqual(chunk(M.apply(at32, {"context": 16384, "images": False})), "256")
             # another VRAM kept free than the layout's: the sums are not for it - the layout's own chunk
             self.assertEqual(chunk(M.apply(at32, {"context": 4096, "reserve_gb": 0.25})), "256")
             # a chunk set by hand stays: one that is not the layout's ...
@@ -453,17 +746,17 @@ class Settings(unittest.TestCase):
                 self.assertEqual((chunk(new), by_hand(new)), ("512", True), ctx)
             with self.assertRaisesRegex(ValueError, r"at 65536 tokens; this card has 8\.5 GB for them"):
                 M.apply(mine, {"context": 65536})      # (what fits is counted with the chunk that stays)
-            both = M.apply(at32, {"context": 8192, "prefill_chunk": 512})   # (changed with the context: the user's)
+            both = M.apply(at32, {"context": 16384, "prefill_chunk": 512})  # (changed with the context: the user's)
             self.assertEqual((chunk(both), by_hand(both)), ("512", True))
             # put back to the layout's choice by its user: the layout's again
             back = M.apply(mine, {"prefill_chunk": 256})
             self.assertEqual((chunk(back), by_hand(back)), ("256", None))
             self.assertEqual(chunk(M.apply(back, {"context": 4096})), "512")
         tight = cfg_with(4096, 512)
-        with cards(8.4):                               # 7.4 GB: at 32K the room left is a smaller picture's
+        with cards(8.4):                               # 7.4 GB: 32K in 8-bit rows - the largest picture all the same
             new = M.apply(tight, {"context": 32768})
             fit = M.hy4_refit(new)
-            self.assertEqual((chunk(new), fit["kv"], fit["vision"], fit["vision_small"]), ("256", "q8", True, True))
+            self.assertEqual((chunk(new), fit["kv"], fit["vision"], fit["vision_small"]), ("256", "q8", True, False))
             # the page's Reset (what the setup wrote, its chunk with its context): not a chunk set by hand
             new["installer"]["as_set_up"] = M.settings_of(tight)
             reset = M.apply(new, new["installer"]["as_set_up"])
@@ -521,6 +814,47 @@ class Settings(unittest.TestCase):
         finally:
             M._gpu_cache.clear()
             M._hy4_used_cache.clear()
+
+    def test_hy4_page_offers_the_streamed_contexts_the_setup_offers(self):
+        """KV streaming (maya-hy4 --kv-streaming auto): with this PC's RAM read, the Models page offers the longer
+        contexts the setup's hy4_fit offers - those the VRAM holds only with the global layers' older rows in RAM -
+        and a config moved to one gets --kv-streaming auto; one that fits without it, or a config with streaming off
+        by hand, is as before."""
+        import maya
+        p = hy4_cfg(self.d)
+        c = json.loads(p.read_text())
+        c.update(args=["--pack", M.flag(c["args"], "--pack"), "--max-context", "16384", "--chunk", "256",
+                       "--reserve-gb", "0.5", "--vram-experts", "0"], gpu=[0])
+        c["installer"]["layout"] = "8gb"
+        p.write_text(json.dumps(c, indent=1))
+        small = M.read(p)
+        xs = maya.hy4_quant_table("maya-xs")
+        card = [{"index": 0, "vram_gb": 8.0}]
+        with mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "x", "vram_gb": 8.0}]):
+            before = M.hy4_room(small)["contexts"]
+            with mock.patch.object(M, "hy4_ram_gb", return_value=64.0):
+                fit = maya.hy4_fit(xs, card, used={0: 1024}, layout="8gb", ram_gb=64.0)
+                room = M.hy4_room(small)
+                self.assertEqual(room["contexts"], fit["contexts"])
+                self.assertGreater(len(fit["streamed"]), 0)
+                self.assertEqual([x for x in room["contexts"] if x not in fit["streamed"]], before)
+                longest = max(fit["streamed"])
+                a = M.apply(small, {"context": longest})["args"]
+                self.assertEqual((M.flag(a, "--max-context"), M.flag(a, "--kv-streaming")), (str(longest), "auto"))
+                self.assertIsNone(M.flag(M.apply(small, {"context": max(before)})["args"], "--kv-streaming"))
+                # (the page's Context size line: RAM a token and the positions in VRAM at the streamed contexts)
+                row = M.listing(self.d, None)["models"][0]
+                self.assertEqual(sorted(int(x) for x in row["kv_streamed"]), fit["streamed"])
+                self.assertIn(row["kv_streamed"][str(longest)]["ram"], (13 * 1152, 13 * 672))
+                self.assertGreaterEqual(row["kv_streamed"][str(longest)]["win"], 256)
+                with self.assertRaisesRegex(ValueError, f"the largest that fits is {longest}"):
+                    M.apply(small, {"context": 1048576})          # (1M: the pooled keys alone do not fit 8 GB)
+                off = dict(small, args=small["args"] + ["--kv-streaming", "off"])
+                self.assertEqual(M.hy4_room(off)["contexts"], before)
+                with self.assertRaisesRegex(ValueError, f"the largest that fits is {max(before)}"):
+                    M.apply(off, {"context": longest})
+            with mock.patch.object(M, "hy4_ram_gb", return_value=16.0):   # (a small RAM: no room for the rows)
+                self.assertEqual(M.hy4_room(small)["contexts"], before)
 
     def test_hy4_page_reads_the_vram_in_use_as_the_setup_does(self):
         """The Models page offers the contexts the setup offers: the cards' VRAM in use is the setup's own reading
@@ -593,6 +927,65 @@ class Settings(unittest.TestCase):
             M._hy4_used_cache.clear()
             M._HY4_BEFORE.clear()
             self.used.start()
+
+    def test_hy4_page_counts_the_vram_windows_gives_the_engine(self):
+        """Windows keeps part of every card from the programs on it: the setup measured what the engine's CUDA gets
+        (maya.py's hy4_engine_room, kept in the config with the card's VRAM) and the page counts no more than that -
+        on the card it was measured on; a config without it, or another card now: as before."""
+        import maya
+        p = hy4_cfg(self.d)
+        c = json.loads(p.read_text())
+        c.update(args=["--pack", M.flag(c["args"], "--pack"), "--max-context", "8192", "--chunk", "256",
+                       "--reserve-gb", "0.5", "--vram-experts", "0", "--dfly2"], gpu=[0])
+        c["installer"].update(layout="8gb", hy4_quant="maya-xs", engine_room_gb={"0": [7.48, 8.0]})
+        p.write_text(json.dumps(c, indent=1))
+        cfg = M.read(p)
+        for vram, usable in ((8.0, 7.48), (12.0, 12.0 - 76 / 1024)):    # (76 MiB in use, nvidia-smi's reading)
+            with mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "x", "vram_gb": vram}]), \
+                    mock.patch.object(M, "hy4_used", side_effect=lambda gpus: {i: 76 for i in gpus}):
+                self.assertAlmostEqual(M.hy4_room(cfg)["usable"], usable)
+                self.assertEqual(M.hy4_cards(cfg, M.machine_gpus())[0].get("engine_room_gb"),
+                                 7.48 if vram == 8.0 else None)
+                fit = M.hy4_refit(cfg)
+                self.assertAlmostEqual(fit["usable"], usable)
+        self.assertEqual(M.hy4_cards({"installer": {"engine_room_gb": {"0": "x", "a": [1, 2]}}},
+                                     [{"index": 0, "vram_gb": 8.0}]), {0: {"index": 0, "vram_gb": 8.0}})
+        self.assertEqual(maya.hy4_usable_gib([{"index": 0, "vram_gb": 8.0}], {0: 1024}), 7.0)
+
+    def test_hy4_page_counts_the_share_the_engine_measured(self):
+        """The setup kept CUDA's reading beside the room (its first guess for CUDA's own share): once the engine has
+        measured the share on that card (maya.py's HY4_ROOM_STORE, this PC, card and driver), the page counts the
+        reading with it, as the next setup does; no record, or a config without the reading: the setup's figure."""
+        import maya
+        cfg = {"installer": {"engine_room_gb": {"0": [7.537, 8.0, 7.037]}}}
+        gl = [{"index": 0, "name": "x", "vram_gb": 8.0}]
+        M._gpu_cache.pop("room_own", None)
+        self.addCleanup(M._gpu_cache.pop, "room_own", None)
+        for own, room in (({0: 0.42}, 7.457), ({}, 7.537)):
+            with mock.patch.object(M, "hy4_room_own", return_value=own):
+                self.assertAlmostEqual(M.hy4_cards(cfg, gl)[0]["engine_room_gb"], room)
+        with mock.patch.object(M, "hy4_room_own", side_effect=AssertionError("not asked")):
+            self.assertAlmostEqual(M.hy4_cards({"installer": {"engine_room_gb": {"0": [7.48, 8.0]}}}, gl)[0]
+                                   ["engine_room_gb"], 7.48)
+        # the record for this PC's card and driver, by the setup's own key (setup.py's list: its PCI id and driver)
+        raw = [{"index": 0, "name": "x", "vram_gb": 8.0, "pci": "00000000:01:00.0", "driver": "610.88"}]
+        with mock.patch.object(maya, "hy4_room_load", return_value={maya.hy4_room_key(raw[0]): {"own_gib": 0.42}}), \
+                mock.patch.object(maya.S, "gpus", return_value=raw):
+            self.assertEqual(M.hy4_room_own(), {0: 0.42})
+            M._gpu_cache.pop("room_own", None)
+            with mock.patch.object(maya.S, "gpus", return_value=[dict(raw[0], driver="615.10")]):
+                self.assertEqual(M.hy4_room_own(), {})
+        # the server's start: the card to measure, and the figure said once kept
+        with mock.patch.object(maya, "hy4_room_due", return_value={"index": 0}):
+            self.assertEqual(M.hy4_room_due({}), {"index": 0})
+        with mock.patch.object(maya, "hy4_room_due", side_effect=OSError("no driver")):
+            self.assertIsNone(M.hy4_room_due({}))
+        with mock.patch.object(maya, "hy4_room_measure", return_value={"own_gib": 0.42}), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(M.hy4_room_measured({}, {"name": "RTX"}, {}), {"own_gib": 0.42})
+        self.assertIn("0.42 GB", out.getvalue())
+        with mock.patch.object(maya, "hy4_room_measure", side_effect=ValueError):
+            self.assertIsNone(M.hy4_room_measured({}, {}, {}))
 
     def test_hy4_contexts_that_fit(self):
         """Hy4-Flash's context on the Models page: only what fits the config's cards by its layout's plan, as the
@@ -770,6 +1163,32 @@ class Settings(unittest.TestCase):
                "installer": {"family": "qwen", "quant": "CYBER-FROST-3.8-PS", "qwen_quant": "q5_k_m"}}
         self.assertEqual(M.quant_label(cfg, Path("maya-cyber-frost.json")), "Q5_K_M")
         self.assertEqual(M.maya_quants.config_label(cfg), "Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M")
+
+
+class PageValidity(unittest.TestCase):
+    """The Models page's own check of a draft (serve/web/models.js badField), run with node where it is installed."""
+
+    def test_tp_auto_is_a_valid_value(self):       # #1249: "Save and restart" stayed disabled for Hy4-Flash
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        import re
+        src = (ROOT / "serve/web/models.js").read_text(encoding="utf-8")
+        parts = [re.search(pat, src, re.S).group(0) for pat in (
+            r"const NUMS = \[.*?\];", r"const DECS = \[.*?\];", r"const whole = [^\n]*;",
+            r"const decimal = [^\n]*;", r"function badField\(k, v\) \{.*?\n\}")]
+        script = "\n".join(parts) + """
+const r = {auto: badField("tp", "auto"), two: badField("tp", "2"), empty: badField("tp", ""), zero: badField("tp", 0),
+  word: badField("tp", "fast"), ctxAuto: badField("context", "auto"), other: badField("prefill_chunk", "x"),
+  dec: badField("reserve_gb", "1.5"), decBad: badField("reserve_gb", "a")};
+console.log(JSON.stringify(r));"""
+        out = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"auto": False, "two": False, "empty": False, "zero": False,
+                                                  "word": True, "ctxAuto": True, "other": True,
+                                                  "dec": False, "decBad": True})
 
 
 class Served(unittest.TestCase):
@@ -1349,6 +1768,30 @@ class Ablate(unittest.TestCase):
         self.assertFalse(M.choices(cfg)["ablate"]["available"])
         self.assertEqual(M.choices(cfg)["ablate"]["why"], "not available for this model")
         self.assertNotIn("--ablate", M.ablate_args(cfg, list(cfg["args"])))
+
+    def test_ik2_loads_it(self):
+        """Inkling-2-Mini (maya-ik2): the switch with its direction file, loaded off by default, as the other engines."""
+        d = self.d / "models" / "Inkling-2-Mini"
+        (d / "maya-ik2" / "tokenizer").mkdir(parents=True)
+        (d / "Inkling-2-Mini-UD-Q4_K_XL.gguf").write_bytes(b"x" * 1000)
+        cfg = {"exe": "/b/maya-ik2", "args": ["--model", str(d / "Inkling-2-Mini-UD-Q4_K_XL.gguf"), "--max-context", "262144"],
+               "tokenizer": str(d / "maya-ik2" / "tokenizer"), "model_name": "inkling-2-mini", "gpu": [0],
+               "env": {"IK2_KV": "fp8"}, "installer": {"family": "ik2", "ik2_quant": "ud-q4_k_xl"}}
+        self.assertFalse(M.choices(cfg)["ablate"]["available"])
+        self.assertIn("no refusal direction", M.choices(cfg)["ablate"]["why"])
+        f = self.d / ("Inkling-2-Mini" + M.ABLATE_SUFFIX)
+        f.write_bytes(b"GGUF")
+        cfg["ablate"] = {"file": str(f), "model": "Inkling-2-Mini"}
+        self.assertTrue(M.choices(cfg)["ablate"]["available"])
+        cfg["args"] = M.ablate_args(cfg, list(cfg["args"]))
+        self.assertEqual(M.flag(cfg["args"], "--ablate"), str(f))
+        self.assertEqual(M.flag(cfg["args"], "--ablate-default"), "off")
+        self.assertEqual(M.flag(cfg["args"], "--model"), str(d / "Inkling-2-Mini-UD-Q4_K_XL.gguf"))
+        on = M.apply(cfg, {"ablate": True})
+        self.assertTrue(on["ablate"]["default"])
+        self.assertTrue(M.settings_of(on)["ablate"])
+        self.assertEqual(M.flag(on["args"], "--ablate-default"), "off")   # (the engine's flag stays: each request asks)
+        self.assertFalse(M.settings_of(M.apply(on, {"ablate": False}))["ablate"])
 
     def test_qwen_greyed_out(self):
         cfg = M.read(glm_cfg(self.d))

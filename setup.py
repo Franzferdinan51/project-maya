@@ -127,6 +127,114 @@ def run(cmd, cwd=None, env=None, check=True, quiet=False, echo=True):
     return r
 
 
+def full_build_output() -> bool:
+    """MAYA_BUILD_OUTPUT=full (or --full-build-output): every line of a compile on the screen, as before v1.1.78."""
+    return os.environ.get("MAYA_BUILD_OUTPUT", "").strip().lower() in ("full", "all", "1")
+
+
+def clock(seconds: float) -> str:
+    seconds = int(seconds)
+    return f"{seconds // 60}:{seconds % 60:02d} min" if seconds >= 60 else f"{seconds} s"
+
+
+class BuildLog:
+    """One compile step of the setup (CMake's configure and its build): ONE line that rewrites itself - what is being
+    built, files done of all, time so far - while every line the tools print goes to a log file in the install
+    folder.  When the step stops, the log's last lines and its path are printed."""
+    COUNT = re.compile(r"^\[\s*(\d+)\s*/\s*(\d+)\]")      # ninja's [12/208]
+    PERCENT = re.compile(r"^\[\s*(\d+)%\]")                # make's [ 12%]
+    TAIL = 30
+
+    def __init__(self, path: Path, what: str):
+        from collections import deque
+        self.path, self.what = Path(path), what
+        self.file = open(self.path, "w", encoding="utf-8", errors="replace", buffering=1)
+        self.tail = deque(maxlen=self.TAIL)
+        self.t0 = time.time()
+        self.done = self.total = 0
+        self.frac = None
+        self.shown = 0.0
+        # a terminal's line rewrites itself each second; a file or a pipe gets a line a minute (and the last one)
+        self.live = UI is not None or sys.stdout.isatty()
+
+    def line(self, text: str) -> None:
+        self.file.write(text + "\n")
+        if text.strip():
+            self.tail.append(text)
+        m = self.COUNT.match(text)
+        if m and int(m.group(2)) > 0:
+            self.done, self.total = int(m.group(1)), int(m.group(2))
+            self.frac = self.done / self.total
+        elif (m := self.PERCENT.match(text)):
+            self.frac = int(m.group(1)) / 100
+        self.show()
+
+    def text(self) -> str:
+        if self.total:
+            at = f"{self.done} of {self.total} files ({self.frac:.0%})"
+        else:
+            at = f"{self.frac:.0%}" if self.frac is not None else "getting ready"
+        return f"{self.what}: {at}, {clock(time.time() - self.t0)}"
+
+    def show(self) -> None:
+        now = time.time()
+        if now - self.shown < (1 if self.live else 60):
+            return
+        self.shown = now
+        if self.live:
+            progress(self.text(), self.frac)
+        elif now - self.t0 >= 60:
+            say("  " + self.text())
+
+    def run(self, cmd, env=None) -> int:
+        """`cmd` with its output into the log; its exit code."""
+        cmd = [str(c) for c in cmd]
+        self.file.write("> " + " ".join(cmd) + "\n")
+        r = UI.run(cmd, env=env, sink=self.line) if UI is not None else None
+        if r is not None:
+            return r.returncode
+        import queue
+        import threading
+        lines: queue.SimpleQueue = queue.SimpleQueue()
+        with subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT) as p:
+            def read():
+                for raw in p.stdout:
+                    lines.put(raw)
+                lines.put(None)
+            threading.Thread(target=read, daemon=True).start()
+            while True:
+                try:
+                    raw = lines.get(timeout=1)
+                except queue.Empty:
+                    self.show()                        # (a long file: the time goes on)
+                    continue
+                if raw is None:
+                    break
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:             # (MSVC writes in the console's code page)
+                    text = raw.decode("oem" if os.name == "nt" else "latin-1", "replace")
+                self.line(text.rstrip("\r\n"))
+        return p.returncode
+
+    def close(self, stopped: str | None = None) -> None:
+        """The step's last line: what was compiled and where its output is - or, when it `stopped`, the log's last
+        lines and its path."""
+        self.file.close()
+        if self.live:
+            progress(None)
+        took = clock(time.time() - self.t0)
+        if stopped is None:
+            ok(f"{self.what}: " + (f"{self.total} files, " if self.total else "") + f"{took} (the compilers' output: "
+               f"{self.path})")
+            return
+        say(f"  {self.what}: stopped while {stopped} after {took} - the last lines of {self.path}:")
+        for text in self.tail:
+            say("    " + text)
+        say(f"  (all of it: {self.path}; MAYA_BUILD_OUTPUT=full shows every line as it comes)")
+
+
 def out(cmd):
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout
@@ -410,6 +518,43 @@ def _cpuid_avx2() -> bool:
         return False
 
 
+def win_simd_features() -> list:
+    """What ggml-cpu's Windows build checks (FindSIMD.cmake: AVX, AVX2 + FMA, AVX-512 F/CD/BW/DQ/VL), asked from the
+    CPU itself (CPUID + XGETBV through the stubs above) instead of by running freshly built test programs, which
+    Windows Smart App Control can block - a blocked check reads as "the CPU lacks it" and ggml-cpu is silently built
+    for AVX only.  ['avx', 'avx2', 'fma', 'f16c', 'avx512'] or a part of it; [] when the CPU cannot be asked."""
+    try:
+        def cpuid(leaf):
+            regs = (ctypes.c_uint32 * 4)()
+            _run_stub(bytes([0x53, 0x49, 0x89, 0xC8, 0x89, 0xD0, 0x31, 0xC9, 0x0F, 0xA2,
+                             0x41, 0x89, 0x00, 0x41, 0x89, 0x58, 0x04, 0x41, 0x89, 0x48, 0x08,
+                             0x41, 0x89, 0x50, 0x0C, 0x5B, 0xC3]), ctypes.addressof(regs), leaf)
+            return list(regs)
+        top = cpuid(0)[0]
+        ecx1 = cpuid(1)[2]
+        if not (ecx1 >> 27) & 1 or not (ecx1 >> 28) & 1:             # OSXSAVE, AVX
+            return []
+        xcr0 = (ctypes.c_uint32 * 2)()
+        _run_stub(bytes([0x49, 0x89, 0xC8, 0x31, 0xC9, 0x0F, 0x01, 0xD0,
+                         0x41, 0x89, 0x00, 0x41, 0x89, 0x50, 0x04, 0xC3]), ctypes.addressof(xcr0))
+        if xcr0[0] & 6 != 6:                                           # the OS saves XMM and YMM
+            return []
+        found = ["avx"]
+        ebx7 = cpuid(7)[1] if top >= 7 else 0
+        if (ebx7 >> 5) & 1:
+            found.append("avx2")
+        if (ecx1 >> 12) & 1:
+            found.append("fma")
+        if (ecx1 >> 29) & 1:
+            found.append("f16c")
+        need = (1 << 16) | (1 << 17) | (1 << 28) | (1 << 30) | (1 << 31)  # AVX-512 F, DQ, CD, BW, VL (/arch:AVX512)
+        if ebx7 & need == need and xcr0[0] & 0xE0 == 0xE0:             # and the OS saves the ZMM / mask state
+            found.append("avx512")
+        return found
+    except Exception:
+        return []
+
+
 def gpus():
     """Every NVIDIA GPU, numbered as nvidia-smi numbers them (by PCI bus, the order the engine is told to use)."""
     s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version,pci.bus_id",
@@ -484,10 +629,14 @@ def find_vcvars(cuda=True, nvcc=None):
     Given `nvcc` of CUDA 13.2 or newer - the release whose install guide first supports VS 2026's toolset - 2026
     is taken as well, but an installed older VS stays the pick: such a PC often has a CUDA 12.x toolkit next to
     the 13.2+ one, and 12.x takes only the older VS - the older one fits every toolkit the PC has.
-    ROCm's clang (the HIP build: cuda=False) takes a newer one too, 2019/2022 first."""
+    ROCm's clang (the HIP build: cuda=False) takes a newer one too, 2019/2022 first.  A standalone vswhere on PATH
+    is used when the Visual Studio Installer's copy is missing; both use the same component and version filters."""
     vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
-    if not vswhere.exists():
-        return None
+    if not vswhere.is_file():
+        located = shutil.which("vswhere.exe")
+        if not located:
+            return None
+        vswhere = Path(located)
     ranges = [["-version", "[16.0,18.0)"]]
     if not cuda or nvcc_takes_vs2026(nvcc):
         ranges.append(["-version", "[18.0,)"])
@@ -498,6 +647,47 @@ def find_vcvars(cuda=True, nvcc=None):
         if v and v.exists():
             return v
     return None
+
+
+BAD_MSVC_CUDA = ((14, 52), (13, 3))     # MSVC toolset 14.52 or newer with CUDA 13.3 or newer: nvcc's cudafe++ dies with
+                                        # 0xC0000005 (issue #992; Build Tools 18.12.0).  14.50 and 14.44 build fine.
+
+
+def msvc_toolsets(vcvars) -> list[tuple[int, int]]:
+    """The (major, minor) of each MSVC toolset installed beside that vcvars64.bat (VC/Tools/MSVC/14.44.35207 ->
+    (14, 44)), oldest first."""
+    try:
+        root = Path(vcvars).parents[2] / "Tools" / "MSVC"
+        names = [d.name for d in root.iterdir() if d.is_dir()]
+    except (OSError, IndexError):
+        return []
+    found = set()
+    for n in names:
+        m = re.match(r"(\d+)\.(\d+)\.", n)
+        if m:
+            found.add((int(m.group(1)), int(m.group(2))))
+    return sorted(found)
+
+
+def vcvars_args(vcvars, nvcc) -> tuple[str, str | None]:
+    """(what to put after the vcvars64.bat call, one line for the screen or None): vcvars64.bat takes the newest
+    MSVC toolset, and CUDA 13.3 with 14.52 or newer crashes in cudafe++ (BAD_MSVC_CUDA).  Where that pair would be
+    built, the newest toolset that is not part of it is asked for (` -vcvars_ver=14.50`); where there is none, the
+    default stays and the line names the fix.  Anything else (no nvcc, an older CUDA, an older toolset): "", None."""
+    v = nvcc_version(nvcc)
+    if v is None or v < BAD_MSVC_CUDA[1]:
+        return "", None
+    sets = msvc_toolsets(vcvars)
+    if not sets or sets[-1] < BAD_MSVC_CUDA[0]:
+        return "", None
+    good = [t for t in sets if t < BAD_MSVC_CUDA[0]]
+    bad = f"{sets[-1][0]}.{sets[-1][1]}"
+    if good:
+        t = f"{good[-1][0]}.{good[-1][1]}"
+        return f" -vcvars_ver={t}", f"MSVC {bad} crashes CUDA {v[0]}.{v[1]}'s compiler: building with the MSVC {t} toolset"
+    return "", (f"MSVC {bad} crashes CUDA {v[0]}.{v[1]}'s compiler (cudafe++ 0xC0000005) and no older toolset is "
+                "installed: in the Visual Studio Installer add the 'MSVC v143 - VS 2022 C++ x64/x86 build tools' "
+                "component (toolset 14.44), then run this again")
 
 
 # ------------------------------------------------------------------------------------------------ downloads

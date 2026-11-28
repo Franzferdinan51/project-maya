@@ -9,6 +9,8 @@ special about it. Back to the [README](../README.md).
 - [DeepSeek-V4.1-Flash-1017](#deepseek-v41-flash-1017)
 - [MiniMax-M3.1-Flash](#minimax-m31-flash)
 - [Hy4-Flash](#hy4-flash)
+- [Inkling-2-Mini](#inkling-2-mini)
+- [Inkling-2-Small (by hand, for now)](#inkling-2-small-by-hand-for-now)
 - [Community quants of GLM-5.3-Flash](#community-quants-of-glm-53-flash)
 
 ## How the quants are named
@@ -204,7 +206,7 @@ the [model card](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF).
 - **One n-gram table for every size:** Tencent's FP8 table, value for value (63.4 GB). It is downloaded once, stays
   on the SSD and is read page by page while the model answers: it does not need to fit in memory and is never loaded
   into RAM whole. Keep it on an SSD / NVMe, never a hard disk.
-- **AMD (Linux):** `./maya.sh --setup --backend hip --model hy4-flash-maya-xs`. Run by us on a Gorgon Halo (Radeon 8065S, `gfx1151`, ROCm 7.14) with the Radeon alone: Maya-XS and Maya-L with every expert in the GPU's memory, pictures, tool calls and both thinking levels. On a Strix Halo / Gorgon Halo the setup says whether the size sits in the GPU's memory whole ([MEMORY.md](MEMORY.md): 64 GB - Maya-XS, 96 GB - Maya-M, 128 GB - Maya-L). Radeon cards (`gfx1100`): the engine's AMD build was contributed by [@Cass67](https://github.com/Cass67), who ran Tencent's own Q4_K_M on four RX 7900 XT; we have not run such cards ourselves. With an AMD GPU on Windows it has not been tested yet: the setup does not offer it there.
+- **AMD (Linux):** `./maya.sh --setup --backend hip --model hy4-flash-maya-xs`. Run by us on a Gorgon Halo (Radeon 8065S, `gfx1151`, ROCm 7.14) with the Radeon alone: Maya-XS and Maya-L with every expert in the GPU's memory, pictures, tool calls and both thinking levels. On a Strix Halo / Gorgon Halo the setup says whether the size sits in the GPU's memory whole ([MEMORY.md](MEMORY.md): 64 GB - Maya-XS, 96 GB - Maya-M, 128 GB - Maya-L). Radeon cards (`gfx1100`): the engine's AMD build was contributed by [@Cass67](https://github.com/Cass67), who ran Tencent's own Q4_K_M on four RX 7900 XT; we have not run such cards ourselves. With an AMD GPU on Windows it is experimental - the setup offers it and says so; we have not run it there ([AMD_MAYA.md](AMD_MAYA.md#hy4-flash-under-windows-experimental)).
 - **Memory:** RAM + VRAM of about 56-64 GB for Maya-XS (a rule of thumb: the model file plus 4-8 GB for the context).
   With less it still runs, slower ([MEMORY.md](MEMORY.md)).
 - **VRAM:** everything but the routed experts has to fit in VRAM; the experts that do not fit are computed on the CPU
@@ -229,9 +231,9 @@ the [model card](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF).
 - **Pictures:** the model's own vision tower runs in the engine (contributed by
   [@needmorevram](https://github.com/needmorevram), #1051). The setup downloads Maya's vision file with the model
   (0.8 GB, one for every size; `--no-vision` skips it). Its weights stay in the file; a picture takes up to 0.8 GB of
-  VRAM while it is read, which the engine keeps free on the main GPU. A card with less room beside the model (8 GB
-  cards) reads smaller pictures: the engine keeps what room there is and big pictures are scaled down to it (about
-  1.8 million pixels at an 8K context on an 8 GB card, 512 x 512 at 32K). Only where not even that fits are pictures
+  VRAM while it is read, lent by the engine's prompt buffers (idle while a picture is read): no VRAM is kept for
+  pictures, so every card that runs the model reads them at full size, 8 GB cards included, and the VRAM goes to the
+  model. Only where the tower does not load are pictures
   off: the setup says so, text works as before, a picture sent is refused in plain words and a picture in a tool
   result becomes a short note. Pictures up to 2048 x 2048 pixels (larger ones are scaled down), a square one 4,160 tokens of the context. Pictures only, no videos. Images on the Models page
   turns them on or off.
@@ -249,7 +251,7 @@ the [model card](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF).
 Not available for Hy4-Flash yet (the dashboard offers no switch for them):
 
 - **Several requests at once:** no `--parallel`; one request at a time for now.
-- **AMD and Mac:** NVIDIA only.
+- **Mac:** no Mac engine yet (it runs on NVIDIA, and on AMD under Linux: see above).
 
 ### Tencent's own Q4_K_M (AngelSlim), with drafting
 
@@ -283,7 +285,7 @@ without pictures.
   are the two levels offered - a request for another level runs at High. Chat, thinking and tool calls through Maya's
   OpenAI-compatible server.
 - **Pictures:** the model's own vision tower runs in the engine on the main GPU (its weights stay in RAM; a picture
-  takes up to 0.8 GB there while it is read, kept free for it). Pictures up to 2048 x 2048 pixels (larger ones are
+  takes up to 0.8 GB there while it is read, lent by the prompt buffers - none kept for pictures). Pictures up to 2048 x 2048 pixels (larger ones are
   scaled down), a square one 4,160 tokens of the context; 1024 x 768 is read in about 0.25 s, the largest in about
   5 s on an RTX 3090. Pictures only, no videos. Images on the Models page turns them off.
 - **The pack:** `python tools/hy4/pack_gguf.py --model <folder>` indexes the GGUF set and the vision tower's file
@@ -293,6 +295,53 @@ Other GGUF sets of the model are not offered by the setup; `tools/hy4/pack_gguf.
 ([SETTINGS.md](SETTINGS.md#hy4-flash)).
 
 Its engine settings: [SETTINGS.md](SETTINGS.md#hy4-flash).
+
+## Inkling-2-Mini
+
+**[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** (thinkingmachines; 26 B, a looped model:
+layers 6-17 run three times, 8 of 128 experts a token; Apache 2.0) runs on its own engine, `maya-ik2`, from Maya's own
+GGUF, Maya-L: `maya.py --setup --model inkling-2-mini`, or the Models page's list. An install of unsloth's UD-Q4_K_XL
+(the setup's file before v1.1.82) keeps it - a setup again checks it and downloads nothing; `--model
+inkling-2-mini-maya-l` switches it to Maya-L, `--model inkling-2-mini-ud-q4_k_xl` sets up unsloth's file by name.
+
+| Files | Size | Runs on |
+| --- | ---: | --- |
+| [Maya-L](https://huggingface.co/peasantsmith/Inkling-2-Mini-Maya-GGUF) (`Maya-L/Inkling-2-Mini-Maya-L-NVFP4.gguf`; NVFP4 experts in layers 0-19, their original bits, Q8_0 elsewhere; made from the original model) | 17.6 GB | NVIDIA V100 / RTX 20 and newer, or AMD RDNA 3 / 3.5 / 4 (Radeon RX 7000 / 9000, Ryzen AI Max); NVIDIA on Linux and Windows, AMD on Linux; NVIDIA with 8 GB of VRAM or more (experts that do not fit stay in RAM: about 13 GB of RAM with an 8 GB card), AMD with 12 GB or more (the same: experts that do not fit stay in RAM) or a Halo / APU with 24 GB (every expert in memory) |
+| [unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (the same layout; the setup's file before v1.1.82) | 17.6 GB | the same |
+
+- **Where it runs:** the whole model sits on one GPU, or two on Linux. The setup says so in one line and stops on a Mac, an AMD GPU on Windows,
+  two GPUs on Windows, three GPUs or more, NVIDIA cards older than V100 / RTX 20, AMD GPUs older than RDNA 3, NVIDIA GPUs under 8 GB and AMD GPUs under 12 GB.
+- **AMD (`--backend hip`):** run by Maya's team on a Radeon 8065S (Gorgon Halo, Linux); Radeon RX 7000 / 9000 cards
+  build the same engine but have not been run here yet - tell us how it goes.
+- **Context:** up to 256K (the setup offers 32K to 256K and recommends the largest that keeps every expert in VRAM on
+  the card); the cache in FP8 by default (F16 on the Models page).
+- **Drafting:** on by default where it runs (NVIDIA RTX 30 and newer with every expert in VRAM, and AMD) - the setup
+  fetches the model's own drafter from Maya's repo (`dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB;
+  `--drafting off` skips it). The model checks every
+  drafted token, so the answers are the same with drafting or without.
+- **Thinking and tools:** thinkingmachines' own template; its effort levels Off, Low, Medium, High (its default) and
+  Max. Tool calls through Maya's OpenAI-compatible server.
+- **Pictures:** on by default - the setup fetches the model's vision tower (`mmproj-Inkling-2-Mini-BF16.gguf`, 0.6 GB, from Maya's repo - unsloth's file byte for byte, a copy you already have is kept; `--no-vision` skips it) and builds Maya's image encoder; the encoder starts only when a picture arrives
+  (on the GPU where its free VRAM holds it, else on the CPU), so the context's fit is the same. Images on the Models
+  page turns them off and on.
+- **Refusal ablation:** as on the other models - the setup fetches the model's direction file from Maya's repo
+  (`Inkling-2-Mini-refusal-direction.gguf`, a few KB, `refusal-directions/`; `--ablation off` skips it), loaded and off
+  by default; the Models page's **Refusal ablation** switch and a request's `"ablate": true` turn it on
+  ([docs/SETTINGS.md](SETTINGS.md#refusal-ablation-per-request-ablate)). Drafting stays exact with it on.
+- One request at a time for now.
+
+## Inkling-2-Small (by hand, for now)
+
+**[Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small)** (thinkingmachines; 594 B, ~17 B active,
+Apache 2.0) runs on its own engine, `maya-ik2` (#974), from unsloth's GGUFs as they are - not from the setup yet: a
+tokenizer folder and a run config by hand, then `serve/server.py` ([INKLING2.md](INKLING2.md) section 6).
+
+| Files | Size | Runs on |
+| --- | --- | --- |
+| [unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Inkling-2-Small-GGUF) (NVFP4 experts, layers 0-39) | 330 GiB; the experts ~323 GiB of pinned RAM | NVIDIA, Ampere on (CUDA), Linux; one or two GPUs. Run on H200 (35 tok/s) and RTX PRO 6000 (22; two: 42) |
+| unsloth's UD-Q3_K_XL (IQ3_XXS / IQ4_XS experts) | 266 GiB; ~260 GiB of pinned RAM | the same; H200: 44.6 tok/s |
+
+Text only, one request at a time. Its engine settings: [SETTINGS.md](SETTINGS.md#inkling-2-small).
 
 ## Community quants of GLM-5.3-Flash
 

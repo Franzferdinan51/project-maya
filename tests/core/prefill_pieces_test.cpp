@@ -3,9 +3,9 @@
 // a pipelined read - every part idle in a gap, every chunk read once in order by every part, no deadlock; prefill_chunks
 // (MAYA_GLM_PREFILL_MIN_CHUNKS): the chunks a call is cut into - as before when off, the floor's count when on.  CPU
 // only.
-#include "strata/core/prefill_chunks.hpp"
-#include "strata/core/prefill_gaps.hpp"
-#include "strata/core/prefill_pieces.hpp"
+#include "maya/core/prefill_chunks.hpp"
+#include "maya/core/prefill_gaps.hpp"
+#include "maya/core/prefill_pieces.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -29,7 +29,7 @@ std::vector<size_t> walk(size_t from, size_t end, const std::vector<size_t>& mar
     size_t at = from, mi = 0;
     while (at < end) {
         const size_t seg = mi < marks.size() ? marks[mi] : end;
-        const size_t e = strata::core::prefill_piece_end(at, seg, piece);
+        const size_t e = maya::core::prefill_piece_end(at, seg, piece);
         out.push_back(e);
         if (e == seg && mi < marks.size()) ++mi;
         at = e;
@@ -43,7 +43,7 @@ bool pipeline(int np, int nc, long long gaps, int* n_gaps) {
     std::mutex mu;
     std::condition_variable cv;
     std::vector<int> produced((size_t) np, 0), consumed((size_t) np, 0);
-    strata::core::PipelineGaps G(np, nc);
+    maya::core::PipelineGaps G(np, nc);
     std::atomic<int> busy{0};
     std::atomic<bool> bad{false};
     std::vector<std::vector<int>> order((size_t) np);
@@ -109,7 +109,48 @@ bool pipeline(int np, int nc, long long gaps, int* n_gaps) {
 }  // namespace
 
 int main() {
-    using strata::core::prefill_piece_end;
+    using maya::core::prefill_piece_end;
+    {
+        using maya::core::prefill_pool_fit;
+        using maya::core::prefill_pool_loan;
+        static constexpr size_t MiB = size_t{1} << 20;
+        // #1184: the non-ring layout needs 1499 MiB at 1280 and 1292 MiB at 1024. The measured pool lends
+        // three 484-MiB rows, keeping 13 of its 16 slots per layer. Model the intervening grid points by row cost.
+        const auto nonring = [](int64_t t) { return (size_t) (464 + 207 * (t / 256)) * MiB; };
+        const size_t loan = prefill_pool_loan(16, 13, 484 * MiB, 90, SIZE_MAX);
+        expect(loan == 3 * 484 * MiB, "keep the slot floor on every layer");
+        expect(prefill_pool_loan(100, 13, MiB, 20, SIZE_MAX) == 20 * MiB &&
+                   prefill_pool_loan(100, 13, MiB, 90, SIZE_MAX) == 87 * MiB &&
+                   prefill_pool_loan(100, 13, MiB, 85, SIZE_MAX) == 85 * MiB,
+               "both the configured percentage and the later 85% use the measured row count");
+        expect(prefill_pool_loan(100, 13, MiB, 20, 40 * MiB) == 40 * MiB &&
+                   prefill_pool_loan(100, 13, MiB, 20, 120 * MiB) == 87 * MiB,
+               "an explicit MiB cap overrides the percentage and still preserves the pool floor");
+        const auto fit = prefill_pool_fit(1280, 20, 16 * MiB, loan, true, nonring);
+        expect(fit.chunk == 1024 && fit.prestage == 0 && fit.bytes == 1292 * MiB,
+               "measured expert pool: 1280 -> 1024 on Auto's grid");
+        expect(prefill_pool_fit(1280, 20, 16 * MiB, loan, false, nonring).chunk == 0,
+               "a fixed chunk does not retry a different length");
+        const auto trim = prefill_pool_fit(1280, 20, 16 * MiB, nonring(1280) + 17 * 16 * MiB, false, nonring);
+        expect(trim.chunk == 1280 && trim.prestage == 17 && trim.bytes == nonring(1280) + 17 * 16 * MiB,
+               "trim the ring at the original chunk when that is enough");
+        const auto enough = prefill_pool_fit(1280, 20, 16 * MiB, nonring(1280) + 24 * 16 * MiB, true, nonring);
+        expect(enough.chunk == 1280 && enough.prestage == 20, "never grow the ring beyond its allocated events");
+
+        // A resident KV cache can leave exactly the 512-token loan priced by the split search. 1024 costs
+        // 1092 MiB in the second report; other sizes here are a synthetic layout with fixed and per-token costs.
+        const auto resident = [](int64_t t) { return (size_t) (508 + 146 * (t / 256)) * MiB; };
+        const auto small = prefill_pool_fit(1024, 32, MiB, resident(512), true, resident);
+        expect(small.chunk == 512 && small.prestage == 0 && small.bytes == resident(512),
+               "use the 512-token chunk priced for resident KV even when Auto prepared 1024");
+        expect(prefill_pool_fit(1024, 0, MiB, resident(256), true, resident).chunk == 256 &&
+                   prefill_pool_fit(1024, 0, MiB, resident(256) - 1, true, resident).chunk == 0 &&
+                   prefill_pool_fit(1024, 0, MiB, 0, true, resident).chunk == 0,
+               "exactly the minimum chunk fits; one byte less or no tail selects the token path");
+        const auto aligned = prefill_pool_fit(1024, 20, 272, 1024 + 17 * 272, true, [](int64_t) { return size_t{1024}; });
+        expect(aligned.prestage == 16 && aligned.bytes == 1024 + 16 * 272,
+               "a partial 256-byte carve block cannot hold another prestage slot");
+    }
     // off: the whole segment
     expect(prefill_piece_end(0, 10000, 0) == 10000, "off: one call");
     expect(prefill_piece_end(100, 1000, 2048) == 1000, "shorter than a piece: one call");
@@ -138,7 +179,7 @@ int main() {
         expect(off == std::vector<size_t>({3000, 20000, 30001}), "walk off: the marks and the end, as before");
     }
     // the setting
-    using strata::core::prefill_interleave_parse;
+    using maya::core::prefill_interleave_parse;
     expect(prefill_interleave_parse(nullptr).tokens == 0, "unset: off");
     expect(prefill_interleave_parse("0").tokens == 0, "0: off");
     expect(prefill_interleave_parse("2048").tokens == 2048 && prefill_interleave_parse("2048").rounds == 1,
@@ -146,23 +187,23 @@ int main() {
     expect(prefill_interleave_parse("1024,4").rounds == 4, "1024,4: four rounds");
     expect(prefill_interleave_parse("16").tokens == 256, "a piece is 256 at least");
     expect(prefill_interleave_parse("2048").exact && !prefill_interleave_parse("2048,1,cut").exact, "exact unless ,cut");
-    using strata::core::prefill_aligned_piece;
+    using maya::core::prefill_aligned_piece;
     expect(prefill_aligned_piece(2048, 8128) == 8128, "exact: one whole chunk at least");
     expect(prefill_aligned_piece(16384, 8128) == 16256, "exact: two chunks");
     expect(prefill_aligned_piece(2048, 0) == 2048, "no chunk: as asked");
     // the decode gaps' setting
-    using strata::core::prefill_gaps_parse;
+    using maya::core::prefill_gaps_parse;
     expect(prefill_gaps_parse(nullptr).percent == 0 && prefill_gaps_parse("0").percent == 0, "gaps unset / 0: off");
     expect(prefill_gaps_parse("25").percent == 25 && prefill_gaps_parse("25").max_ms == 4000.0, "gaps 25");
     expect(prefill_gaps_parse("95").percent == 90, "gaps: 90% at most");
     expect(prefill_gaps_parse("20,1500").max_ms == 1500.0, "gaps: the longest gap");
-    using strata::core::prefill_gap_budget_ms;
+    using maya::core::prefill_gap_budget_ms;
     expect(prefill_gap_budget_ms(prefill_gaps_parse("20"), 2800.0) == 700.0, "a 20% gap after a 2.8 s stage: 0.7 s");
     expect(prefill_gap_budget_ms(prefill_gaps_parse("50,1000"), 2800.0) == 1000.0, "the cap");
     expect(prefill_gap_budget_ms(prefill_gaps_parse("0"), 2800.0) == 0.0, "off: none");
     // the gaps' gate: part k starts chunk c after boundary c + k - 1, none past the last
     {
-        strata::core::PipelineGaps G(2, 4);
+        maya::core::PipelineGaps G(2, 4);
         expect(G.may_start(1, 0) == false && G.all_idle(0), "boundary 0: part 1 waits, nothing to wait for");
         G.released = 0;
         expect(G.may_start(1, 0) && !G.may_start(1, 1) && !G.all_idle(1), "after boundary 0: chunk 0 only");
@@ -183,7 +224,7 @@ int main() {
     }
     // the chunks a call is cut into (MAYA_GLM_PREFILL_MIN_CHUNKS)
     {
-        using namespace strata::core;
+        using namespace maya::core;
         expect(prefill_min_chunks_parse(nullptr).n == 1 && prefill_min_chunks_parse("1").n == 1 &&
                    prefill_min_chunks_parse("0").n == 1,
                "min chunks unset / 0 / 1: off");

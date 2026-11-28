@@ -19,7 +19,7 @@
 #include <cstring>
 #endif
 
-namespace strata::ds4::par {
+namespace maya::ds4::par {
 
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
 DS4_PAR_HD float p_fma(float a, float b, float c) { return __fmaf_rn(a, b, c); }
@@ -75,11 +75,25 @@ DS4_PAR_HD float exp_portable(float y) {
 
 /// DeepSeek's clamped SwiGLU (limit 0: no clamp), the device kernels' operations with exp_portable.
 DS4_PAR_HD float swiglu_portable(float gv, float uv, float limit) {
+#ifdef MAYA_LING_SWIGLU   // (maya-ling only: a negative limit = the post-SiLU clamp; every other engine takes the #else)
+    if (limit > 0.0f) {
+        gv = p_min(gv, limit);
+        uv = p_min(p_max(uv, -limit), limit);
+        return p_mul(p_div(gv, p_add(1.0f, exp_portable(-gv))), uv);
+    }
+    const float act = p_div(gv, p_add(1.0f, exp_portable(-gv)));
+    if (limit < 0.0f) {
+        const float L = -limit;
+        return p_mul(p_min(act, L), p_min(p_max(uv, -L), L));
+    }
+    return p_mul(act, uv);
+#else
     if (limit > 0.0f) {
         gv = p_min(gv, limit);
         uv = p_min(p_max(uv, -limit), limit);
     }
     return p_mul(p_div(gv, p_add(1.0f, exp_portable(-gv))), uv);
+#endif
 }
 
-}  // namespace strata::ds4::par
+}  // namespace maya::ds4::par

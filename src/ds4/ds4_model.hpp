@@ -22,19 +22,23 @@
 #include <utility>
 #include <vector>
 
-namespace strata::ds4 {
+namespace maya::ds4 {
 
 struct Options {
     std::string pack;                 // <model>/maya-ds4
     int64_t max_context = 32768;
     std::vector<int> gpus;            // empty: every visible GPU
     int64_t reserve_mib = 600;        // VRAM left free on each GPU
+    bool reserve_given = false;       // (--reserve-mib on the command line: held for the whole run - #1026)
     double vram_experts = 1.0;        // the share of the expert budget to use (tests: less, so the CPU lane works)
     // the CPU lane's threads: 0 a thread a physical core, or where the host offers it the performance cores or one
     // NUMA node's cores when measured faster at load; n: at most n, a thread a core
     int cpu_threads = 0;
     std::string profile;              // expert hit counts (read to place the hottest experts in VRAM, written back)
     bool profile_readonly = false;    // (--profile-readonly) the profile is read, never written back
+    // read at the load in place of `profile` while that file does not exist yet (a pack set up by hand or mounted
+    // read-only has none): the shipped data/expert-profile-ds4.bin.  What the run learns is still written to `profile`
+    std::string profile_seed;
     // (--profile-out) where save_profile() also writes what this run routed alone: the counts read at the load taken off
     std::string profile_out;
     bool expert_cache = true;         // experts move between VRAM and the CPU lane as they are used
@@ -147,6 +151,8 @@ struct Stats {
     double store_wait_ms = 0.0;
     double prof_ms[6] = {};          // DS4_PROF: the GPU's time in decode by stage (between layers, attention, routing +
     int64_t prof_tokens = 0;         // shared expert, experts' gate / up, the wait for the CPU lane, down + post)
+    double prof_dev_ms[2][6] = {};   // (the same by CUDA0 / CUDA1 apart) and the profiled steps' rows in all
+    int64_t prof_rows = 0;
     // lookahead (decode windows of one): the picks of layers guessed a layer before (the next layer's gate on this
     // layer's FFN input), of them in the guess's top k / in all its guesses / in the guess two layers before; the picks
     // read from the files, of them prefetched early; experts prefetched early
@@ -278,7 +284,8 @@ public:
     void set_cancel(std::function<bool()> f);
     bool cancelled() const;   // the last feed() / feed_mark() ended early on a Stop
     /// After a request: true when no later one can trust this process - a layer GPU took a fault inside a kernel (its
-    /// context returns that error from then on) or the prompt path's room was not handed back.  The serve loop then
+    /// context returns that error from then on), a peer all-reduce failed, or the prompt path's room was not handed back.
+    /// The serve loop then
     /// ends the engine (exit 3) once the request's DONE is out, and the server starts a fresh one for the next request.
     bool broken();
     /// Asked while a run of chunks goes through the layers: true (a yield) ends it at a chunk every GPU reaches, as a
@@ -288,6 +295,8 @@ public:
     int fed() const;   // the tokens the last feed() / feed_mark() took (all of them unless a yield)
     /// A request starts (before its prompt): DISK_SKIP_AUTO may switch back on here, never mid-answer.
     void begin_request();
+    /// (#1026) > 0: this start came out short of --reserve-mib; the next keeps this many MiB beside it (its file)
+    int reserve_short_mib() const;
     int64_t pos() const;
     int64_t max_context() const;
     int vocab() const;
@@ -425,4 +434,4 @@ private:
     std::unique_ptr<Impl> p_;
 };
 
-}  // namespace strata::ds4
+}  // namespace maya::ds4

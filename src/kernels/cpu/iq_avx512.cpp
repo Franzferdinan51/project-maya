@@ -11,7 +11,7 @@
 // Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22), IQ4_XS (23), and the K-quants Q4_K (12)
 // and Q5_K (13) (with ggml's min terms from the activations' block sums).  IQ1_M stays on ggml-cpu (no shipped model
 // has IQ1_M expert rows: the 'Coder IQ1_M' pack's gate/up are IQ2_S / IQ3_XXS / IQ3_S).
-#include "strata/kernels/cpu/iq_avx512.hpp"
+#include "maya/kernels/cpu/iq_avx512.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -24,7 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace strata::kernels::cpu {
+namespace maya::kernels::cpu {
 namespace {
 
 inline float h2f(uint16_t h) { return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) h))); }
@@ -364,14 +364,37 @@ void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n
 template <int TY>
 void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0,
                  int r1) {
-    switch (nt) {
-        case 1: dot_rows<TY, 1>(w, row_bytes, n, act, out, r0, r1); break;
-        case 2: dot_rows<TY, 2>(w, row_bytes, n, act, out, r0, r1); break;
-        case 3: dot_rows<TY, 3>(w, row_bytes, n, act, out, r0, r1); break;
-        case 4: dot_rows<TY, 4>(w, row_bytes, n, act, out, r0, r1); break;
-        default: for (int t0 = 0; t0 < nt; t0 += 4) {
+    if constexpr (TY == 12 || TY == 13) {
+        // K-quants keep extra min-term accumulators; stay at <= 4 tokens per pass.
+        for (int t0 = 0; t0 < nt; t0 += 4) {
             const int k = nt - t0 < 4 ? nt - t0 : 4;
-            dot_rows_nt<TY>(k, w, row_bytes, n, act + t0, out + t0, r0, r1);
+            switch (k) {
+                case 1: dot_rows<TY, 1>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                case 2: dot_rows<TY, 2>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                case 3: dot_rows<TY, 3>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                default: dot_rows<TY, 4>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+            }
+        }
+        return;
+    } else {
+        // Non-K i-quants amortize weight unpacking over up to 16 tokens per pass (bit-exact with NT=1..4).
+        for (int t0 = 0; t0 < nt; ) {
+            const int rem = nt - t0;
+            if (rem >= 16) { dot_rows<TY, 16>(w, row_bytes, n, act + t0, out + t0, r0, r1); t0 += 16; }
+            else if (rem >= 12) { dot_rows<TY, 12>(w, row_bytes, n, act + t0, out + t0, r0, r1); t0 += 12; }
+            else if (rem >= 8) { dot_rows<TY, 8>(w, row_bytes, n, act + t0, out + t0, r0, r1); t0 += 8; }
+            else {
+                switch (rem) {
+                    case 1: dot_rows<TY, 1>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                    case 2: dot_rows<TY, 2>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                    case 3: dot_rows<TY, 3>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                    case 4: dot_rows<TY, 4>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                    case 5: dot_rows<TY, 5>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                    case 6: dot_rows<TY, 6>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                    default: dot_rows<TY, 7>(w, row_bytes, n, act + t0, out + t0, r0, r1); break;
+                }
+                t0 += rem;
+            }
         }
     }
 }
@@ -406,4 +429,4 @@ void iq512_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
     }
 }
 
-}  // namespace strata::kernels::cpu
+}  // namespace maya::kernels::cpu

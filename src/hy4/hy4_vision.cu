@@ -11,8 +11,10 @@
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "hy4_kernels.cuh"   // (k::submit: AMD under Windows)
 #include "hy4_pack.hpp"
 
 namespace hy4 {
@@ -58,8 +60,21 @@ __device__ float block_sum(float v, float* red) {
     return s;
 }
 
-// one block a row: y16 = LayerNorm(x) (biased variance) . w + b, BF16
-__global__ void layernorm_kernel(const float* x, const float* w, const float* b, int D, float eps, bf16_t* y16) {
+__device__ __forceinline__ float clamp_f16_val(float v) {
+    return v > 65504.0f ? 65504.0f : (v < -65504.0f ? -65504.0f : v);
+}
+
+__device__ __forceinline__ uint16_t pack_act16(float v, bool fp16) {
+    if (fp16) return __half_as_ushort(__float2half_rn(clamp_f16_val(v)));
+    const bf16_t b = __float2bfloat16(v);
+    uint16_t u;
+    std::memcpy(&u, &b, 2);
+    return u;
+}
+
+// one block a row: y16 = LayerNorm(x) (biased variance) . w + b, BF16 or FP16
+__global__ void layernorm_kernel(const float* x, const float* w, const float* b, int D, float eps, uint16_t* y16,
+                                 bool fp16) {
     __shared__ float red[32];
     const float* r = x + (size_t) blockIdx.x * D;
     float s = 0.0f;
@@ -72,7 +87,7 @@ __global__ void layernorm_kernel(const float* x, const float* w, const float* b,
     }
     const float inv = rsqrtf(block_sum(q, red) / (float) D + eps);
     for (int i = threadIdx.x; i < D; i += blockDim.x)
-        y16[(size_t) blockIdx.x * D + i] = __float2bfloat16((r[i] - mean) * inv * w[i] + b[i]);
+        y16[(size_t) blockIdx.x * D + i] = pack_act16((r[i] - mean) * inv * w[i] + b[i], fp16);
 }
 
 // one block a row, in place: x = x / rms(x) . w
@@ -92,11 +107,11 @@ __global__ void add_bias_kernel(float* y, const float* bias, size_t n, int M) {
 }
 
 // y16 [n] = act(y + bias) (rows of M; act 1: tanh GELU, 2: exact GELU)
-__global__ void bias_act_kernel(const float* y, const float* bias, size_t n, int M, int act, bf16_t* y16) {
+__global__ void bias_act_kernel(const float* y, const float* bias, size_t n, int M, int act, uint16_t* y16, bool fp16) {
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
         float v = y[i] + bias[i % (size_t) M];
         v = act == 1 ? gelu_tanh(v) : act == 2 ? gelu_erf(v) : v;
-        y16[i] = __float2bfloat16(v);
+        y16[i] = pack_act16(v, fp16);
     }
 }
 
@@ -106,9 +121,16 @@ __global__ void residual_kernel(float* h, const float* t, const float* bias, siz
         h[i] += t[i] + bias[i % (size_t) M];
 }
 
-__global__ void to_bf16_kernel(const float* x, size_t n, bf16_t* y) {
+__global__ void to_bf16_kernel(const float* x, size_t n, uint16_t* y, bool fp16) {
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
-        y[i] = __float2bfloat16(x[i]);
+        y[i] = pack_act16(x[i], fp16);
+}
+
+__global__ void bf16_to_f16_inplace_kernel(uint16_t* w, size_t n) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        const float f = __uint_as_float((uint32_t) w[i] << 16);
+        w[i] = __half_as_ushort(__float2half_rn(clamp_f16_val(f)));
+    }
 }
 
 // one block a row of n: softmax in place
@@ -136,12 +158,12 @@ __global__ void softmax_kernel(float* s, int n) {
 
 // the 2 x 2 convolution's input: block b (row-major over ow x oh) -> m16 [b][ic * 4 + ky * 2 + kx] (the kernel's
 // [OC][IC][KH][KW] order), from the normed patch rows xn [gh * gw][D] (raster order)
-__global__ void merge_gather_kernel(const float* xn, int gw, int D, int ow, bf16_t* m16) {
+__global__ void merge_gather_kernel(const float* xn, int gw, int D, int ow, uint16_t* m16, bool fp16) {
     const int b = blockIdx.x, by = b / ow, bx = b % ow;
-    bf16_t* dst = m16 + (size_t) b * 4 * D;
+    uint16_t* dst = m16 + (size_t) b * 4 * D;
     for (int i = threadIdx.x; i < 4 * D; i += blockDim.x) {
         const int ic = i >> 2, ky = (i >> 1) & 1, kx = i & 1;
-        dst[i] = __float2bfloat16(xn[((size_t) (2 * by + ky) * gw + 2 * bx + kx) * D + ic]);
+        dst[i] = pack_act16(xn[((size_t) (2 * by + ky) * gw + 2 * bx + kx) * D + ic], fp16);
     }
 }
 
@@ -162,9 +184,8 @@ int blocks_for(size_t n) { return (int) std::min<size_t>((n + 255) / 256, 65535)
 size_t al(size_t n) { return (n + 255) & ~(size_t) 255; }
 
 // A layer's matrices in the file's other types (a quantized mmproj: Q8_0 blocks - an F16 scale and 32 int8 -, F16 where
-// a row is no multiple of 32) are made BF16 as a stage is gathered for its copy: the file stays the only copy in host
-// memory, the GPU's side is the same for every type.
-enum : int { kRaw = 0, kF16 = 1, kQ8 = 2 };
+// a row is no multiple of 32) are made BF16 (or FP16 when fp16=true) as a stage is gathered for its copy.
+enum : int { kRaw = 0, kF16 = 1, kQ8 = 2, kBf16 = 3 };
 
 inline float half_f32(uint16_t h) {
     const uint32_t s = (uint32_t) (h & 0x8000u) << 16, e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
@@ -197,10 +218,42 @@ inline uint16_t f32_bf16(float f) {   // (round to nearest, ties to even)
     return (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 
-// n values of src (kF16: n F16; kQ8: n / 32 blocks of 34 bytes) -> BF16
-void to_bf16_host(const uint8_t* src, int kind, size_t n, uint8_t* dst8) {
+inline uint16_t f32_f16(float f) {
+    if (std::isnan(f)) return 0x7e00u;
+    if (f > 65504.0f) f = 65504.0f;
+    else if (f < -65504.0f) f = -65504.0f;
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    const uint32_t sign = (u >> 16) & 0x8000u;
+    const uint32_t abs_u = u & 0x7fffffffu;
+    if (abs_u >= 0x477fe000u) return (uint16_t) (sign | 0x7bffu);
+    if (abs_u < 0x38800000u) {
+        if (abs_u < 0x33000000u) return (uint16_t) sign;
+        const int exp = (int) (abs_u >> 23) - 127;
+        const uint32_t mant = (abs_u & 0x7fffffu) | 0x800000u;
+        const int shift = 1 - exp + 13;
+        const uint32_t round_bit = 1u << (shift - 1);
+        const uint32_t rem = mant & ((1u << shift) - 1u);
+        uint32_t sub = mant >> shift;
+        if (rem > round_bit || (rem == round_bit && (sub & 1u))) ++sub;
+        return (uint16_t) (sign | sub);
+    }
+    const uint32_t exp16 = ((abs_u >> 23) - 112u) << 10;
+    const uint32_t mant = abs_u & 0x7fffffu;
+    uint32_t res = sign | exp16 | (mant >> 13);
+    const uint32_t rem = mant & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (res & 1u))) ++res;
+    return (uint16_t) res;
+}
+
+// n values of src (kF16: n F16; kQ8: n / 32 blocks of 34 bytes) -> BF16 (fp16=false) or FP16 (fp16=true)
+void to_16_host(const uint8_t* src, int kind, size_t n, uint8_t* dst8, bool fp16) {
     uint16_t* dst = (uint16_t*) dst8;
     if (kind == kF16) {
+        if (fp16) {
+            std::memcpy(dst8, src, n * 2);
+            return;
+        }
         for (size_t i = 0; i < n; ++i) {
             uint16_t h;
             std::memcpy(&h, src + 2 * i, 2);
@@ -215,7 +268,11 @@ void to_bf16_host(const uint8_t* src, int kind, size_t n, uint8_t* dst8) {
         const float d = half_f32(h);
         const int8_t* q = (const int8_t*) (blk + 2);
         uint16_t* o = dst + b * 32;
-        for (int j = 0; j < 32; ++j) o[j] = f32_bf16(d * (float) q[j]);
+        if (fp16) {
+            for (int j = 0; j < 32; ++j) o[j] = f32_f16(d * (float) q[j]);
+        } else {
+            for (int j = 0; j < 32; ++j) o[j] = f32_bf16(d * (float) q[j]);
+        }
     }
 }
 
@@ -262,6 +319,8 @@ struct Vision::Impl {
     std::vector<uint8_t> bounce_v[2];          // (pageable, when no pinned memory was had)
     bool pinned = false;
     size_t host_b = 0, last_b = 0;
+    bool last_lent = false;
+    bool fp16 = false;   // FP16 GEMMs on HIP GPUs without hardware BF16 BLAS (gfx906/gfx10; HY4_VISION_FP16=0|1)
     bool tf32 = std::getenv("HY4_VISION_F32") == nullptr;   // (attention's products in TF32; =1: plain F32)
 
     ~Impl() {
@@ -303,7 +362,7 @@ struct Vision::Impl {
             err = "vision: " + n + " missing (pack the model again with its mmproj file)";
             return nullptr;
         }
-        if (t->type == "BF16" && t->bytes == elems * 2) kind = kRaw;
+        if (t->type == "BF16" && t->bytes == elems * 2) kind = kBf16;
         else if (t->type == "F16" && t->bytes == elems * 2) kind = kF16;
         else if (t->type == "Q8_0" && elems % 32 == 0 && t->n(0) % 32 == 0 && t->bytes == elems / 32 * 34) kind = kQ8;
         else {
@@ -342,10 +401,11 @@ struct Vision::Impl {
         return off;
     }
 
-    // C [rows][ldc] F32 (columns [0, N) of it) = X [rows][K] BF16 . W [N][K]^T BF16
-    bool gemm(const uint8_t* W, int N, int K, const bf16_t* X, int rows, float* C, int ldc, std::string& err) {
+    // C [rows][ldc] F32 (columns [0, N) of it) = X [rows][K] BF16/FP16 . W [N][K]^T BF16/FP16
+    bool gemm(const uint8_t* W, int N, int K, const void* X, int rows, float* C, int ldc, std::string& err) {
         const float one = 1.0f, zero = 0.0f;
-        VB(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, N, rows, K, &one, W, CUDA_R_16BF, K, X, CUDA_R_16BF, K, &zero,
+        const auto dt = fp16 ? CUDA_R_16F : CUDA_R_16BF;
+        VB(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, N, rows, K, &one, W, dt, K, X, dt, K, &zero,
                         C, CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
         return true;
     }
@@ -354,6 +414,21 @@ struct Vision::Impl {
         if (!Vision::geometry(pk, g, err)) return false;
         dev = dev_;
         VK(cudaSetDevice(dev));
+        {
+            cudaDeviceProp pr{};
+            const char* fv = std::getenv("HY4_VISION_FP16");
+            bool need_fp16 = false;
+#if defined(MAYA_USE_HIP)
+            if (cudaGetDeviceProperties(&pr, dev) == cudaSuccess) {
+                need_fp16 = std::strstr(pr.gcnArchName, "gfx906") != nullptr ||
+                            std::strstr(pr.gcnArchName, "gfx10") != nullptr;
+            }
+#else
+            (void) pr;
+#endif
+            fp16 = fv != nullptr ? std::atoi(fv) != 0 : need_fp16;
+            if (need_fp16 && std::getenv("HY4_VISION_F32") == nullptr) tf32 = false;
+        }
         VK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
         VK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
         for (int b = 0; b < 2; ++b) {
@@ -441,7 +516,7 @@ struct Vision::Impl {
                 S.mat = m;
                 S.n0 = n0;
                 S.nc = std::min(rc, nn[m] - n0);
-                add(S, src + (size_t) n0 * row, (size_t) S.nc * row);
+                add(S, src + (size_t) n0 * row, (size_t) S.nc * row, true, kBf16);
                 st.push_back(std::move(S));
             }
         }
@@ -503,7 +578,9 @@ struct Vision::Impl {
         return al((D * P + 2 * D + M4 + 2 * (size_t) g.out_dim) * 4 + 6 * 256);
     }
 
-    bool encode(const uint8_t* rgb, int w, int hgt, std::vector<float>& rows, std::string& err) {
+    bool encode(const uint8_t* rgb, int w, int hgt, std::vector<float>& rows, std::string& err, uint8_t* room,
+                size_t room_b) {
+        last_lent = false;
         const int n_tok = g.tokens(w, hgt);
         if (n_tok == 0) {
             err = "vision: a picture of " + std::to_string(w) + " x " + std::to_string(hgt) +
@@ -555,7 +632,10 @@ struct Vision::Impl {
         }
         const Lay y = layout(g, (size_t) N, (size_t) (gh / g.merge), slot, pre_h.size());
         uint8_t* base = nullptr;
-        if (cudaMalloc((void**) &base, y.total) != cudaSuccess) {
+        last_lent = room != nullptr && y.total <= room_b;
+        if (last_lent) {
+            base = room;
+        } else if (cudaMalloc((void**) &base, y.total) != cudaSuccess) {
             cudaGetLastError();
             size_t fr = 0, tot = 0;
             cudaMemGetInfo(&fr, &tot);
@@ -567,7 +647,7 @@ struct Vision::Impl {
         const bool ok = run(base, y, hp, hpos, gh, gw, rows, err);
         cudaStreamSynchronize(s);
         cudaStreamSynchronize(cs);
-        cudaFree(base);
+        if (!last_lent) cudaFree(base);
         if (!ok) cudaGetLastError();
         return ok;
     }
@@ -578,7 +658,7 @@ struct Vision::Impl {
         auto fp = [&](size_t o) { return (float*) (base + o); };
         float *px = fp(y.px), *h = fp(y.h), *qkv = fp(y.qkv), *att = fp(y.att), *big = fp(y.big), *sc = fp(y.sc);
         float* out = fp(y.out);
-        bf16_t* x16 = (bf16_t*) (base + y.x16);
+        uint16_t* x16 = (uint16_t*) (base + y.x16);
         float* pre = fp(y.pre);
         auto pv = [&](size_t o) { return (float*) ((uint8_t*) pre + o); };
         VB(cublasSetWorkspace(blas, base + y.ws, kWs));
@@ -596,12 +676,21 @@ struct Vision::Impl {
             const Stage& S = st[(size_t) k];
             VK(cudaEventSynchronize(ev_up[b]));
             for (const Piece& q : S.pc) {
-                if (q.kind == kRaw) std::memcpy(bounce[b] + q.off, q.src, q.bytes);
-                else to_bf16_host(q.src, q.kind, q.bytes / 2, bounce[b] + q.off);
+                if (q.kind == kRaw || q.kind == kBf16 || (fp16 && q.kind == kF16))
+                    std::memcpy(bounce[b] + q.off, q.src, q.bytes);
+                else to_16_host(q.src, q.kind, q.bytes / 2, bounce[b] + q.off, fp16);
             }
             VK(cudaStreamWaitEvent(cs, ev_free[b], 0));
             VK(cudaMemcpyAsync(sl[b], bounce[b], S.bytes, cudaMemcpyHostToDevice, cs));
+            if (fp16) {
+                for (const Piece& q : S.pc) {
+                    if (q.kind == kBf16 && q.bytes > 0)
+                        bf16_to_f16_inplace_kernel<<<blocks_for(q.bytes / 2), 256, 0, cs>>>(
+                            (uint16_t*) (sl[b] + q.off), q.bytes / 2);
+                }
+            }
             VK(cudaEventRecord(ev_up[b], cs));
+            k::submit(cs);   // (AMD under Windows: the compute stream waits for it on the GPU)
             return true;
         };
         auto acquire = [&](int k, uint8_t*& at) -> bool {
@@ -611,6 +700,7 @@ struct Vision::Impl {
         };
         auto done = [&](int k) -> bool {
             VK(cudaEventRecord(ev_free[k & 1], s));
+            k::submit(s);   // (AMD under Windows: the next upload waits for it on the GPU, the host for that)
             return k + 2 < ns ? upload(k + 2) : true;
         };
         if (!upload(0) || (ns > 1 && !upload(1))) return false;
@@ -632,7 +722,7 @@ struct Vision::Impl {
             if (!acquire(li, sb)) return false;
             const LOff& l = lo[(size_t) li];
             auto lf = [&](size_t o) { return (float*) (sb + o); };
-            layernorm_kernel<<<N, 256, 0, s>>>(h, lf(l.ln1w), lf(l.ln1b), D, g.eps, x16);
+            layernorm_kernel<<<N, 256, 0, s>>>(h, lf(l.ln1w), lf(l.ln1b), D, g.eps, x16, fp16);
             if (!gemm(sb + l.wqkv, 3 * D, D, x16, N, qkv, 3 * D, err)) return false;
             add_bias_kernel<<<blocks_for((size_t) N * 3 * D), 256, 0, s>>>(qkv, lf(l.bqkv), (size_t) N * 3 * D, 3 * D);
             // S = scale Q K^T for nh heads x qb queries (q, k, v read in place from qkv), softmax, S V
@@ -651,16 +741,16 @@ struct Vision::Impl {
                                                   CUDA_R_32F, D, hd, nhh, ct, CUBLAS_GEMM_DEFAULT));
                 }
             }
-            to_bf16_kernel<<<blocks_for(ND), 256, 0, s>>>(att, ND, x16);
+            to_bf16_kernel<<<blocks_for(ND), 256, 0, s>>>(att, ND, x16, fp16);
             if (!gemm(sb + l.wo, D, D, x16, N, att, D, err)) return false;
             residual_kernel<<<blocks_for(ND), 256, 0, s>>>(h, att, lf(l.bo), ND, D);
             // the MLP, rc rows a pass
             for (int r0 = 0; r0 < N; r0 += rc) {
                 const int nr = std::min(rc, N - r0);
                 float* hr = h + (size_t) r0 * D;
-                layernorm_kernel<<<nr, 256, 0, s>>>(hr, lf(l.ln2w), lf(l.ln2b), D, g.eps, x16);
+                layernorm_kernel<<<nr, 256, 0, s>>>(hr, lf(l.ln2w), lf(l.ln2b), D, g.eps, x16, fp16);
                 if (!gemm(sb + l.w1, F, D, x16, nr, big, F, err)) return false;
-                bias_act_kernel<<<blocks_for((size_t) nr * F), 256, 0, s>>>(big, lf(l.b1), (size_t) nr * F, F, 1, x16);
+                bias_act_kernel<<<blocks_for((size_t) nr * F), 256, 0, s>>>(big, lf(l.b1), (size_t) nr * F, F, 1, x16, fp16);
                 if (!gemm(sb + l.w2, D, F, x16, nr, att, D, err)) return false;
                 residual_kernel<<<blocks_for((size_t) nr * D), 256, 0, s>>>(hr, att, lf(l.b2), (size_t) nr * D, D);
             }
@@ -669,7 +759,7 @@ struct Vision::Impl {
         // the projector: RMSNorm, each 2 x 2 block's patches -> the strided convolution (4608), exact GELU, the 1 x 1
         // convolution (out_dim) - each matrix's stages of rows into their columns
         int k = g.layers;
-        auto mat = [&](int m, const bf16_t* X, int rws, float* C) -> bool {
+        auto mat = [&](int m, const void* X, int rws, float* C) -> bool {
             for (; k < ns && st[(size_t) k].mat == m; ++k) {
                 uint8_t* sb = nullptr;
                 if (!acquire(k, sb) ||
@@ -680,10 +770,10 @@ struct Vision::Impl {
         };
         const int ow = gw / g.merge, oh = gh / g.merge, NB = ow * oh, M4 = g.merge * g.merge * D;
         rmsnorm_kernel<<<N, 256, 0, s>>>(h, pv(o_norm), D, g.eps);
-        merge_gather_kernel<<<NB, 256, 0, s>>>(h, gw, D, ow, x16);
+        merge_gather_kernel<<<NB, 256, 0, s>>>(h, gw, D, ow, x16, fp16);
         if (!mat(0, x16, NB, qkv)) return false;   // ([NB][4D] F32: qkv's room, free now)
-        bf16_t* g16 = (bf16_t*) att;                // ([NB][4D] BF16: att's room)
-        bias_act_kernel<<<blocks_for((size_t) NB * M4), 256, 0, s>>>(qkv, pv(o_b0), (size_t) NB * M4, M4, 2, g16);
+        uint16_t* g16 = (uint16_t*) att;            // ([NB][4D] BF16/FP16: att's room)
+        bias_act_kernel<<<blocks_for((size_t) NB * M4), 256, 0, s>>>(qkv, pv(o_b0), (size_t) NB * M4, M4, 2, g16, fp16);
         if (!mat(1, g16, NB, qkv)) return false;
         const int R = (ow + 1) * oh;
         place_rows_kernel<<<R, 256, 0, s>>>(qkv, pv(o_b2), pv(o_nl), ow, O, out);
@@ -744,8 +834,15 @@ bool Vision::load(const Pack& pk, int dev, std::string& err) {
     return true;
 }
 const VisionGeo& Vision::geo() const { return p->g; }
-bool Vision::encode(const uint8_t* rgb, int w, int h, std::vector<float>& rows, std::string& err) {
-    return p->encode(rgb, w, h, rows, err);
+size_t Vision::room_of(int w, int h) const {
+    if (p->g.tokens(w, h) <= 0) return 0;
+    const size_t gh = (size_t) (h / p->g.patch), gw = (size_t) (w / p->g.patch);
+    return Impl::layout(p->g, gh * gw, gh / (size_t) p->g.merge, p->slot, p->pre_h.size()).total;
+}
+bool Vision::last_lent() const { return p->last_lent; }
+bool Vision::encode(const uint8_t* rgb, int w, int h, std::vector<float>& rows, std::string& err, uint8_t* room,
+                    size_t room_b) {
+    return p->encode(rgb, w, h, rows, err, room, room_b);
 }
 size_t Vision::host_bytes() const { return p->host_b; }
 size_t Vision::room_bytes() const { return room_for(p->g); }

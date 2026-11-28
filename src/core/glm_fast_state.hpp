@@ -3,11 +3,11 @@
 // Not a public header: glm_model.cu also uses it to reset request-local routing errors.
 #pragma once
 
-#include "strata/core/glm_model.hpp"
-#include "strata/core/remote_experts.hpp"
-#include "strata/kernels/glm_fast.hpp"
-#include "strata/kernels/glm_kv_stream.hpp"
-#include "strata/kernels/cpu/native_expert.hpp"
+#include "maya/core/glm_model.hpp"
+#include "maya/core/remote_experts.hpp"
+#include "maya/kernels/glm_fast.hpp"
+#include "maya/kernels/glm_kv_stream.hpp"
+#include "maya/kernels/cpu/native_expert.hpp"
 #include "glm_memory.hpp"
 #include "glm_layer_graphs.hpp"
 
@@ -36,7 +36,7 @@
 #include <sched.h>
 #endif
 
-namespace strata::core {
+namespace maya::core {
 namespace glmfast {
 inline bool cuda_ok(cudaError_t e, const char* what, std::string& err) {
     if (e == cudaSuccess) return true;
@@ -73,6 +73,23 @@ inline bool repeatable(bool linked) {
     }();
     return env >= 0 ? env == 1 : linked;
 }
+// The same greedy answers on every start (default on; MAYA_GLM_SAME_ANSWERS=0: the earlier timing-led choices).  Three
+// choices followed how fast something ran at that moment, and each one moves an expert between this GPU and the CPU
+// lane (other bits for the same expert): (1) the CPU lane's split, planned from a start-up timing taken again at
+// every start and re-planned from decode timing - now timed once on this PC and kept (MAYA_GLM_CPU_CAL, the server's
+// data/glm-cpu-cal.txt) with no live re-plan; (2) tier moves went live as soon as their copy landed - now exactly
+// fixed_moves boundaries after they started; (3) a prompt's CPU / PCIe expert split learned from each layer's
+// times - now planned from the kept timing alone; also the pipelined window's boundary on fresh windows only, the
+// prompts' stable products (glm_prefill.cu) and the draft length fixed at its start length (glm_mtp.cu: the length
+// changes the bits, and one picked by measured round times parted starts).  Three V100s, Maya-S v2, --bench A/B vs
+// the timing-led choices: decode -6% with length 2 (its tokens = no drafting), none with length 3; prompts -2.5%.
+inline bool same_answers() {
+    static const bool on = [] {
+        const char* v = getenv("MAYA_GLM_SAME_ANSWERS");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
 // repeatable answers: the CPU-lane timing the expert splits plan with in powers of two (MAYA_GLM_LANE_STEPS=0:
 // the measured values - a few percent of timing noise between builds then moves experts and the answers' bits)
 inline bool lane_steps() {
@@ -88,10 +105,10 @@ inline int fixed_moves(bool linked) {
         const char* v = getenv("MAYA_GLM_FIXED_MOVES");
         return v != nullptr ? std::max(0, std::atoi(v)) : -1;
     }();
-    return env >= 0 ? env : repeatable(linked) ? 4 : 0;
+    return env >= 0 ? env : repeatable(linked) || same_answers() ? 4 : 0;
 }
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 
 // #860: a draft id the host reads back (the NextN block's pick) that is no token id: the confirmed token in its place -
 // a wrong draft the verify rejects like any other, so the answer is unchanged - said once a process.  A real id passes
@@ -134,7 +151,7 @@ inline void cpu_relax() {
 // the default: on the 8065S (Maya-S, drafting with the MTP rework) a submission every 4 layers lost ~4% of the decode
 // (26.5 against 27.7 tok/s, same answers); the runtime's own batching plus the service thread's kick keep the GPU fed.
 inline void submit_queued(cudaStream_t s) {
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
+#if defined(_WIN32) && defined(MAYA_USE_HIP)
     if (cudaPeekAtLastError() != cudaSuccess) return;
     const cudaError_t e = cudaStreamQuery(s);
     if (e == cudaErrorNotReady || e == cudaSuccess) (void) cudaGetLastError();
@@ -143,7 +160,7 @@ inline void submit_queued(cudaStream_t s) {
 #endif
 }
 inline int submit_every() {
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
+#if defined(_WIN32) && defined(MAYA_USE_HIP)
     static const int v = [] {
         const char* e = getenv("MAYA_GLM_FLUSH");
         return e != nullptr ? std::max(0, std::atoi(e)) : 0;
@@ -157,7 +174,7 @@ inline int submit_every() {
 // default: Maya-S on the 8065S, 2K / 8K / 16K prompts 271 / 323 / 325 tok/s with it against 273-276 / 323-325 /
 // 329-339 without - the sub-batches are long enough that the runtime's batching costs nothing)
 inline bool prefill_submit() {
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
+#if defined(_WIN32) && defined(MAYA_USE_HIP)
     static const bool v = [] {
         const char* e = getenv("MAYA_GLM_PREFILL_FLUSH");
         return e != nullptr && std::atoi(e) != 0;
@@ -242,6 +259,11 @@ public:
         while (done_.load(std::memory_order_acquire) < n) cpu_relax();
     }
     int size() const { return (int) th_.size() + 1; }
+    // the workers' CPUs from now on, as the constructor's cpus / one_to_one (an empty list changes nothing; Linux)
+    void pin(const std::vector<int>& cpus, bool one_to_one) {
+        for (size_t i = 0; i < th_.size(); ++i)
+            pin_thread(th_[i].native_handle(), one_to_one && i < cpus.size() ? std::vector<int>{cpus[i]} : cpus);
+    }
     // only the caller and the first n - 1 workers take jobs (fewer threads without a restart: setup's calibration);
     // a batch's job count should be active() for one job a thread.  The workers left out wait on idle_cv_, which only
     // this wakes (under mu_, so none misses it)
@@ -417,7 +439,7 @@ void read_slice(const Glm5Model::Shard& sh, uint64_t off, size_t len, uint8_t* d
 inline size_t expert_stride(size_t blob, int gu_type, int d_type) {
     // an EXL3 blob: every piece is a multiple of 256 bytes, no ggml blocks to keep whole (the prompt path does not
     // multiply these with MMQ)
-    if (gu_type == strata::kernels::exl3::kTypeEXL3 || d_type == strata::kernels::exl3::kTypeEXL3)
+    if (gu_type == maya::kernels::exl3::kTypeEXL3 || d_type == maya::kernels::exl3::kTypeEXL3)
         return (blob + 255) / 256 * 256;
     size_t a = 16;
     const size_t b1 = ggml_type_size((ggml_type) gu_type), b2 = ggml_type_size((ggml_type) d_type);
@@ -447,7 +469,7 @@ int trunk_skip_from(int il);
 
 }  // namespace glmfast
 
-namespace gf = strata::kernels::glmf;
+namespace gf = maya::kernels::glmf;
 namespace glmdsa { struct GlmDsaFast; }   // glm-dsa B2.4: src/core/glm_dsa_fast.hpp
 namespace glmtier { struct TierState; }   // glm-dsa B8.2-B8.4: src/core/glm_tier_numa.hpp
 
@@ -564,6 +586,9 @@ struct Glm5Model::FastState {
     unsigned int* wait_diag_h = nullptr;
     std::atomic<unsigned int> svc_next{1};
     std::atomic<int> svc_phase{0};
+    // the routes' experts demoted at the last boundary that the fetch took from their draining VRAM slot (#860: no
+    // wait for the demotion's copy; the service thread's own count, read by the stall report)
+    std::atomic<uint64_t> drain_vram{0};
     float* emb_h = nullptr;     // pinned
     float* hop_h = nullptr;     // pinned, hc * n_embd
     int* tok_h = nullptr;       // pinned
@@ -590,9 +615,14 @@ struct Glm5Model::FastState {
         WSlot ffn_gate, ffn_up, ffn_down;
         int gu_type = 0, d_type = 0;
         size_t blob = 0, down_off = 0, gu_bytes = 0, dn_bytes = 0;
+        // the FFN width this instance computes (the routed experts', the shared expert's per expert, the dense FFN's):
+        // the model's own, or a tensor-parallel member's slice [f0, f0 + ff) - then the blob above is the slice's and
+        // src_gu / src_dn / src_d_row are the whole expert's in the shards (the reads take those, glm_tp.cu compacts)
+        int ff = 0, ffd = 0, f0 = 0;
+        size_t src_gu = 0, src_dn = 0, src_d_row = 0, d_row = 0;
         // EXL3 (an exl3.txt pack): the routed experts' blob layout, and the indexer's q_b when it is an EXL3 matrix
         bool exl3 = false;
-        strata::kernels::exl3::ExpertLayout xl;
+        maya::kernels::exl3::ExpertLayout xl;
         WSlot idx_q_b_x;
     };
     std::vector<Layer> L;
@@ -870,7 +900,7 @@ struct Glm5Model::FastState {
         volatile int* from_h = nullptr;
         int* skip_d = nullptr;
         const volatile int* from = nullptr;
-        strata::kernels::SamplerParams pick_sp;
+        maya::kernels::SamplerParams pick_sp;
         int32_t pick_tok[32] = {};          // ... the tokens pushed, by slot (a pick's penalty rows count the drafts before it)
         int64_t p0 = 0;
         int T = 0;
@@ -939,6 +969,7 @@ struct Glm5Model::FastState {
     int64_t pf_end = -1;                     // the prompt's end while one runs (the drafter takes its last positions)
     int cpu_node = -1;                         // the NUMA node the pool is pinned to (-1: unpinned) ...
     std::vector<int> cpu_pin;                  // ... and its CPUs (the service thread runs there too)
+    bool lane_packed = false;                  // the one-pool lane sits on one NUMA node (lane_pin; saved as " node")
     std::string cal_file, cal_key;             // MAYA_GLM_CPU_CAL
     double cal_ref = 0.0;                      // decode's CPU ms an expert after calibrating (0: not measured yet)
     uint64_t drift_e0 = 0, drift_us0 = 0;
@@ -959,7 +990,7 @@ struct Glm5Model::FastState {
     gf::CpuAnswer* cpu_ans_h = nullptr;                      // host-mapped
     unsigned int* cpu_seq_d = nullptr;
     unsigned int* dcnt_d = nullptr;                          // the device's route counts (the coldest go to the host)
-    std::vector<strata::kernels::cpu::NativeFmt> cpu_fmt;   // per layer; n_ff == 0: the lane skips that layer
+    std::vector<maya::kernels::cpu::NativeFmt> cpu_fmt;   // per layer; n_ff == 0: the lane skips that layer
     std::vector<uint8_t> cpu_act, cpu_hq;                    // x's activation quant; 8 h quants
     std::vector<float> cpu_ff, cpu_dn;                       // 8 x n_ff; 8 x n_embd
     struct CpuWin {                                          // a merged window layer (win_cpu_merged):
@@ -1003,7 +1034,8 @@ struct Glm5Model::FastState {
     int read_chunks = 0;         // set_read_chunks: a disk read's pieces (0: MAYA_GLM_READ_CHUNKS, else 8)
     // ---- MAYA_GLM_PROF=1: a cudaEvent after every launch, the gaps summed per kernel name (debug only)
     bool prof_on = false;
-    bool kda_graph_on = false;   // experimental, single-device ordinary decode only
+    bool kda_graph_on = false;       // this token's layers go through kda_graphs (fast_layers, MAYA_GLM_KDA_GRAPH)
+    bool kda_graph_broken = false;   // a capture failed once: direct launches for this engine's life
     glmfast::LayerGraphs kda_graphs;
     std::vector<cudaEvent_t> pev;
     std::vector<const char*> pname;
@@ -1056,6 +1088,12 @@ struct Glm5Model::FastState {
         return false;
     }
 };
+namespace glmfast {
+/// Tensor parallel (glm_tp.cu): a whole expert staged at the shards' layout ([gate | up | down] of Ly.src_*) becomes
+/// this member's slice in place - gate and up rows [f0, f0 + ff), every down row's columns [f0, f0 + ff) - at the
+/// layout of Ly.gu_bytes / Ly.d_row (Ly.blob bytes).
+void tp_compact(uint8_t* blob, const Glm5Model::FastState::Layer& Ly, int n_embd);
+}  // namespace glmfast
 
 // KV streaming (Glm5Model::kv_stream_setup): per DSA layer of this part (the NextN block's too), its latent cache in
 // pinned host memory - the authoritative copy, position order - and the residency map of its VRAM slots, which are
@@ -1066,7 +1104,7 @@ struct Glm5Model::KvStream {
     int row_bytes = 0;     // one position's latent row: FP16 kv_lora, or an INT8 record (lat8_rec_bytes)
     int64_t n_blocks = 0;  // pages of the context
     std::vector<uint8_t*> host;                          // per layer: the host copy (device-mapped), null: not a DSA layer
-    std::vector<strata::kernels::KvStreamMap> map;       // per layer
+    std::vector<maya::kernels::KvStreamMap> map;       // per layer
     int kpe_row_bytes = 0;                               // L1-6 glm-dsa: k_pe's FP16 row (0: no k_pe copy, Flash)
     std::vector<uint8_t*> kpe_host;                      // L1-6 glm-dsa: per layer k_pe's host copy (empty on Flash)
     uint8_t* host_arena = nullptr;                       // pinned: every layer's host copy
@@ -1111,4 +1149,4 @@ inline const int* kv_attend_cells(const Glm5Model::KvStream* K, int il, uint16_t
 }
 
 
-}  // namespace strata::core
+}  // namespace maya::core
